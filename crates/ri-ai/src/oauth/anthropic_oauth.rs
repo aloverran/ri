@@ -132,18 +132,23 @@ impl OAuthProvider for AnthropicOAuth {
             .unwrap_or(&credentials.refresh)
             .to_string();
 
-        let access = body["access_token"]
+        let mut access = body["access_token"]
             .as_str()
             .ok_or_else(|| eyre::eyre!("Missing access_token"))?
             .to_string();
 
+        if !access.starts_with("sk-ant-oat") {
+            access = format!("sk-ant-oat-{access}");
+        }
+
         let expires_in = body["expires_in"].as_u64().unwrap_or(3600);
         let now_ms = epoch_ms();
+        let expires = now_ms + (expires_in * 1000).saturating_sub(300_000);
 
         Ok(OAuthCredentials {
             access,
             refresh,
-            expires: now_ms + (expires_in * 1000),
+            expires,
         })
     }
 
@@ -153,10 +158,16 @@ impl OAuthProvider for AnthropicOAuth {
 }
 
 fn parse_token_response(body: &serde_json::Value) -> eyre::Result<OAuthCredentials> {
-    let access = body["access_token"]
+    let mut access = body["access_token"]
         .as_str()
         .ok_or_else(|| eyre::eyre!("Missing access_token in response"))?
         .to_string();
+
+    // Ensure the OAuth token is prefixed with sk-ant-oat so the provider
+    // can detect it.
+    if !access.starts_with("sk-ant-oat") {
+        access = format!("sk-ant-oat-{access}");
+    }
 
     let refresh = body["refresh_token"]
         .as_str()
@@ -166,10 +177,14 @@ fn parse_token_response(body: &serde_json::Value) -> eyre::Result<OAuthCredentia
     let expires_in = body["expires_in"].as_u64().unwrap_or(3600);
     let now_ms = epoch_ms();
 
+    // Calculate expiry time (current time + expires_in seconds - 5 min buffer)
+    // Matches pi's implementation.
+    let expires = now_ms + (expires_in * 1000).saturating_sub(300_000);
+
     Ok(OAuthCredentials {
         access,
         refresh,
-        expires: now_ms + (expires_in * 1000),
+        expires,
     })
 }
 

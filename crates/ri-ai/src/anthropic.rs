@@ -119,7 +119,7 @@ fn convert_tool(tool: &ToolSchema) -> Value {
     })
 }
 
-fn build_request_body(model: &Model, messages: &[Message], options: &CompletionOptions) -> Value {
+fn build_request_body(model: &Model, messages: &[Message], options: &CompletionOptions, is_oauth: bool) -> Value {
     let api_messages: Vec<Value> = messages
         .iter()
         .filter(|m| m.role != Role::System)
@@ -137,8 +137,23 @@ fn build_request_body(model: &Model, messages: &[Message], options: &CompletionO
         "stream": true
     });
 
-    // System prompt as top-level field
-    if let Some(ref sys) = options.system_prompt {
+    // System prompt as top-level field.
+    // OAuth tokens (Claude Code) require specific identity prefix.
+    if is_oauth {
+        let mut system_blocks = vec![json!({
+            "type": "text",
+            "text": "You are Claude Code, Anthropic's official CLI for Claude.",
+            "cache_control": { "type": "ephemeral" }
+        })];
+        if let Some(ref sys) = options.system_prompt {
+            system_blocks.push(json!({
+                "type": "text",
+                "text": sys,
+                "cache_control": { "type": "ephemeral" }
+            }));
+        }
+        body["system"] = json!(system_blocks);
+    } else if let Some(ref sys) = options.system_prompt {
         body["system"] = build_system_param(sys);
     }
 
@@ -530,10 +545,9 @@ impl LlmProvider for AnthropicProvider {
         options: &CompletionOptions,
         api_key: &str,
     ) -> Result<StreamOutput, ProviderError> {
-        let body = build_request_body(model, messages, options);
-        let url = format!("{}/v1/messages", model.base_url.trim_end_matches('/'));
-
         let is_oauth = api_key.contains("sk-ant-oat");
+        let body = build_request_body(model, messages, options, is_oauth);
+        let url = format!("{}/v1/messages", model.base_url.trim_end_matches('/'));
 
         let mut headers = HeaderMap::new();
         if is_oauth {
@@ -542,8 +556,9 @@ impl LlmProvider for AnthropicProvider {
             })?);
             headers.insert(
                 "anthropic-beta",
-                HeaderValue::from_static("claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14"),
+                HeaderValue::from_static("claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,fine-grained-tool-streaming-2025-05-14"),
             );
+            headers.insert("anthropic-dangerous-direct-browser-access", HeaderValue::from_static("true"));
             headers.insert("user-agent", HeaderValue::from_static("claude-cli/2.1.2 (external, cli)"));
             headers.insert("x-app", HeaderValue::from_static("cli"));
         } else {
@@ -552,7 +567,7 @@ impl LlmProvider for AnthropicProvider {
             })?);
             headers.insert(
                 "anthropic-beta",
-                HeaderValue::from_static("interleaved-thinking-2025-05-14"),
+                HeaderValue::from_static("interleaved-thinking-2025-05-14,fine-grained-tool-streaming-2025-05-14"),
             );
         }
         headers.insert(
