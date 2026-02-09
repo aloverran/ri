@@ -107,9 +107,37 @@ fn convert_message(msg: &Message) -> Value {
     })
 }
 
-fn convert_tool(tool: &ToolSchema) -> Value {
+// Claude Code canonical tool names. OAuth tokens require tool names that
+// case-insensitively match these to use the exact casing below.
+const CLAUDE_CODE_TOOLS: &[&str] = &[
+    "Read", "Write", "Edit", "Bash", "Grep", "Glob",
+    "AskUserQuestion", "EnterPlanMode", "ExitPlanMode",
+    "KillShell", "NotebookEdit", "Skill", "Task",
+    "TaskOutput", "TodoWrite", "WebFetch", "WebSearch",
+];
+
+fn to_claude_code_name(name: &str) -> String {
+    CLAUDE_CODE_TOOLS.iter()
+        .find(|cc| cc.eq_ignore_ascii_case(name))
+        .map(|cc| cc.to_string())
+        .unwrap_or_else(|| name.to_string())
+}
+
+fn from_claude_code_name(name: &str, original_tools: &[ToolSchema]) -> String {
+    original_tools.iter()
+        .find(|t| t.name.eq_ignore_ascii_case(name))
+        .map(|t| t.name.clone())
+        .unwrap_or_else(|| name.to_string())
+}
+
+fn convert_tool(tool: &ToolSchema, is_oauth: bool) -> Value {
+    let name = if is_oauth {
+        to_claude_code_name(&tool.name)
+    } else {
+        tool.name.clone()
+    };
     json!({
-        "name": tool.name,
+        "name": name,
         "description": tool.description,
         "input_schema": {
             "type": "object",
@@ -159,7 +187,7 @@ fn build_request_body(model: &Model, messages: &[Message], options: &CompletionO
 
     // Tools
     if !options.tools.is_empty() {
-        let tools: Vec<Value> = options.tools.iter().map(convert_tool).collect();
+        let tools: Vec<Value> = options.tools.iter().map(|t| convert_tool(t, is_oauth)).collect();
         body["tools"] = json!(tools);
     }
 
@@ -412,6 +440,8 @@ struct SseStream {
     blocks: Vec<BlockKind>,
     pending: VecDeque<Result<AssistantStreamEvent, ProviderError>>,
     done: bool,
+    original_tools: Vec<ToolSchema>,
+    is_oauth: bool,
 }
 
 impl Stream for SseStream {
@@ -460,13 +490,19 @@ impl Stream for SseStream {
 }
 
 impl SseStream {
-    fn new(inner: Pin<Box<dyn Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Send>>) -> Self {
+    fn new(
+        inner: Pin<Box<dyn Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Send>>,
+        original_tools: Vec<ToolSchema>,
+        is_oauth: bool,
+    ) -> Self {
         Self {
             inner,
             buffer: String::new(),
             blocks: Vec::new(),
             pending: VecDeque::new(),
             done: false,
+            original_tools,
+            is_oauth,
         }
     }
 
@@ -496,7 +532,19 @@ impl SseStream {
 
             if !event_type.is_empty() {
                 let events = parse_sse_event(&event_type, &data, &mut self.blocks);
-                self.pending.extend(events);
+                if self.is_oauth {
+                    self.pending.extend(events.into_iter().map(|e| {
+                        e.map(|evt| match evt {
+                            AssistantStreamEvent::ToolCallStart { id, name } => {
+                                let original_name = from_claude_code_name(&name, &self.original_tools);
+                                AssistantStreamEvent::ToolCallStart { id, name: original_name }
+                            }
+                            other => other,
+                        })
+                    }));
+                } else {
+                    self.pending.extend(events);
+                }
             }
         }
     }
@@ -577,6 +625,14 @@ impl LlmProvider for AnthropicProvider {
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
         headers.insert("accept", HeaderValue::from_static("text/event-stream"));
 
+        tracing::debug!(
+            url = %url,
+            is_oauth = is_oauth,
+            model = %model.id,
+            body = %body,
+            "Anthropic API request"
+        );
+
         let response = self
             .client
             .post(&url)
@@ -588,11 +644,19 @@ impl LlmProvider for AnthropicProvider {
         let status = response.status().as_u16();
         if status >= 400 {
             let body_text = response.text().await.unwrap_or_default();
+            if is_oauth && body_text.contains("only authorized for use with Claude Code") {
+                let tool_names: Vec<&str> = options.tools.iter().map(|t| t.name.as_str()).collect();
+                warn!(
+                    "OAuth credential rejected by API. This usually means the request \
+                     does not match Claude Code's expected format. Tool names sent: {:?}",
+                    tool_names
+                );
+            }
             return Err(parse_error_body(status, &body_text));
         }
 
         let byte_stream = response.bytes_stream();
-        let sse = SseStream::new(Box::pin(byte_stream));
+        let sse = SseStream::new(Box::pin(byte_stream), options.tools.clone(), is_oauth);
 
         Ok(Box::pin(sse))
     }
