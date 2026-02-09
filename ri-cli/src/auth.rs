@@ -1,9 +1,4 @@
-// Credential storage for OAuth login.
-//
-// Persists provider credentials in ~/.ri/auth.json.
-// File permissions set to 0600 on Unix.
-
-use ri_ai::oauth::OAuthCredentials;
+use ri::auth::OAuthCredentials;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -15,15 +10,12 @@ pub struct AuthStore {
 
 impl AuthStore {
     pub fn path() -> PathBuf {
-        let home = dirs::home_dir().expect("No home directory");
-        home.join(".ri").join("auth.json")
+        dirs::home_dir().expect("No home directory").join(".ri").join("auth.json")
     }
 
     pub fn load() -> Self {
         let path = Self::path();
-        if !path.exists() {
-            return Self::default();
-        }
+        if !path.exists() { return Self::default(); }
         let data = std::fs::read_to_string(&path).unwrap_or_default();
         serde_json::from_str(&data).unwrap_or_default()
     }
@@ -35,13 +27,11 @@ impl AuthStore {
         }
         let data = serde_json::to_string_pretty(self)?;
         std::fs::write(&path, data)?;
-
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
         }
-
         Ok(())
     }
 
@@ -51,14 +41,5 @@ impl AuthStore {
 
     pub fn set(&mut self, provider: &str, creds: OAuthCredentials) {
         self.providers.insert(provider.to_string(), creds);
-    }
-
-    pub fn is_expired(creds: &OAuthCredentials) -> bool {
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_millis() as u64;
-        // Expire 60s early to avoid edge cases
-        now_ms >= creds.expires.saturating_sub(60_000)
     }
 }

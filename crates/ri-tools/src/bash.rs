@@ -83,17 +83,13 @@ impl Tool for BashTool {
                 // child is consumed by wait_with_output branch, so this won't run
                 // if wait_with_output wins. If timeout wins, child is still alive.
                 return Ok(ToolResultOutput {
-                    content: vec![ContentBlock::Text {
-                        text: format!("Command timed out after {}ms", timeout_ms),
-                    }],
+                    content: vec![ContentBlock::text(format!("Command timed out after {}ms", timeout_ms))],
                     is_error: true,
                 });
             }
             _ = cancel.cancelled() => {
                 return Ok(ToolResultOutput {
-                    content: vec![ContentBlock::Text {
-                        text: "Command aborted".to_string(),
-                    }],
+                    content: vec![ContentBlock::text("Command aborted")],
                     is_error: true,
                 });
             }
@@ -118,7 +114,7 @@ impl Tool for BashTool {
         );
 
         Ok(ToolResultOutput {
-            content: vec![ContentBlock::Text { text }],
+            content: vec![ContentBlock::text(text)],
             is_error: exit_code != 0,
         })
     }

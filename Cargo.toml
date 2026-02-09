@@ -1,9 +1,6 @@
 [workspace]
 members = [
-    "crates/ri-core",
-    "crates/ri-ai",
-    "crates/ri-tools",
-    "crates/ri-tui",
+    "crates/ri",
     "ri-cli",
 ]
 resolver = "2"
@@ -14,47 +11,25 @@ edition = "2024"
 license = "MIT"
 
 [workspace.dependencies]
-# Core
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 futures = "0.3"
-async-trait = "0.1"
-
-# HTTP
 reqwest = { version = "0.12", features = ["json", "stream"] }
-
-# Error handling
 eyre = "0.6"
 color-eyre = "0.6"
 thiserror = "2"
-
-# CLI
 clap = { version = "4", features = ["derive"] }
-
-# TUI
-ratatui = "0.29"
-crossterm = "0.28"
-
-# Logging
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-
-# Crypto
 sha2 = "0.10"
 rand = "0.9"
 base64 = "0.22"
-
-# Utilities
 uuid = { version = "1", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 dirs = "6"
 glob = "0.3"
 tokio-stream = "0.1"
 bytes = "1"
-
-# Workspace crates
-ri-core = { path = "crates/ri-core" }
-ri-ai = { path = "crates/ri-ai" }
-ri-tools = { path = "crates/ri-tools" }
-ri-tui = { path = "crates/ri-tui" }
+tokio-util = { version = "0.7", features = ["rt"] }
+ri = { path = "crates/ri" }

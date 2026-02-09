@@ -60,17 +60,13 @@ impl Tool for EditTool {
         let count = content.matches(old_text).count();
         if count == 0 {
             return Ok(ToolResultOutput {
-                content: vec![ContentBlock::Text {
-                    text: "old_text not found in file".to_string(),
-                }],
+                content: vec![ContentBlock::text("old_text not found in file")],
                 is_error: true,
             });
         }
         if count > 1 {
             return Ok(ToolResultOutput {
-                content: vec![ContentBlock::Text {
-                    text: format!("old_text found {} times; must be unique", count),
-                }],
+                content: vec![ContentBlock::text(format!("old_text found {} times; must be unique", count))],
                 is_error: true,
             });
         }
@@ -79,9 +75,7 @@ impl Tool for EditTool {
         tokio::fs::write(&path, &new_content).await?;
 
         Ok(ToolResultOutput {
-            content: vec![ContentBlock::Text {
-                text: format!("Edited {}", path.display()),
-            }],
+            content: vec![ContentBlock::text(format!("Edited {}", path.display()))],
             is_error: false,
         })
     }

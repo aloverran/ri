@@ -32,13 +32,13 @@ pub enum AgentEvent {
 pub enum AssistantStreamEvent {
     TextStart,
     TextDelta { delta: String },
-    TextEnd,
+    TextEnd { signature: Option<String> },
     ThinkingStart,
     ThinkingDelta { delta: String },
-    ThinkingEnd,
+    ThinkingEnd { signature: Option<String> },
     ToolCallStart { id: String, name: String },
     ToolCallDelta { id: String, delta: String },
-    ToolCallEnd { id: String },
+    ToolCallEnd { id: String, signature: Option<String> },
     Done,
     Error { message: String },
 }

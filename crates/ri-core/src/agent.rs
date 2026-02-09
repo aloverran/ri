@@ -156,7 +156,7 @@ impl Agent {
                     .content
                     .iter()
                     .filter_map(|b| match b {
-                        ContentBlock::ToolUse { id, name, input } => Some(ToolCall {
+                        ContentBlock::ToolUse { id, name, input, .. } => Some(ToolCall {
                             id: id.clone(),
                             name: name.clone(),
                             input: input.clone(),
@@ -278,10 +278,11 @@ impl Agent {
                         AssistantStreamEvent::TextDelta { delta } => {
                             current_text.push_str(delta);
                         }
-                        AssistantStreamEvent::TextEnd => {
+                        AssistantStreamEvent::TextEnd { signature } => {
                             if !current_text.is_empty() {
                                 content_blocks.push(ContentBlock::Text {
                                     text: std::mem::take(&mut current_text),
+                                    text_signature: signature.clone(),
                                 });
                             }
                         }
@@ -291,10 +292,11 @@ impl Agent {
                         AssistantStreamEvent::ThinkingDelta { delta } => {
                             current_thinking.push_str(delta);
                         }
-                        AssistantStreamEvent::ThinkingEnd => {
+                        AssistantStreamEvent::ThinkingEnd { signature } => {
                             if !current_thinking.is_empty() {
                                 content_blocks.push(ContentBlock::Thinking {
                                     thinking: std::mem::take(&mut current_thinking),
+                                    thinking_signature: signature.clone(),
                                 });
                             }
                         }
@@ -307,7 +309,7 @@ impl Agent {
                                 json.push_str(delta);
                             }
                         }
-                        AssistantStreamEvent::ToolCallEnd { id } => {
+                        AssistantStreamEvent::ToolCallEnd { id, signature } => {
                             if let Some((name, json)) = pending_tools.remove(id) {
                                 let input: serde_json::Value =
                                     serde_json::from_str(&json).unwrap_or_else(|_| {
@@ -320,6 +322,7 @@ impl Agent {
                                     id: id.clone(),
                                     name,
                                     input,
+                                    thought_signature: signature.clone(),
                                 });
                             }
                         }
@@ -346,11 +349,13 @@ impl Agent {
         if !current_text.is_empty() {
             content_blocks.push(ContentBlock::Text {
                 text: current_text,
+                text_signature: None,
             });
         }
         if !current_thinking.is_empty() {
             content_blocks.push(ContentBlock::Thinking {
                 thinking: current_thinking,
+                thinking_signature: None,
             });
         }
         for (id, (name, json)) in pending_tools {
@@ -361,7 +366,7 @@ impl Agent {
                         "partial": json
                     })
                 });
-            content_blocks.push(ContentBlock::ToolUse { id, name, input });
+            content_blocks.push(ContentBlock::ToolUse { id, name, input, thought_signature: None });
         }
 
         let _ = self.event_tx.send(AgentEvent::MessageEnd);
@@ -426,25 +431,19 @@ impl Agent {
                         },
                         Ok(Err(e)) => ToolResultEntry {
                             id: call.id.clone(),
-                            content: vec![ContentBlock::Text {
-                                text: format!("{e}"),
-                            }],
+                            content: vec![ContentBlock::text(format!("{e}"))],
                             is_error: true,
                         },
                         Err(e) => ToolResultEntry {
                             id: call.id.clone(),
-                            content: vec![ContentBlock::Text {
-                                text: format!("Tool panicked: {e}"),
-                            }],
+                            content: vec![ContentBlock::text(format!("Tool panicked: {e}"))],
                             is_error: true,
                         },
                     }
                 }
                 None => ToolResultEntry {
                     id: call.id.clone(),
-                    content: vec![ContentBlock::Text {
-                        text: format!("Tool '{}' not found", call.name),
-                    }],
+                    content: vec![ContentBlock::text(format!("Tool '{}' not found", call.name))],
                     is_error: true,
                 },
             };
@@ -477,9 +476,7 @@ impl Agent {
         });
         let result = ToolResultEntry {
             id: call.id.clone(),
-            content: vec![ContentBlock::Text {
-                text: "Skipped due to queued user message.".to_string(),
-            }],
+            content: vec![ContentBlock::text("Skipped due to queued user message.")],
             is_error: true,
         };
         let _ = self.event_tx.send(AgentEvent::ToolExecutionEnd {

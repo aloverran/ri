@@ -6,6 +6,7 @@
 use serde::{Deserialize, Serialize};
 
 pub mod anthropic_oauth;
+pub mod google_oauth;
 mod pkce;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -13,6 +14,12 @@ pub struct OAuthCredentials {
     pub refresh: String,
     pub access: String,
     pub expires: u64, // ms since epoch
+    /// Google Cloud project ID (only used by Google providers).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<String>,
+    /// User email (optional, for display purposes).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub email: Option<String>,
 }
 
 pub struct OAuthLoginResult {

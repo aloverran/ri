@@ -3,17 +3,14 @@ name = "ri-cli"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "ri coding agent CLI - Rust implementation of pi"
+description = "ri coding agent CLI"
 
 [[bin]]
 name = "ri"
 path = "src/main.rs"
 
 [dependencies]
-ri-core.workspace = true
-ri-ai.workspace = true
-ri-tools.workspace = true
-ri-tui.workspace = true
+ri.workspace = true
 tokio.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -25,4 +22,5 @@ tracing-subscriber.workspace = true
 dirs.workspace = true
 uuid.workspace = true
 chrono.workspace = true
-tokio-util = { version = "0.7", features = ["rt"] }
+tokio-util.workspace = true
+glob.workspace = true

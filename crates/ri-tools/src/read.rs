@@ -84,7 +84,7 @@ impl Tool for ReadTool {
         };
 
         Ok(ToolResultOutput {
-            content: vec![ContentBlock::Text { text }],
+            content: vec![ContentBlock::text(text)],
             is_error: false,
         })
     }

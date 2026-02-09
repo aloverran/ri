@@ -149,6 +149,8 @@ impl OAuthProvider for AnthropicOAuth {
             access,
             refresh,
             expires,
+            project_id: None,
+            email: None,
         })
     }
 
@@ -185,6 +187,8 @@ fn parse_token_response(body: &serde_json::Value) -> eyre::Result<OAuthCredentia
         access,
         refresh,
         expires,
+        project_id: None,
+        email: None,
     })
 }
 

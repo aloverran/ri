@@ -23,6 +23,9 @@ pub enum Role {
 pub enum ContentBlock {
     Text {
         text: String,
+        /// Thought signature for Google providers (preserves reasoning context).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        text_signature: Option<String>,
     },
     Image {
         #[serde(rename = "mediaType")]
@@ -33,6 +36,9 @@ pub enum ContentBlock {
         id: String,
         name: String,
         input: serde_json::Value,
+        /// Thought signature for Google providers (preserves reasoning context).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        thought_signature: Option<String>,
     },
     ToolResult {
         #[serde(rename = "toolUseId")]
@@ -43,7 +49,24 @@ pub enum ContentBlock {
     },
     Thinking {
         thinking: String,
+        /// Thought signature for Google providers (preserves reasoning context).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        thinking_signature: Option<String>,
     },
+}
+
+impl ContentBlock {
+    pub fn text(text: impl Into<String>) -> Self {
+        ContentBlock::Text { text: text.into(), text_signature: None }
+    }
+
+    pub fn thinking(thinking: impl Into<String>) -> Self {
+        ContentBlock::Thinking { thinking: thinking.into(), thinking_signature: None }
+    }
+
+    pub fn tool_use(id: impl Into<String>, name: impl Into<String>, input: serde_json::Value) -> Self {
+        ContentBlock::ToolUse { id: id.into(), name: name.into(), input, thought_signature: None }
+    }
 }
 
 // -- Messages --
@@ -70,21 +93,21 @@ impl AgentMessage {
     pub fn user(text: impl Into<String>) -> Self {
         AgentMessage::Llm(Message {
             role: Role::User,
-            content: vec![ContentBlock::Text { text: text.into() }],
+            content: vec![ContentBlock::text(text)],
         })
     }
 
     pub fn assistant(text: impl Into<String>) -> Self {
         AgentMessage::Llm(Message {
             role: Role::Assistant,
-            content: vec![ContentBlock::Text { text: text.into() }],
+            content: vec![ContentBlock::text(text)],
         })
     }
 
     pub fn system(text: impl Into<String>) -> Self {
         AgentMessage::Llm(Message {
             role: Role::System,
-            content: vec![ContentBlock::Text { text: text.into() }],
+            content: vec![ContentBlock::text(text)],
         })
     }
 }
@@ -102,6 +125,10 @@ pub enum ApiType {
     OpenaiResponses,
     #[serde(rename = "google")]
     Google,
+    #[serde(rename = "google-gemini-cli")]
+    GoogleGeminiCli,
+    #[serde(rename = "google-antigravity")]
+    GoogleAntigravity,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

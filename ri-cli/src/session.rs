@@ -7,7 +7,7 @@
 // Location: ~/.ri/sessions/{timestamp}-{short_id}.jsonl
 
 use chrono::Utc;
-use ri_core::types::AgentMessage;
+use ri::types::Message;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
@@ -33,7 +33,7 @@ pub enum SessionEntry {
         #[serde(rename = "parentId")]
         parent_id: String,
         timestamp: String,
-        message: AgentMessage,
+        message: Message,
     },
     ModelChange {
         id: String,
@@ -220,7 +220,7 @@ impl SessionManager {
     }
 
     /// Append a user or assistant message. Returns the entry id.
-    pub fn append_message(&mut self, message: AgentMessage) -> eyre::Result<String> {
+    pub fn append_message(&mut self, message: Message) -> eyre::Result<String> {
         let id = new_id();
         let parent_id = self
             .current_leaf_id
@@ -511,10 +511,10 @@ mod tests {
 
         // Append messages.
         let id1 = mgr
-            .append_message(AgentMessage::user("Hello"))
+            .append_message(Message::user("Hello"))
             .unwrap();
         let id2 = mgr
-            .append_message(AgentMessage::assistant("Hi there"))
+            .append_message(Message::assistant("Hi there"))
             .unwrap();
 
         assert_eq!(mgr.entries().len(), 3);
@@ -540,15 +540,15 @@ mod tests {
         };
         mgr.append(header).unwrap();
 
-        let id1 = mgr.append_message(AgentMessage::user("First")).unwrap();
+        let id1 = mgr.append_message(Message::user("First")).unwrap();
         let _id2 = mgr
-            .append_message(AgentMessage::assistant("Second"))
+            .append_message(Message::assistant("Second"))
             .unwrap();
 
         // Fork from id1 -- next append branches from there.
         assert!(mgr.fork(&id1));
         let id3 = mgr
-            .append_message(AgentMessage::user("Alternate"))
+            .append_message(Message::user("Alternate"))
             .unwrap();
 
         // Branch from id3 should be root -> id1 -> id3 (not id2).
@@ -577,8 +577,8 @@ mod tests {
         };
         mgr.append(header).unwrap();
 
-        let id1 = mgr.append_message(AgentMessage::user("A")).unwrap();
-        let id2 = mgr.append_message(AgentMessage::assistant("B")).unwrap();
+        let id1 = mgr.append_message(Message::user("A")).unwrap();
+        let id2 = mgr.append_message(Message::assistant("B")).unwrap();
 
         // Get branch from id1 (not the current leaf).
         let branch = mgr.get_branch(Some(&id1));
@@ -604,7 +604,7 @@ mod tests {
         };
         mgr.append(header).unwrap();
 
-        let _msg_id = mgr.append_message(AgentMessage::user("Hello")).unwrap();
+        let _msg_id = mgr.append_message(Message::user("Hello")).unwrap();
 
         let mc_id = mgr
             .append_model_change("anthropic", "claude-opus-4")
@@ -630,7 +630,7 @@ mod tests {
             id: "abc".to_string(),
             parent_id: "root".to_string(),
             timestamp: "2025-01-01T00:00:00Z".to_string(),
-            message: AgentMessage::user("Test message"),
+            message: Message::user("Test message"),
         };
 
         let json = serde_json::to_string(&entry).unwrap();
@@ -658,9 +658,9 @@ mod tests {
         };
         mgr.append(header).unwrap();
 
-        let id1 = mgr.append_message(AgentMessage::user("First")).unwrap();
+        let id1 = mgr.append_message(Message::user("First")).unwrap();
         let id2 = mgr
-            .append_message(AgentMessage::assistant("Second"))
+            .append_message(Message::assistant("Second"))
             .unwrap();
 
         assert_eq!(mgr.current_leaf_id(), Some(id2.as_str()));

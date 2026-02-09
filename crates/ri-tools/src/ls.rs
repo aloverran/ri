@@ -70,7 +70,7 @@ impl Tool for LsTool {
         };
 
         Ok(ToolResultOutput {
-            content: vec![ContentBlock::Text { text }],
+            content: vec![ContentBlock::text(text)],
             is_error: false,
         })
     }

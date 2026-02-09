@@ -59,9 +59,7 @@ impl Tool for WriteTool {
         tokio::fs::write(&path, content).await?;
 
         Ok(ToolResultOutput {
-            content: vec![ContentBlock::Text {
-                text: format!("Wrote {} bytes to {}", content.len(), path.display()),
-            }],
+            content: vec![ContentBlock::text(format!("Wrote {} bytes to {}", content.len(), path.display()))],
             is_error: false,
         })
     }

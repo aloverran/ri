@@ -1,10 +1,7 @@
-// ri - Rust implementation of pi coding agent.
-//
-// Entry point: parse args, set up model registry, create agent, run mode.
-
 use clap::Parser;
 use color_eyre::eyre::Result;
-use ri_ai::oauth::OAuthProvider;
+use ri::api::{GeminiVariant, Provider};
+use ri::types::*;
 
 mod auth;
 mod interactive;
@@ -16,31 +13,21 @@ mod session;
 #[derive(Parser)]
 #[command(name = "ri", about = "A Rust coding agent")]
 struct Cli {
-    /// Run mode
     #[arg(long, default_value = "interactive")]
     mode: String,
 
-    /// LLM provider
     #[arg(long, default_value = "anthropic")]
     provider: String,
 
-    /// Model ID
     #[arg(long)]
     model: Option<String>,
 
-    /// Initial prompt (non-interactive)
     #[arg(short, long)]
     prompt: Option<String>,
 
-    /// Working directory
     #[arg(short = 'C', long)]
     cwd: Option<String>,
 
-    /// Disable session persistence
-    #[arg(long)]
-    no_session: bool,
-
-    /// Output format for print mode: text or json
     #[arg(long, default_value = "text")]
     output: String,
 }
@@ -48,121 +35,39 @@ struct Cli {
 #[tokio::main]
 async fn main() -> Result<()> {
     color_eyre::install()?;
-
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
 
     let cli = Cli::parse();
-
-    let cwd = cli
-        .cwd
-        .unwrap_or_else(|| std::env::current_dir().unwrap().display().to_string());
+    let cwd = cli.cwd.unwrap_or_else(|| std::env::current_dir().unwrap().display().to_string());
 
     tracing::info!("ri starting in {}", cwd);
 
-    // Load resources (context files, skills, prompts, settings, models.json)
     let res = resources::ResourceLoader::load(std::path::Path::new(&cwd));
 
-    // Set up model registry
-    let mut registry = ri_ai::registry::ModelRegistry::new();
-
-    // Register Anthropic provider
-    let anthropic = std::sync::Arc::new(ri_ai::anthropic::AnthropicProvider::new());
-    registry.register_provider("anthropic", anthropic);
-
-    // Add default models
-    registry.add_model(ri_core::types::Model {
-        id: "claude-sonnet-4-20250514".to_string(),
-        name: "Claude Sonnet 4".to_string(),
-        api: ri_core::types::ApiType::AnthropicMessages,
-        provider: "anthropic".to_string(),
-        base_url: "https://api.anthropic.com".to_string(),
-        reasoning: false,
-        input: vec![
-            ri_core::types::InputModality::Text,
-            ri_core::types::InputModality::Image,
-        ],
-        cost: ri_core::types::ModelCost {
-            input: 3.0,
-            output: 15.0,
-            cache_read: 0.3,
-            cache_write: 3.75,
-        },
-        context_window: 200_000,
-        max_tokens: 16_384,
-    });
-
-    // Register custom models from models.json
-    for model in res.custom_models() {
-        registry.add_model(model);
-    }
-
-    // Create tools
-    let tools = ri_tools::all_tools(&cwd);
-
-    // Create event channel
-    let (event_tx, event_rx) = ri_core::event::event_channel(256);
-
-    // Resolve model -- use settings defaults, then CLI overrides
+    // Resolve provider name from settings or CLI
     let provider_name = res.settings.default_provider
         .as_deref()
         .unwrap_or(&cli.provider);
+
+    // Resolve model
     let model_id = cli.model
         .or_else(|| res.settings.default_model.clone())
-        .unwrap_or_else(|| "claude-sonnet-4-20250514".to_string());
-    let model = registry
-        .find(provider_name, &model_id)
-        .cloned()
-        .ok_or_else(|| eyre::eyre!("Model not found: {}:{}", provider_name, model_id))?;
+        .unwrap_or_else(|| default_model_id(provider_name).to_string());
 
-    // Resolve API key: models.json -> env var -> OAuth credentials
-    let mut api_key = match res.provider_api_key(provider_name) {
-        Some(key_spec) => registry.resolve_api_key(&key_spec).await
-            .unwrap_or_default(),
-        None => std::env::var("ANTHROPIC_API_KEY").unwrap_or_default(),
-    };
+    let model = find_model(provider_name, &model_id, &res);
 
-    // Fall back to OAuth credentials from ~/.ri/auth.json
-    if api_key.is_empty() {
-        let mut auth_store = auth::AuthStore::load();
-        if let Some(creds) = auth_store.get(provider_name).cloned() {
-            if auth::AuthStore::is_expired(&creds) {
-                let oauth = ri_ai::oauth::anthropic_oauth::AnthropicOAuth::new();
-                match oauth.refresh_token(&creds).await {
-                    Ok(new_creds) => {
-                        api_key = new_creds.access.clone();
-                        auth_store.set(provider_name, new_creds);
-                        let _ = auth_store.save();
-                        tracing::info!("API key refreshed via OAuth");
-                    }
-                    Err(e) => {
-                        tracing::warn!("OAuth token refresh failed: {e}");
-                    }
-                }
-            } else {
-                api_key = creds.access.clone();
-                tracing::info!("Using saved API key");
-            }
-        }
-    }
+    // Resolve API key and build provider
+    let provider = build_provider(provider_name, &res).await;
 
-    let provider = registry
-        .get_provider(provider_name)
-        .ok_or_else(|| eyre::eyre!("Provider not found: {}", provider_name))?;
-
-    // Build system prompt from resources (tool descriptions come via API tools param)
+    // Build system prompt
     let system_prompt = res.build_system_prompt(None);
 
-    // Create agent
-    let config = ri_core::agent::AgentConfig {
-        model,
-        thinking_level: ri_core::types::ThinkingLevel::Medium,
-        system_prompt,
-        api_key,
-    };
+    // Build tools
+    let tools = ri::tools::all_tools();
 
-    let mut agent = ri_core::agent::Agent::new(config, provider, tools, event_tx);
+    let cwd_path = std::path::PathBuf::from(&cwd);
 
     match cli.mode.as_str() {
         "print" | "json" => {
@@ -170,44 +75,163 @@ async fn main() -> Result<()> {
                 .ok_or_else(|| eyre::eyre!("Print mode requires --prompt (-p)"))?;
 
             let is_json = cli.mode == "json" || cli.output == "json";
-            let display_task = if is_json {
-                tokio::spawn(print_mode::run_json(event_rx))
-            } else {
-                tokio::spawn(print_mode::run_text(event_rx))
+            let mut messages = vec![Message::user(prompt)];
+
+            let config = ri::agent::RunConfig {
+                provider: &provider,
+                model: &model,
+                system_prompt: &system_prompt,
+                tools: &tools,
+                thinking: ThinkingLevel::Medium,
+                max_tokens: None,
+                cwd: &cwd_path,
             };
 
-            agent
-                .prompt(ri_core::types::AgentMessage::user(prompt))
-                .await?;
-
-            let _ = display_task.await;
+            let cancel = tokio_util::sync::CancellationToken::new();
+            if is_json {
+                ri::agent::run(&config, &mut messages, &mut |evt| {
+                    print_mode::on_event_json(&evt);
+                }, cancel).await?;
+            } else {
+                ri::agent::run(&config, &mut messages, &mut |evt| {
+                    print_mode::on_event_text(&evt);
+                }, cancel).await?;
+            }
+            println!();
         }
         "rpc" => {
-            let steering_tx = agent.steering_handle();
-            let follow_up_tx = agent.follow_up_handle();
-            let cancel = agent.cancel_token();
-
-            if let Some(prompt) = cli.prompt {
-                // Run agent with initial prompt in background
-                tokio::spawn(async move {
-                    let _ = agent
-                        .prompt(ri_core::types::AgentMessage::user(prompt))
-                        .await;
-                });
-
-                rpc_mode::run(event_rx, steering_tx, follow_up_tx, cancel).await;
-            } else {
-                // No initial prompt -- wait for prompt command via RPC
-                rpc_mode::run(event_rx, steering_tx, follow_up_tx, cancel).await;
-            }
+            rpc_mode::run(provider, model, system_prompt, tools, cwd_path, cli.prompt).await;
         }
         "interactive" | _ => {
             eprintln!("ri - a Rust coding agent");
             eprintln!("Type /help for commands, /quit to exit.\n");
-            interactive::run(agent, event_rx, cli.prompt).await?;
+            interactive::run(provider, model, system_prompt, tools, cwd_path, cli.prompt).await?;
         }
     }
 
     Ok(())
 }
 
+fn default_model_id(provider: &str) -> &'static str {
+    match provider {
+        "anthropic" => "claude-sonnet-4-20250514",
+        "google-gemini-cli" => "gemini-2.5-pro",
+        "google-antigravity" => "gemini-3-pro",
+        _ => "claude-sonnet-4-20250514",
+    }
+}
+
+fn find_model(provider: &str, model_id: &str, res: &resources::ResourceLoader) -> Model {
+    // Check custom models from models.json
+    for m in res.custom_models() {
+        if m.id == model_id { return m; }
+    }
+
+    // Built-in models
+    match (provider, model_id) {
+        ("anthropic", "claude-sonnet-4-20250514") => Model {
+            id: "claude-sonnet-4-20250514".into(), name: "Claude Sonnet 4".into(),
+            reasoning: false, context_window: 200_000, max_tokens: 16_384,
+            cost: ModelCost { input: 3.0, output: 15.0, cache_read: 0.3, cache_write: 3.75 },
+        },
+        ("anthropic", id) if id.contains("opus-4-6") || id.contains("opus-4.6") => Model {
+            id: id.into(), name: "Claude Opus 4.6".into(),
+            reasoning: true, context_window: 200_000, max_tokens: 32_768,
+            cost: ModelCost { input: 15.0, output: 75.0, cache_read: 1.5, cache_write: 18.75 },
+        },
+        ("google-gemini-cli", "gemini-2.5-pro") => Model {
+            id: "gemini-2.5-pro".into(), name: "Gemini 2.5 Pro".into(),
+            reasoning: true, context_window: 1_048_576, max_tokens: 65_536,
+            cost: ModelCost { input: 1.25, output: 10.0, cache_read: 0.315, cache_write: 0.0 },
+        },
+        ("google-gemini-cli", "gemini-2.5-flash") => Model {
+            id: "gemini-2.5-flash".into(), name: "Gemini 2.5 Flash".into(),
+            reasoning: true, context_window: 1_048_576, max_tokens: 65_536,
+            cost: ModelCost { input: 0.15, output: 0.6, cache_read: 0.0375, cache_write: 0.0 },
+        },
+        ("google-antigravity", "gemini-3-pro") => Model {
+            id: "gemini-3-pro".into(), name: "Gemini 3 Pro".into(),
+            reasoning: true, context_window: 1_048_576, max_tokens: 65_536,
+            cost: ModelCost { input: 2.0, output: 6.0, cache_read: 0.5, cache_write: 0.0 },
+        },
+        ("google-antigravity", "gemini-3-flash") => Model {
+            id: "gemini-3-flash".into(), name: "Gemini 3 Flash".into(),
+            reasoning: true, context_window: 1_048_576, max_tokens: 65_536,
+            cost: ModelCost { input: 0.5, output: 1.5, cache_read: 0.125, cache_write: 0.0 },
+        },
+        _ => {
+            // Unknown model, make a reasonable default
+            Model {
+                id: model_id.into(), name: model_id.into(),
+                reasoning: false, context_window: 128_000, max_tokens: 16_384,
+                cost: ModelCost { input: 0.0, output: 0.0, cache_read: 0.0, cache_write: 0.0 },
+            }
+        }
+    }
+}
+
+async fn build_provider(provider_name: &str, res: &resources::ResourceLoader) -> Provider {
+    // Try models.json API key, then env var, then OAuth
+    let mut auth_store = auth::AuthStore::load();
+
+    match provider_name {
+        "anthropic" => {
+            let key = res.provider_api_key("anthropic")
+                .or_else(|| std::env::var("ANTHROPIC_API_KEY").ok())
+                .unwrap_or_default();
+
+            if !key.is_empty() {
+                return Provider::Anthropic { api_key: key };
+            }
+
+            // Try OAuth
+            if let Some(creds) = auth_store.get("anthropic").cloned() {
+                if !creds.is_expired() {
+                    return Provider::Anthropic { api_key: creds.access };
+                }
+                if let Ok(refreshed) = ri::auth::anthropic::refresh_token(&creds).await {
+                    let key = refreshed.access.clone();
+                    auth_store.set("anthropic", refreshed);
+                    let _ = auth_store.save();
+                    return Provider::Anthropic { api_key: key };
+                }
+            }
+
+            Provider::Anthropic { api_key: String::new() }
+        }
+
+        name @ ("google-gemini-cli" | "google-antigravity") => {
+            let variant = if name == "google-antigravity" {
+                GeminiVariant::Antigravity
+            } else {
+                GeminiVariant::Cli
+            };
+
+            if let Some(creds) = auth_store.get(name).cloned() {
+                let (token, project_id) = if creds.is_expired() {
+                    match ri::auth::google::refresh_token(&creds, variant).await {
+                        Ok(refreshed) => {
+                            let t = refreshed.access.clone();
+                            let p = refreshed.project_id.clone().unwrap_or_default();
+                            auth_store.set(name, refreshed);
+                            let _ = auth_store.save();
+                            (t, p)
+                        }
+                        Err(e) => {
+                            tracing::warn!("Google token refresh failed: {}", e);
+                            (String::new(), String::new())
+                        }
+                    }
+                } else {
+                    (creds.access.clone(), creds.project_id.clone().unwrap_or_default())
+                };
+
+                return Provider::Gemini { variant, token, project_id };
+            }
+
+            Provider::Gemini { variant, token: String::new(), project_id: String::new() }
+        }
+
+        _ => Provider::Anthropic { api_key: String::new() },
+    }
+}

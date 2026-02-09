@@ -41,7 +41,7 @@ fn build_system_param(system_prompt: &str) -> Value {
 
 fn convert_content_block(block: &ContentBlock) -> Value {
     match block {
-        ContentBlock::Text { text } => json!({
+        ContentBlock::Text { text, .. } => json!({
             "type": "text",
             "text": text
         }),
@@ -53,7 +53,7 @@ fn convert_content_block(block: &ContentBlock) -> Value {
                 "data": data
             }
         }),
-        ContentBlock::ToolUse { id, name, input } => json!({
+        ContentBlock::ToolUse { id, name, input, .. } => json!({
             "type": "tool_use",
             "id": id,
             "name": name,
@@ -72,11 +72,9 @@ fn convert_content_block(block: &ContentBlock) -> Value {
                 "is_error": is_error
             })
         }
-        ContentBlock::Thinking { thinking } => json!({
+        ContentBlock::Thinking { thinking, .. } => json!({
             "type": "thinking",
             "thinking": thinking,
-            // Thinking blocks in history need a signature; but for now
-            // we pass them as-is and let the API handle validation.
         }),
     }
 }
@@ -276,7 +274,6 @@ fn parse_sse_event(
 
             match block_type {
                 "text" => {
-                    // Ensure blocks vec is big enough
                     while blocks.len() <= index {
                         blocks.push(BlockKind::Text);
                     }
@@ -374,10 +371,10 @@ fn parse_sse_event(
             let index = parsed["index"].as_u64().unwrap_or(0) as usize;
             if let Some(block) = blocks.get(index) {
                 match block {
-                    BlockKind::Text => events.push(Ok(AssistantStreamEvent::TextEnd)),
-                    BlockKind::Thinking => events.push(Ok(AssistantStreamEvent::ThinkingEnd)),
+                    BlockKind::Text => events.push(Ok(AssistantStreamEvent::TextEnd { signature: None })),
+                    BlockKind::Thinking => events.push(Ok(AssistantStreamEvent::ThinkingEnd { signature: None })),
                     BlockKind::ToolUse { id, .. } => {
-                        events.push(Ok(AssistantStreamEvent::ToolCallEnd { id: id.clone() }));
+                        events.push(Ok(AssistantStreamEvent::ToolCallEnd { id: id.clone(), signature: None }));
                     }
                 }
             }

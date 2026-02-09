@@ -1,0 +1,57 @@
+use std::pin::Pin;
+use futures::Stream;
+
+use super::{ApiError, ApiRequest};
+
+type ByteStream = Pin<Box<dyn Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Send>>;
+
+// Send an ApiRequest, return the response as a byte stream.
+// Checks for HTTP error status codes before returning.
+pub async fn send(request: &ApiRequest) -> Result<ByteStream, ApiError> {
+    let client = reqwest::Client::new();
+
+    let mut builder = client.post(&request.url);
+    for (key, value) in &request.headers {
+        builder = builder.header(key.as_str(), value.as_str());
+    }
+    builder = builder.body(request.body.clone());
+
+    let response = builder.send().await?;
+    let status = response.status().as_u16();
+
+    if status >= 400 {
+        let body = response.text().await.unwrap_or_default();
+        return Err(parse_http_error(status, &body));
+    }
+
+    Ok(Box::pin(response.bytes_stream()))
+}
+
+fn parse_http_error(status: u16, body: &str) -> ApiError {
+    let parsed: serde_json::Value = serde_json::from_str(body).unwrap_or_default();
+
+    // Anthropic error shape
+    if let Some(error) = parsed.get("error") {
+        let error_type = error["type"].as_str().unwrap_or("unknown");
+        let message = error["message"].as_str().unwrap_or(body).to_string();
+
+        if error_type == "rate_limit_error" || status == 429 {
+            return ApiError::RateLimited { retry_after_ms: 5000 };
+        }
+        if message.contains("token") && (message.contains("exceed") || message.contains("limit")) {
+            return ApiError::ContextOverflow { used: 0, limit: 0 };
+        }
+        return ApiError::Api { status, message: format!("{}: {}", error_type, message) };
+    }
+
+    // Google error shape
+    if let Some(error) = parsed.get("error") {
+        let message = error["message"].as_str().unwrap_or(body).to_string();
+        if status == 429 || body.contains("RESOURCE_EXHAUSTED") {
+            return ApiError::RateLimited { retry_after_ms: 5000 };
+        }
+        return ApiError::Api { status, message };
+    }
+
+    ApiError::Api { status, message: body.to_string() }
+}

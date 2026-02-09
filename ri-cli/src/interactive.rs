@@ -1,114 +1,186 @@
-// Interactive mode: REPL-style agent interaction.
-//
-// Reads user input from stdin, sends to agent, streams response to terminal.
-// Uses basic line-oriented I/O (no raw mode / ratatui for v1).
-// The agent runs in the background and events are printed as they arrive.
-
-use ri_ai::oauth::{LoginState, OAuthProvider};
-use ri_core::event::{AgentEvent, AssistantStreamEvent, EventReceiver};
-use ri_core::types::AgentMessage;
+use ri::agent::{self, AgentEvent, RunConfig};
+use ri::api::{GeminiVariant, Provider, StreamEvent};
+use ri::tools::ToolDef;
+use ri::types::*;
 use std::io::Write;
+use std::path::PathBuf;
 use tokio::io::AsyncBufReadExt;
-use tokio::sync::mpsc;
 
 use crate::auth::AuthStore;
 
-/// Run interactive mode.
-///
-/// The agent is owned by the caller. We take handles for steering/follow-up
-/// and run the display + input loops concurrently.
 pub async fn run(
-    mut agent: ri_core::agent::Agent,
-    event_rx: EventReceiver,
+    mut provider: Provider,
+    model: Model,
+    system_prompt: String,
+    tools: Vec<ToolDef>,
+    cwd: PathBuf,
     initial_prompt: Option<String>,
 ) -> eyre::Result<()> {
-    let cancel = agent.cancel_token();
-
-    // Channel for user input -> agent prompt
-    let (input_tx, mut input_rx) = mpsc::channel::<String>(16);
-
-    // Spawn display task (consumes agent events, prints to terminal)
-    let display_cancel = cancel.clone();
-    let display_task = tokio::spawn(display_loop(event_rx, display_cancel));
-
-    // Spawn input task (reads lines from stdin)
-    let input_cancel = cancel.clone();
-    tokio::spawn(input_loop(input_tx, input_cancel));
+    let mut messages: Vec<Message> = Vec::new();
 
     // If there's an initial prompt, run it first
     if let Some(prompt) = initial_prompt {
         print_user_prefix();
-        println!("{prompt}");
-        agent.prompt(AgentMessage::user(prompt)).await?;
+        println!("{}", prompt);
+        messages.push(Message::user(&prompt));
+
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let config = RunConfig {
+            provider: &provider,
+            model: &model,
+            system_prompt: &system_prompt,
+            tools: &tools,
+            thinking: ThinkingLevel::Medium,
+            max_tokens: None,
+            cwd: &cwd,
+        };
+        agent::run(&config, &mut messages, &mut |evt| display_event(&evt), cancel).await?;
     }
 
-    // Login state: when Some, the next input line is treated as the OAuth code.
-    let mut login_pending: Option<LoginState> = None;
+    // Main REPL loop
+    let stdin = tokio::io::stdin();
+    let reader = tokio::io::BufReader::new(stdin);
+    let mut lines = reader.lines();
 
-    // Main loop: wait for user input, then run agent
+    // Login state
+    let mut login_pending: Option<ri::auth::anthropic::LoginFlow> = None;
+
     loop {
         if login_pending.is_some() {
             eprint!("\x1b[33mPaste code: \x1b[0m");
-            let _ = std::io::stderr().flush();
         } else {
-            print_prompt();
+            eprint!("\x1b[36m> \x1b[0m");
+        }
+        let _ = std::io::stderr().flush();
+
+        let line = match lines.next_line().await {
+            Ok(Some(l)) => l,
+            _ => break,
+        };
+
+        let trimmed = line.trim();
+        if trimmed.is_empty() { continue; }
+
+        // Login code completion
+        if let Some(flow) = login_pending.take() {
+            match ri::auth::anthropic::complete_login(trimmed, &flow).await {
+                Ok(creds) => {
+                    let key = creds.access.clone();
+                    let mut store = AuthStore::load();
+                    store.set("anthropic", creds);
+                    let _ = store.save();
+                    eprintln!("\x1b[32mLogged in successfully.\x1b[0m");
+                    provider = Provider::Anthropic { api_key: key };
+                }
+                Err(e) => eprintln!("\x1b[31m[login failed: {}]\x1b[0m", e),
+            }
+            continue;
         }
 
-        tokio::select! {
-            input = input_rx.recv() => {
-                match input {
-                    Some(line) => {
-                        let trimmed = line.trim();
-                        if trimmed.is_empty() {
-                            continue;
-                        }
-
-                        // If we're waiting for a login code, complete the flow
-                        if let Some(state) = login_pending.take() {
-                            if let Some(key) = complete_login(trimmed, &state).await {
-                                agent.config.api_key = key;
-                            }
-                            continue;
-                        }
-
-                        // Handle special commands
-                        if trimmed == "/quit" || trimmed == "/exit" {
-                            break;
-                        }
-
-                        if trimmed == "/help" {
-                            print_help();
-                            continue;
-                        }
-
-                        if trimmed == "/login" {
-                            login_pending = begin_login();
-                            continue;
-                        }
-
-                        // Send to agent. Errors are printed but don't kill the REPL.
-                        if let Err(e) = agent.prompt(AgentMessage::user(trimmed.to_string())).await {
-                            eprintln!("\x1b[31m[error: {e}]\x1b[0m");
-                        }
-                    }
-                    None => break, // Input channel closed (stdin EOF)
-                }
+        // Commands
+        match trimmed {
+            "/quit" | "/exit" => break,
+            "/help" => {
+                eprintln!("\x1b[33mCommands:\x1b[0m");
+                eprintln!("  /login              - Log in via OAuth (Anthropic)");
+                eprintln!("  /login google       - Log in via OAuth (Google Antigravity)");
+                eprintln!("  /login gemini       - Log in via OAuth (Google Gemini CLI)");
+                eprintln!("  /quit, /exit        - Exit ri");
+                continue;
             }
-            _ = cancel.cancelled() => break,
+            "/login" | "/login anthropic" => {
+                match ri::auth::anthropic::begin_login() {
+                    Ok(flow) => {
+                        eprintln!("\n\x1b[33mVisit this URL to authorize:\x1b[0m");
+                        eprintln!("\x1b[4m{}\x1b[0m\n", flow.url);
+                        login_pending = Some(flow);
+                    }
+                    Err(e) => eprintln!("\x1b[31m[login error: {}]\x1b[0m", e),
+                }
+                continue;
+            }
+            cmd if cmd == "/login google" || cmd == "/login google-antigravity" => {
+                if let Some(p) = do_google_login(GeminiVariant::Antigravity).await {
+                    provider = p;
+                }
+                continue;
+            }
+            cmd if cmd == "/login gemini" || cmd == "/login google-gemini-cli" => {
+                if let Some(p) = do_google_login(GeminiVariant::Cli).await {
+                    provider = p;
+                }
+                continue;
+            }
+            _ => {}
+        }
+
+        // Send to agent
+        messages.push(Message::user(trimmed));
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let config = RunConfig {
+            provider: &provider,
+            model: &model,
+            system_prompt: &system_prompt,
+            tools: &tools,
+            thinking: ThinkingLevel::Medium,
+            max_tokens: None,
+            cwd: &cwd,
+        };
+
+        if let Err(e) = agent::run(&config, &mut messages, &mut |evt| display_event(&evt), cancel).await {
+            eprintln!("\x1b[31m[error: {}]\x1b[0m", e);
         }
     }
-
-    // Clean up
-    cancel.cancel();
-    let _ = display_task.await;
 
     println!();
     Ok(())
 }
 
-fn print_prompt() {
-    eprint!("\x1b[36m> \x1b[0m");
-    let _ = std::io::stderr().flush();
+fn display_event(evt: &AgentEvent) {
+    match evt {
+        AgentEvent::StreamEvent(se) => match se {
+            StreamEvent::TextStart => {}
+            StreamEvent::TextDelta(d) => {
+                print!("{}", d);
+                let _ = std::io::stdout().flush();
+            }
+            StreamEvent::TextEnd { .. } => { println!(); }
+            StreamEvent::ThinkingStart => { eprint!("\x1b[2m"); }
+            StreamEvent::ThinkingDelta(d) => {
+                eprint!("{}", d);
+                let _ = std::io::stderr().flush();
+            }
+            StreamEvent::ThinkingEnd { .. } => { eprintln!("\x1b[0m"); }
+            StreamEvent::ToolCallStart { name, .. } => {
+                eprintln!("\x1b[33m[tool: {}]\x1b[0m", name);
+            }
+            StreamEvent::Error(msg) => {
+                eprintln!("\x1b[31m[error: {}]\x1b[0m", msg);
+            }
+            _ => {}
+        },
+        AgentEvent::ToolStart { name, .. } => {
+            eprintln!("\x1b[33m[executing: {}]\x1b[0m", name);
+        }
+        AgentEvent::ToolEnd { output, is_error, .. } => {
+            if *is_error {
+                eprintln!("\x1b[31m[tool error: {}]\x1b[0m", output);
+            } else {
+                let display = if output.len() > 200 {
+                    let end = output.char_indices()
+                        .map(|(i, _)| i)
+                        .take_while(|&i| i <= 200)
+                        .last()
+                        .unwrap_or(0);
+                    format!("{}... ({} bytes)", &output[..end], output.len())
+                } else {
+                    output.clone()
+                };
+                eprintln!("\x1b[2m[result: {}]\x1b[0m", display);
+            }
+        }
+        _ => {}
+    }
 }
 
 fn print_user_prefix() {
@@ -116,186 +188,35 @@ fn print_user_prefix() {
     let _ = std::io::stderr().flush();
 }
 
-fn print_help() {
-    eprintln!("\x1b[33mCommands:\x1b[0m");
-    eprintln!("  /login        - Log in via OAuth (Anthropic)");
-    eprintln!("  /quit, /exit  - Exit ri");
-    eprintln!("  /help         - Show this help");
-    eprintln!();
-}
+async fn do_google_login(variant: GeminiVariant) -> Option<Provider> {
+    let variant_name = match variant {
+        GeminiVariant::Antigravity => "google-antigravity",
+        GeminiVariant::Cli => "google-gemini-cli",
+    };
 
-fn begin_login() -> Option<LoginState> {
-    let provider = ri_ai::oauth::anthropic_oauth::AnthropicOAuth::new();
-    match provider.begin_login() {
-        Ok((result, state)) => {
-            eprintln!();
-            eprintln!("\x1b[33mVisit this URL to authorize:\x1b[0m");
-            eprintln!("\x1b[4m{}\x1b[0m", result.url);
-            if let Some(instructions) = result.instructions {
-                eprintln!("\x1b[2m{instructions}\x1b[0m");
-            }
-            eprintln!();
-            Some(state)
-        }
-        Err(e) => {
-            eprintln!("\x1b[31m[login error: {e}]\x1b[0m");
-            None
-        }
-    }
-}
+    eprintln!("\x1b[33mStarting Google OAuth login...\x1b[0m");
 
-async fn complete_login(code: &str, state: &LoginState) -> Option<String> {
-    let provider = ri_ai::oauth::anthropic_oauth::AnthropicOAuth::new();
-    match provider.complete_login(code, state).await {
+    match ri::auth::google::login(variant, |url| {
+        eprintln!("\n\x1b[33mVisit this URL to authorize:\x1b[0m");
+        eprintln!("\x1b[4m{}\x1b[0m\n", url);
+        #[cfg(target_os = "macos")]
+        { let _ = std::process::Command::new("open").arg(url).spawn(); }
+    }).await {
         Ok(creds) => {
-            let key = creds.access.clone();
-            let mut store = AuthStore::load();
-            store.set("anthropic", creds);
-            match store.save() {
-                Ok(()) => {
-                    eprintln!("\x1b[32mLogged in successfully.\x1b[0m");
-                    eprintln!("\x1b[2mCredentials saved to {}\x1b[0m", AuthStore::path().display());
-                }
-                Err(e) => {
-                    eprintln!("\x1b[31m[failed to save credentials: {e}]\x1b[0m");
-                }
+            let (token, project_id) = ri::auth::google::build_api_key(&creds);
+            if let Some(ref email) = creds.email {
+                eprintln!("\x1b[32mLogged in as {}\x1b[0m", email);
+            } else {
+                eprintln!("\x1b[32mLogged in successfully.\x1b[0m");
             }
-            Some(key)
+            let mut store = AuthStore::load();
+            store.set(variant_name, creds);
+            let _ = store.save();
+            Some(Provider::Gemini { variant, token, project_id })
         }
         Err(e) => {
-            eprintln!("\x1b[31m[login failed: {e}]\x1b[0m");
+            eprintln!("\x1b[31m[Google login failed: {}]\x1b[0m", e);
             None
-        }
-    }
-}
-
-async fn input_loop(tx: mpsc::Sender<String>, cancel: tokio_util::sync::CancellationToken) {
-    let stdin = tokio::io::stdin();
-    let reader = tokio::io::BufReader::new(stdin);
-    let mut lines = reader.lines();
-
-    loop {
-        tokio::select! {
-            _ = cancel.cancelled() => break,
-            line = lines.next_line() => {
-                match line {
-                    Ok(Some(text)) => {
-                        if tx.send(text).await.is_err() {
-                            break;
-                        }
-                    }
-                    Ok(None) => break, // EOF
-                    Err(_) => break,
-                }
-            }
-        }
-    }
-}
-
-async fn display_loop(
-    mut rx: EventReceiver,
-    cancel: tokio_util::sync::CancellationToken,
-) {
-    let mut in_text = false;
-    let mut in_thinking = false;
-
-    loop {
-        tokio::select! {
-            _ = cancel.cancelled() => break,
-            event = rx.recv() => {
-                match event {
-                    Ok(evt) => {
-                        match evt {
-                            AgentEvent::MessageUpdate(ref stream_evt) => match stream_evt {
-                                AssistantStreamEvent::TextStart => {
-                                    in_text = true;
-                                }
-                                AssistantStreamEvent::TextDelta { delta } => {
-                                    print!("{delta}");
-                                    let _ = std::io::stdout().flush();
-                                }
-                                AssistantStreamEvent::TextEnd => {
-                                    if in_text {
-                                        println!();
-                                        in_text = false;
-                                    }
-                                }
-                                AssistantStreamEvent::ThinkingStart => {
-                                    in_thinking = true;
-                                    eprint!("\x1b[2m"); // dim
-                                }
-                                AssistantStreamEvent::ThinkingDelta { delta } => {
-                                    eprint!("{delta}");
-                                    let _ = std::io::stderr().flush();
-                                }
-                                AssistantStreamEvent::ThinkingEnd => {
-                                    if in_thinking {
-                                        eprint!("\x1b[0m"); // reset
-                                        eprintln!();
-                                        in_thinking = false;
-                                    }
-                                }
-                                AssistantStreamEvent::ToolCallStart { name, .. } => {
-                                    eprintln!("\x1b[33m[tool: {name}]\x1b[0m");
-                                }
-                                AssistantStreamEvent::Error { message } => {
-                                    eprintln!("\x1b[31m[error: {message}]\x1b[0m");
-                                }
-                                _ => {}
-                            },
-                            AgentEvent::ToolExecutionStart { tool_call } => {
-                                eprintln!(
-                                    "\x1b[33m[executing: {}]\x1b[0m",
-                                    tool_call.name
-                                );
-                            }
-                            AgentEvent::ToolExecutionEnd {
-                                result,
-                                is_error,
-                                ..
-                            } => {
-                                for block in &result {
-                                    if let ri_core::types::ContentBlock::Text { text } = block {
-                                        if is_error {
-                                            eprintln!("\x1b[31m[tool error: {}]\x1b[0m", text);
-                                        } else {
-                                            // Truncate long tool output (char-safe)
-                                            let display = if text.len() > 200 {
-                                                let end = text
-                                                    .char_indices()
-                                                    .map(|(i, _)| i)
-                                                    .take_while(|&i| i <= 200)
-                                                    .last()
-                                                    .unwrap_or(0);
-                                                format!(
-                                                    "{}... ({} bytes)",
-                                                    &text[..end],
-                                                    text.len()
-                                                )
-                                            } else {
-                                                text.clone()
-                                            };
-                                            eprintln!(
-                                                "\x1b[2m[result: {}]\x1b[0m",
-                                                display
-                                            );
-                                        }
-                                    }
-                                }
-                            }
-                            AgentEvent::AgentEnd => {
-                                // Agent finished this turn. The main loop will
-                                // print a new prompt.
-                            }
-                            _ => {}
-                        }
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                        eprintln!("\x1b[33m[skipped {n} events]\x1b[0m");
-                    }
-                }
-            }
         }
     }
 }

@@ -83,7 +83,7 @@ impl Tool for GrepTool {
         };
 
         Ok(ToolResultOutput {
-            content: vec![ContentBlock::Text { text: result }],
+            content: vec![ContentBlock::text(result)],
             is_error: false,
         })
     }
