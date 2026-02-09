@@ -127,11 +127,7 @@ async fn main() -> Result<()> {
     if api_key.is_empty() {
         let mut auth_store = auth::AuthStore::load();
         if let Some(creds) = auth_store.get(provider_name).cloned() {
-            // Detect stale OAuth tokens (sk-ant-oat...) from before the create_api_key
-            // fix. These won't work with the Messages API -- user needs to /login again.
-            if creds.access.starts_with("sk-ant-oat") {
-                tracing::warn!("Saved credentials contain an OAuth token, not an API key. Run /login to re-authenticate.");
-            } else if auth::AuthStore::is_expired(&creds) {
+            if auth::AuthStore::is_expired(&creds) {
                 let oauth = ri_ai::oauth::anthropic_oauth::AnthropicOAuth::new();
                 match oauth.refresh_token(&creds).await {
                     Ok(new_creds) => {

@@ -533,27 +533,34 @@ impl LlmProvider for AnthropicProvider {
         let body = build_request_body(model, messages, options);
         let url = format!("{}/v1/messages", model.base_url.trim_end_matches('/'));
 
+        let is_oauth = api_key.contains("sk-ant-oat");
+
         let mut headers = HeaderMap::new();
-        // The Anthropic Messages API uses x-api-key for authentication.
-        // OAuth tokens are exchanged for real API keys during login, so this
-        // should always receive a proper API key (sk-ant-api...).
-        headers.insert("x-api-key", HeaderValue::from_str(api_key).map_err(|e| {
-            ProviderError::Other(format!("Invalid API key header: {e}"))
-        })?);
+        if is_oauth {
+            headers.insert("authorization", HeaderValue::from_str(&format!("Bearer {api_key}")).map_err(|e| {
+                ProviderError::Other(format!("Invalid auth header: {e}"))
+            })?);
+            headers.insert(
+                "anthropic-beta",
+                HeaderValue::from_static("claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14"),
+            );
+            headers.insert("user-agent", HeaderValue::from_static("claude-cli/2.1.2 (external, cli)"));
+            headers.insert("x-app", HeaderValue::from_static("cli"));
+        } else {
+            headers.insert("x-api-key", HeaderValue::from_str(api_key).map_err(|e| {
+                ProviderError::Other(format!("Invalid API key header: {e}"))
+            })?);
+            headers.insert(
+                "anthropic-beta",
+                HeaderValue::from_static("interleaved-thinking-2025-05-14"),
+            );
+        }
         headers.insert(
             "anthropic-version",
             HeaderValue::from_static("2023-06-01"),
         );
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
         headers.insert("accept", HeaderValue::from_static("text/event-stream"));
-
-        // Beta features
-        let beta_value = "interleaved-thinking-2025-05-14";
-        headers.insert(
-            "anthropic-beta",
-            HeaderValue::from_str(beta_value)
-                .unwrap_or_else(|_| HeaderValue::from_static("interleaved-thinking-2025-05-14")),
-        );
 
         let response = self
             .client

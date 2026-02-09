@@ -11,7 +11,6 @@ const AUTHORIZE_URL: &str = "https://claude.ai/oauth/authorize";
 const TOKEN_URL: &str = "https://console.anthropic.com/v1/oauth/token";
 const REDIRECT_URI: &str = "https://console.anthropic.com/oauth/code/callback";
 const SCOPES: &str = "org:create_api_key user:profile user:inference";
-const CREATE_API_KEY_URL: &str = "https://api.anthropic.com/api/oauth/claude_cli/create_api_key";
 
 pub struct AnthropicOAuth {
     client: reqwest::Client,
@@ -99,12 +98,7 @@ impl OAuthProvider for AnthropicOAuth {
         }
 
         let body: serde_json::Value = response.json().await?;
-        let mut creds = parse_token_response(&body)?;
-
-        // Exchange the OAuth token for a real API key.
-        // The Messages API does not accept OAuth tokens directly.
-        let api_key = self.create_api_key(&creds.access).await?;
-        creds.access = api_key;
+        let creds = parse_token_response(&body)?;
 
         Ok(creds)
     }
@@ -146,19 +140,8 @@ impl OAuthProvider for AnthropicOAuth {
         let expires_in = body["expires_in"].as_u64().unwrap_or(3600);
         let now_ms = epoch_ms();
 
-        // Exchange the refreshed OAuth token for a new API key.
-        // If this fails, still return the new refresh token so it doesn't get lost
-        // (the server may have rotated it).
-        let api_key = match self.create_api_key(&access).await {
-            Ok(key) => key,
-            Err(e) => {
-                tracing::warn!("API key exchange failed after refresh: {e}");
-                access
-            }
-        };
-
         Ok(OAuthCredentials {
-            access: api_key,
+            access,
             refresh,
             expires: now_ms + (expires_in * 1000),
         })
@@ -166,32 +149,6 @@ impl OAuthProvider for AnthropicOAuth {
 
     fn get_api_key(&self, credentials: &OAuthCredentials) -> String {
         credentials.access.clone()
-    }
-}
-
-impl AnthropicOAuth {
-    /// Exchange an OAuth access token for a real API key via the CLI endpoint.
-    async fn create_api_key(&self, oauth_token: &str) -> eyre::Result<String> {
-        let response = self
-            .client
-            .post(CREATE_API_KEY_URL)
-            .header("authorization", format!("Bearer {oauth_token}"))
-            .header("content-type", "application/x-www-form-urlencoded")
-            .header("accept", "application/json")
-            .send()
-            .await?;
-
-        let status = response.status();
-        if !status.is_success() {
-            let body = response.text().await.unwrap_or_default();
-            return Err(eyre::eyre!("API key creation failed ({}): {}", status, body));
-        }
-
-        let body: serde_json::Value = response.json().await?;
-        body["raw_key"]
-            .as_str()
-            .map(|s| s.to_string())
-            .ok_or_else(|| eyre::eyre!("Missing raw_key in create_api_key response"))
     }
 }
 
