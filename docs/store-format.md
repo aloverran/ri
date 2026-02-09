@@ -52,7 +52,7 @@ Every subsequent line is a message -- the single entity type in the pool.
 | Field | Type | Description |
 |-------|------|-------------|
 | `provenance` | `Provenance` | Present on messages produced by an LLM call (see below) |
-| `ts` | `string` | ISO 8601 timestamp of when the message was created |
+| `meta` | `object` | Application-defined metadata (see below) |
 
 Messages WITHOUT provenance are "authored" -- written by humans, tools, or code.
 Messages WITH provenance are "derived" -- produced by an LLM API call.
@@ -67,18 +67,33 @@ When a message was produced by an LLM call, it carries a `provenance` object rec
 | `input` | `string[]` | yes | Ordered array of message IDs that were sent as the LLM call's input |
 | `model` | `string` | yes | Model identifier (e.g., `"claude-sonnet-4-20250514"`) |
 | `ts` | `string` | yes | ISO 8601 timestamp of when the call completed |
-| `provider` | `string` | no | Provider name (e.g., `"anthropic"`) |
-| `usage` | `Usage` | no | Token usage (see below) |
-| `duration_ms` | `number` | no | Wall-clock duration of the LLM call in milliseconds |
-| `cost` | `number` | no | Estimated cost in USD |
+| `usage` | `Usage` | yes | Token usage (see below) |
 
-**Usage fields** (all optional):
+These four fields are the stable core of provenance -- they capture what went in, what produced it, when, and the cost in tokens. They are unlikely to change.
+
+**Usage fields**:
 | Field | Type | Description |
 |-------|------|-------------|
 | `input_tokens` | `number` | Input tokens consumed |
 | `output_tokens` | `number` | Output tokens generated |
-| `cache_read_tokens` | `number` | Tokens read from cache |
-| `cache_write_tokens` | `number` | Tokens written to cache |
+| `cache_read_tokens` | `number` | Tokens read from cache (0 if not applicable) |
+| `cache_write_tokens` | `number` | Tokens written to cache (0 if not applicable) |
+
+## Metadata
+
+The `meta` field on a message is an open object for application-defined data. The store preserves it on round-trip but does not interpret it. Applications use it for domain-specific information that may evolve over time.
+
+For ri (the coding agent), common metadata fields include:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `ts` | `string` | ISO 8601 timestamp of when the message was created |
+| `provider` | `string` | Provider name (e.g., `"anthropic"`) |
+| `duration_ms` | `number` | Wall-clock duration of the LLM call |
+| `cost` | `number` | Estimated cost in USD |
+| `thinking` | `string` | Thinking level used (e.g., `"medium"`) |
+
+Other applications may store different metadata entirely. The format does not constrain this.
 
 ## Content blocks
 
@@ -113,11 +128,11 @@ A coding agent session: user asks to fix a bug, agent reads a file, makes an edi
 {"session":"fix-login-crash","ts":"2026-02-09T08:00:00Z","cwd":"/Users/john/Projects/myapp"}
 {"id":"fx_s1","role":"system","content":[{"type":"text","text":"You are ri, a coding agent. You have tools for reading and editing code."}]}
 {"id":"fx_u1","role":"user","content":[{"type":"text","text":"There's a crash in the login handler. Fix it."}]}
-{"id":"fx_a1","role":"assistant","content":[{"type":"text","text":"I'll look at the login handler."},{"type":"tool_use","id":"tc_1","name":"read","input":{"path":"src/handlers/login.rs"}}],"provenance":{"input":["fx_s1","fx_u1"],"model":"claude-sonnet-4-20250514","ts":"2026-02-09T08:00:05Z","usage":{"input_tokens":245,"output_tokens":89},"duration_ms":2100}}
+{"id":"fx_a1","role":"assistant","content":[{"type":"text","text":"I'll look at the login handler."},{"type":"tool_use","id":"tc_1","name":"read","input":{"path":"src/handlers/login.rs"}}],"provenance":{"input":["fx_s1","fx_u1"],"model":"claude-sonnet-4-20250514","ts":"2026-02-09T08:00:05Z","usage":{"input_tokens":245,"output_tokens":89,"cache_read_tokens":0,"cache_write_tokens":0}},"meta":{"provider":"anthropic","duration_ms":2100}}
 {"id":"fx_tr1","role":"user","content":[{"type":"tool_result","toolUseId":"tc_1","content":[{"type":"text","text":"     1\tpub fn handle_login(req: Request) -> Response {\n     2\t    let user = db.find_user(req.username);\n     3\t    if user.verify(req.password) {\n     4\t        session.create(user.id)\n     5\t    }\n     6\t}"}],"is_error":false}]}
-{"id":"fx_a2","role":"assistant","content":[{"type":"text","text":"The function doesn't handle the case where the user is not found. `db.find_user` could return None. Let me fix it."},{"type":"tool_use","id":"tc_2","name":"edit","input":{"path":"src/handlers/login.rs","old_text":"let user = db.find_user(req.username);\n    if user.verify(req.password) {","new_text":"let user = match db.find_user(req.username) {\n        Some(u) => u,\n        None => return Response::not_found(),\n    };\n    if user.verify(req.password) {"}}],"provenance":{"input":["fx_s1","fx_u1","fx_a1","fx_tr1"],"model":"claude-sonnet-4-20250514","ts":"2026-02-09T08:00:15Z","usage":{"input_tokens":534,"output_tokens":156},"duration_ms":3400}}
+{"id":"fx_a2","role":"assistant","content":[{"type":"text","text":"The function doesn't handle the case where the user is not found. `db.find_user` could return None. Let me fix it."},{"type":"tool_use","id":"tc_2","name":"edit","input":{"path":"src/handlers/login.rs","old_text":"let user = db.find_user(req.username);\n    if user.verify(req.password) {","new_text":"let user = match db.find_user(req.username) {\n        Some(u) => u,\n        None => return Response::not_found(),\n    };\n    if user.verify(req.password) {"}}],"provenance":{"input":["fx_s1","fx_u1","fx_a1","fx_tr1"],"model":"claude-sonnet-4-20250514","ts":"2026-02-09T08:00:15Z","usage":{"input_tokens":534,"output_tokens":156,"cache_read_tokens":0,"cache_write_tokens":0}},"meta":{"provider":"anthropic","duration_ms":3400}}
 {"id":"fx_tr2","role":"user","content":[{"type":"tool_result","toolUseId":"tc_2","content":[{"type":"text","text":"Edited src/handlers/login.rs"}],"is_error":false}]}
-{"id":"fx_a3","role":"assistant","content":[{"type":"text","text":"Fixed. The crash was caused by `db.find_user` returning None when the username doesn't exist. The function now returns a 404 response in that case."}],"provenance":{"input":["fx_s1","fx_u1","fx_a1","fx_tr1","fx_a2","fx_tr2"],"model":"claude-sonnet-4-20250514","ts":"2026-02-09T08:00:25Z","usage":{"input_tokens":823,"output_tokens":67},"duration_ms":1800}}
+{"id":"fx_a3","role":"assistant","content":[{"type":"text","text":"Fixed. The crash was caused by `db.find_user` returning None when the username doesn't exist. The function now returns a 404 response in that case."}],"provenance":{"input":["fx_s1","fx_u1","fx_a1","fx_tr1","fx_a2","fx_tr2"],"model":"claude-sonnet-4-20250514","ts":"2026-02-09T08:00:25Z","usage":{"input_tokens":823,"output_tokens":67,"cache_read_tokens":0,"cache_write_tokens":0}},"meta":{"provider":"anthropic","duration_ms":1800}}
 ```
 
 ### Reading this file
@@ -161,7 +176,7 @@ A review session references a message from the fix session:
 {"session":"review-login-fix","ts":"2026-02-09T09:00:00Z","cwd":"/Users/john/Projects/myapp"}
 {"id":"rv_s1","role":"system","content":[{"type":"text","text":"You are a thorough code reviewer."}]}
 {"id":"rv_u1","role":"user","content":[{"type":"text","text":"Review this fix and its rationale:"}]}
-{"id":"rv_a1","role":"assistant","content":[{"type":"text","text":"The fix correctly handles the None case, but you should also consider..."}],"provenance":{"input":["rv_s1","rv_u1","fx_a2","fx_a3"],"model":"claude-sonnet-4-20250514","ts":"2026-02-09T09:00:10Z"}}
+{"id":"rv_a1","role":"assistant","content":[{"type":"text","text":"The fix correctly handles the None case, but you should also consider..."}],"provenance":{"input":["rv_s1","rv_u1","fx_a2","fx_a3"],"model":"claude-sonnet-4-20250514","ts":"2026-02-09T09:00:10Z","usage":{"input_tokens":612,"output_tokens":98,"cache_read_tokens":0,"cache_write_tokens":0}}}
 ```
 
 Message `rv_a1`'s provenance shows it was produced from inputs that include `fx_a2` and `fx_a3` -- messages from the `fix-login-crash` session. The system resolves these IDs from the global pool (populated by loading both session files).
@@ -173,7 +188,7 @@ The review session file is readable on its own (you can see what was sent and re
 Compaction (summarizing old messages) produces a new message via an LLM call:
 
 ```jsonl
-{"id":"fx_sum1","role":"system","content":[{"type":"text","text":"Previous context: We fixed a crash in src/handlers/login.rs where db.find_user could return None. Added a match statement returning 404 for unknown users."}],"provenance":{"input":["fx_s1","fx_u1","fx_a1","fx_tr1","fx_a2","fx_tr2","fx_a3"],"model":"claude-sonnet-4-20250514","ts":"2026-02-09T10:00:00Z"}}
+{"id":"fx_sum1","role":"system","content":[{"type":"text","text":"Previous context: We fixed a crash in src/handlers/login.rs where db.find_user could return None. Added a match statement returning 404 for unknown users."}],"provenance":{"input":["fx_s1","fx_u1","fx_a1","fx_tr1","fx_a2","fx_tr2","fx_a3"],"model":"claude-sonnet-4-20250514","ts":"2026-02-09T10:00:00Z","usage":{"input_tokens":823,"output_tokens":45,"cache_read_tokens":0,"cache_write_tokens":0}},"meta":{"purpose":"compaction"}}
 ```
 
 This summary message (`fx_sum1`) was produced by asking the LLM to summarize the conversation. Its provenance records what it was derived from. Future LLM calls can use `fx_sum1` instead of the seven messages it summarizes, saving context space. The original messages remain in the pool.
@@ -244,24 +259,21 @@ struct Message {
     pub role: Role,
     pub content: Vec<ContentBlock>,
     pub provenance: Option<Provenance>,
-    pub ts: Option<String>,
+    pub meta: Option<serde_json::Value>,  // application-defined, open object
 }
 
 struct Provenance {
     pub input: Vec<String>,
     pub model: String,
     pub ts: String,
-    pub provider: Option<String>,
-    pub usage: Option<Usage>,
-    pub duration_ms: Option<u64>,
-    pub cost: Option<f64>,
+    pub usage: Usage,
 }
 
 struct Usage {
-    pub input_tokens: Option<u64>,
-    pub output_tokens: Option<u64>,
-    pub cache_read_tokens: Option<u64>,
-    pub cache_write_tokens: Option<u64>,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cache_write_tokens: u64,
 }
 ```
 

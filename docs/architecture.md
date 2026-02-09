@@ -44,16 +44,18 @@ Every message has:
 
 Some messages also have:
 
-- **provenance**: record of the LLM call that produced this message
+- **provenance**: record of the LLM call that produced this message (the stable core)
   - `input`: ordered array of message IDs (the exact context the LLM saw)
   - `model`: which model was used
   - `ts`: when the call completed
-  - `usage`: token counts (optional)
-  - `duration_ms`: wall-clock time (optional)
-  - `cost`: estimated cost in USD (optional)
+  - `usage`: token counts (input, output, cache read, cache write)
+- **meta**: open object for application-defined metadata (provider name, duration, cost, thinking level, etc.)
+
+Provenance captures the four things that are fundamental and stable: what went in, what produced it, when, and the token cost. Everything else (provider details, wall-clock time, dollar cost, thinking level) goes in `meta`, which is an open object the store preserves but does not interpret. This lets applications extend the metadata without changing the core format.
 
 Messages without provenance are "authored" -- written by humans, tools, or code.
 Messages with provenance are "derived" -- produced by an LLM call.
+Both can carry `meta` for application-specific data (e.g., a timestamp on authored messages, or cost tracking on derived ones).
 
 A message is immutable once written. It exists in the pool forever (or until the pool is archived/compacted at the storage level).
 
