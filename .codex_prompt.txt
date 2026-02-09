@@ -1,0 +1,18 @@
+I'm porting a TypeScript coding agent ("pi") to Rust. 65k LOC across 4 packages. I want to know what will go WRONG. Be brutal.
+
+The system has:
+- An agent loop that calls LLMs, gets tool calls, executes them, loops
+- Streaming SSE from multiple providers (Anthropic, OpenAI, Google)
+- A dynamic extension system where TS files are loaded at runtime and can register tools, commands, hooks
+- A TUI with differential rendering
+- Tree-structured JSONL session persistence
+- Context window management with LLM-generated summaries (compaction)
+
+Specific concerns:
+1. The extension system is deeply dynamic. Extensions register event handlers, tools, custom message renderers, providers. In TS this is trivial. In Rust, this is a nightmare. What's the realistic approach?
+2. The streaming API uses async generators that emit typed events. Multiple consumers. How does this translate?
+3. The message types are extensible unions (apps add custom message types via TS declaration merging). Rust enums are closed. What breaks?
+4. Error handling: TS uses try/catch everywhere with string errors. Rust needs explicit error types.
+5. The TUI mixes mutable state freely (components mutate, re-render, components reference each other). Rust's borrow checker will hate this.
+
+What are the top 10 things that will bite us? What should we cut or redesign rather than port 1:1?

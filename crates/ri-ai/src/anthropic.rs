@@ -534,6 +534,9 @@ impl LlmProvider for AnthropicProvider {
         let url = format!("{}/v1/messages", model.base_url.trim_end_matches('/'));
 
         let mut headers = HeaderMap::new();
+        // The Anthropic Messages API uses x-api-key for authentication.
+        // OAuth tokens are exchanged for real API keys during login, so this
+        // should always receive a proper API key (sk-ant-api...).
         headers.insert("x-api-key", HeaderValue::from_str(api_key).map_err(|e| {
             ProviderError::Other(format!("Invalid API key header: {e}"))
         })?);

@@ -4,11 +4,14 @@
 // Uses basic line-oriented I/O (no raw mode / ratatui for v1).
 // The agent runs in the background and events are printed as they arrive.
 
+use ri_ai::oauth::{LoginState, OAuthProvider};
 use ri_core::event::{AgentEvent, AssistantStreamEvent, EventReceiver};
 use ri_core::types::AgentMessage;
 use std::io::Write;
 use tokio::io::AsyncBufReadExt;
 use tokio::sync::mpsc;
+
+use crate::auth::AuthStore;
 
 /// Run interactive mode.
 ///
@@ -39,9 +42,17 @@ pub async fn run(
         agent.prompt(AgentMessage::user(prompt)).await?;
     }
 
+    // Login state: when Some, the next input line is treated as the OAuth code.
+    let mut login_pending: Option<LoginState> = None;
+
     // Main loop: wait for user input, then run agent
     loop {
-        print_prompt();
+        if login_pending.is_some() {
+            eprint!("\x1b[33mPaste code: \x1b[0m");
+            let _ = std::io::stderr().flush();
+        } else {
+            print_prompt();
+        }
 
         tokio::select! {
             input = input_rx.recv() => {
@@ -52,6 +63,14 @@ pub async fn run(
                             continue;
                         }
 
+                        // If we're waiting for a login code, complete the flow
+                        if let Some(state) = login_pending.take() {
+                            if let Some(key) = complete_login(trimmed, &state).await {
+                                agent.config.api_key = key;
+                            }
+                            continue;
+                        }
+
                         // Handle special commands
                         if trimmed == "/quit" || trimmed == "/exit" {
                             break;
@@ -59,6 +78,11 @@ pub async fn run(
 
                         if trimmed == "/help" {
                             print_help();
+                            continue;
+                        }
+
+                        if trimmed == "/login" {
+                            login_pending = begin_login();
                             continue;
                         }
 
@@ -94,9 +118,55 @@ fn print_user_prefix() {
 
 fn print_help() {
     eprintln!("\x1b[33mCommands:\x1b[0m");
+    eprintln!("  /login        - Log in via OAuth (Anthropic)");
     eprintln!("  /quit, /exit  - Exit ri");
     eprintln!("  /help         - Show this help");
     eprintln!();
+}
+
+fn begin_login() -> Option<LoginState> {
+    let provider = ri_ai::oauth::anthropic_oauth::AnthropicOAuth::new();
+    match provider.begin_login() {
+        Ok((result, state)) => {
+            eprintln!();
+            eprintln!("\x1b[33mVisit this URL to authorize:\x1b[0m");
+            eprintln!("\x1b[4m{}\x1b[0m", result.url);
+            if let Some(instructions) = result.instructions {
+                eprintln!("\x1b[2m{instructions}\x1b[0m");
+            }
+            eprintln!();
+            Some(state)
+        }
+        Err(e) => {
+            eprintln!("\x1b[31m[login error: {e}]\x1b[0m");
+            None
+        }
+    }
+}
+
+async fn complete_login(code: &str, state: &LoginState) -> Option<String> {
+    let provider = ri_ai::oauth::anthropic_oauth::AnthropicOAuth::new();
+    match provider.complete_login(code, state).await {
+        Ok(creds) => {
+            let key = creds.access.clone();
+            let mut store = AuthStore::load();
+            store.set("anthropic", creds);
+            match store.save() {
+                Ok(()) => {
+                    eprintln!("\x1b[32mLogged in successfully.\x1b[0m");
+                    eprintln!("\x1b[2mCredentials saved to {}\x1b[0m", AuthStore::path().display());
+                }
+                Err(e) => {
+                    eprintln!("\x1b[31m[failed to save credentials: {e}]\x1b[0m");
+                }
+            }
+            Some(key)
+        }
+        Err(e) => {
+            eprintln!("\x1b[31m[login failed: {e}]\x1b[0m");
+            None
+        }
+    }
 }
 
 async fn input_loop(tx: mpsc::Sender<String>, cancel: tokio_util::sync::CancellationToken) {

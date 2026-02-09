@@ -4,7 +4,9 @@
 
 use clap::Parser;
 use color_eyre::eyre::Result;
+use ri_ai::oauth::OAuthProvider;
 
+mod auth;
 mod interactive;
 mod print_mode;
 mod resources;
@@ -114,12 +116,40 @@ async fn main() -> Result<()> {
         .cloned()
         .ok_or_else(|| eyre::eyre!("Model not found: {}:{}", provider_name, model_id))?;
 
-    // Resolve API key: models.json provider key -> env var fallback
-    let api_key = match res.provider_api_key(provider_name) {
+    // Resolve API key: models.json -> env var -> OAuth credentials
+    let mut api_key = match res.provider_api_key(provider_name) {
         Some(key_spec) => registry.resolve_api_key(&key_spec).await
             .unwrap_or_default(),
         None => std::env::var("ANTHROPIC_API_KEY").unwrap_or_default(),
     };
+
+    // Fall back to OAuth credentials from ~/.ri/auth.json
+    if api_key.is_empty() {
+        let mut auth_store = auth::AuthStore::load();
+        if let Some(creds) = auth_store.get(provider_name).cloned() {
+            // Detect stale OAuth tokens (sk-ant-oat...) from before the create_api_key
+            // fix. These won't work with the Messages API -- user needs to /login again.
+            if creds.access.starts_with("sk-ant-oat") {
+                tracing::warn!("Saved credentials contain an OAuth token, not an API key. Run /login to re-authenticate.");
+            } else if auth::AuthStore::is_expired(&creds) {
+                let oauth = ri_ai::oauth::anthropic_oauth::AnthropicOAuth::new();
+                match oauth.refresh_token(&creds).await {
+                    Ok(new_creds) => {
+                        api_key = new_creds.access.clone();
+                        auth_store.set(provider_name, new_creds);
+                        let _ = auth_store.save();
+                        tracing::info!("API key refreshed via OAuth");
+                    }
+                    Err(e) => {
+                        tracing::warn!("OAuth token refresh failed: {e}");
+                    }
+                }
+            } else {
+                api_key = creds.access.clone();
+                tracing::info!("Using saved API key");
+            }
+        }
+    }
 
     let provider = registry
         .get_provider(provider_name)
