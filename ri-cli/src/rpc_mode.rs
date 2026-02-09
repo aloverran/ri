@@ -1,7 +1,8 @@
-use ri::agent::{self, AgentEvent, RunConfig};
+use ri::agent::{self, AgentCallback, AgentEvent, RunConfig};
 use ri::api::Provider;
 use ri::tools::ToolDef;
 use ri::types::*;
+use ri_store::types::Message;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::io::Write;
@@ -17,6 +18,23 @@ struct RpcCommand {
     command_type: String,
     #[serde(flatten)]
     data: Value,
+}
+
+struct RpcCallback { counter: u64 }
+
+impl RpcCallback {
+    fn new() -> Self { RpcCallback { counter: 0 } }
+}
+
+impl AgentCallback for RpcCallback {
+    fn next_id(&mut self) -> String {
+        self.counter += 1;
+        format!("rpc_{}", self.counter)
+    }
+
+    fn on_event(&mut self, evt: AgentEvent) {
+        output_json(&print_mode::event_to_json(&evt));
+    }
 }
 
 fn output_json(value: &Value) {
@@ -36,6 +54,7 @@ pub async fn run(
     initial_prompt: Option<String>,
 ) {
     let mut messages: Vec<Message> = Vec::new();
+    let mut cb = RpcCallback::new();
 
     // If there's an initial prompt, start the agent
     if let Some(prompt) = initial_prompt {
@@ -52,9 +71,7 @@ pub async fn run(
             cwd: &cwd,
         };
 
-        let _ = agent::run(&config, &mut messages, &mut |evt| {
-            output_json(&print_mode::event_to_json(&evt));
-        }, cancel).await;
+        let _ = agent::run(&config, &mut messages, &mut cb, cancel).await;
     }
 
     // Read commands from stdin
@@ -95,9 +112,7 @@ pub async fn run(
                     cwd: &cwd,
                 };
 
-                let _ = agent::run(&config, &mut messages, &mut |evt| {
-                    output_json(&print_mode::event_to_json(&evt));
-                }, cancel).await;
+                let _ = agent::run(&config, &mut messages, &mut cb, cancel).await;
 
                 output_json(&json!({"type": "response", "command": "prompt", "success": true}));
             }

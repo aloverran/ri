@@ -11,7 +11,8 @@ use futures::Stream;
 use serde_json::{json, Value};
 use tracing::warn;
 
-use crate::types::*;
+use crate::types::{ThinkingLevel, Role};
+use ri_store::types::{Message, ContentBlock};
 use super::{ApiError, ApiRequest, EventStream, RequestOptions, StreamEvent, ToolSchema};
 use super::sse::{SseEvent, SseParser};
 
@@ -163,29 +164,33 @@ fn convert_message(msg: &Message) -> Value {
     };
 
     let content: Vec<Value> = msg.content.iter().map(convert_content).collect();
-    let has_tool_results = msg.content.iter().any(|c| matches!(c, Content::ToolResult { .. }));
+    let has_tool_results = msg.content.iter().any(|c| matches!(c, ContentBlock::ToolResult { .. }));
     let effective_role = if has_tool_results { "user" } else { role };
 
     json!({ "role": effective_role, "content": content })
 }
 
-fn convert_content(c: &Content) -> Value {
+fn convert_content(c: &ContentBlock) -> Value {
     match c {
-        Content::Text { text, .. } => json!({ "type": "text", "text": text }),
-        Content::Thinking { text, .. } => json!({ "type": "thinking", "thinking": text }),
-        Content::Image { media_type, data } => json!({
+        ContentBlock::Text { text, .. } => json!({ "type": "text", "text": text }),
+        ContentBlock::Thinking { thinking, .. } => json!({ "type": "thinking", "thinking": thinking }),
+        ContentBlock::Image { media_type, data, .. } => json!({
             "type": "image",
             "source": { "type": "base64", "media_type": media_type, "data": data }
         }),
-        Content::ToolUse { id, name, input, .. } => json!({
+        ContentBlock::ToolUse { id, name, input, .. } => json!({
             "type": "tool_use", "id": id, "name": name, "input": input
         }),
-        Content::ToolResult { tool_use_id, output, is_error } => json!({
-            "type": "tool_result",
-            "tool_use_id": tool_use_id,
-            "content": [{ "type": "text", "text": output }],
-            "is_error": is_error,
-        }),
+        ContentBlock::ToolResult { tool_use_id, content, is_error, .. } => {
+            let content_json: Vec<Value> = content.iter().map(convert_content).collect();
+            json!({
+                "type": "tool_result",
+                "tool_use_id": tool_use_id,
+                "content": content_json,
+                "is_error": is_error,
+            })
+        }
+        ContentBlock::Unknown(v) => v.clone(),
     }
 }
 

@@ -6,7 +6,8 @@ pub mod http;
 use std::pin::Pin;
 use futures::Stream;
 
-use crate::types::{Message, Model, ThinkingLevel};
+use crate::types::{Model, ThinkingLevel};
+use ri_store::types::Message;
 
 // The HTTP request the provider builds. Fully visible, inspectable, loggable.
 #[derive(Debug, Clone)]

@@ -67,9 +67,9 @@ When a message was produced by an LLM call, it carries a `provenance` object rec
 | `input` | `string[]` | yes | Ordered array of message IDs that were sent as the LLM call's input |
 | `model` | `string` | yes | Model identifier (e.g., `"claude-sonnet-4-20250514"`) |
 | `ts` | `string` | yes | ISO 8601 timestamp of when the call completed |
-| `usage` | `Usage` | yes | Token usage (see below) |
+| `usage` | `Usage` | no | Token usage (see below). Omitted when provider doesn't report it. |
 
-These four fields are the stable core of provenance -- they capture what went in, what produced it, when, and the cost in tokens. They are unlikely to change.
+These fields are the stable core of provenance -- they capture what went in, what produced it, when, and optionally the cost in tokens. They are unlikely to change.
 
 **Usage fields**:
 | Field | Type | Description |
@@ -266,7 +266,7 @@ struct Provenance {
     pub input: Vec<String>,
     pub model: String,
     pub ts: String,
-    pub usage: Usage,
+    pub usage: Option<Usage>,
 }
 
 struct Usage {

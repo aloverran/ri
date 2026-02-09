@@ -14,7 +14,8 @@ use std::task::{Context, Poll};
 use futures::Stream;
 use serde_json::{json, Value};
 
-use crate::types::*;
+use crate::types::{ThinkingLevel, Role};
+use ri_store::types::{Message, ContentBlock};
 use super::{ApiError, ApiRequest, EventStream, GeminiVariant, RequestOptions, StreamEvent};
 use super::sse::{SseEvent, SseParser};
 
@@ -136,7 +137,7 @@ fn build_contents(messages: &[Message], model_id: &str) -> Vec<Value> {
     let mut tool_names: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     for msg in messages {
         for block in &msg.content {
-            if let Content::ToolUse { id, name, .. } = block {
+            if let ContentBlock::ToolUse { id, name, .. } = block {
                 tool_names.insert(id.clone(), name.clone());
             }
         }
@@ -147,18 +148,22 @@ fn build_contents(messages: &[Message], model_id: &str) -> Vec<Value> {
     for msg in messages {
         if msg.role == Role::System { continue; }
 
-        let has_tool_results = msg.content.iter().any(|c| matches!(c, Content::ToolResult { .. }));
+        let has_tool_results = msg.content.iter().any(|c| matches!(c, ContentBlock::ToolResult { .. }));
 
         if has_tool_results {
             let parts: Vec<Value> = msg.content.iter().filter_map(|c| {
-                if let Content::ToolResult { tool_use_id, output, is_error } = c {
-                    let tool_name = tool_names.get(tool_use_id)
+                if let ContentBlock::ToolResult { tool_use_id, content, is_error, .. } = c {
+                    let tool_name = tool_names.get(tool_use_id.as_str())
                         .cloned()
                         .unwrap_or_else(|| "unknown".to_string());
+                    // Extract text from content blocks for the response.
+                    let output_text: String = content.iter().filter_map(|b| {
+                        if let ContentBlock::Text { text, .. } = b { Some(text.as_str()) } else { None }
+                    }).collect::<Vec<_>>().join("\n");
                     let response = if *is_error {
-                        json!({ "error": output })
+                        json!({ "error": output_text })
                     } else {
-                        json!({ "output": output })
+                        json!({ "output": output_text })
                     };
                     Some(json!({
                         "functionResponse": { "name": tool_name, "response": response }
@@ -199,29 +204,31 @@ fn build_contents(messages: &[Message], model_id: &str) -> Vec<Value> {
         let mut parts: Vec<Value> = Vec::new();
         for block in &msg.content {
             match block {
-                Content::Text { text, sig } => {
+                ContentBlock::Text { text, extra } => {
                     if text.trim().is_empty() { continue; }
                     let mut part = json!({ "text": text });
-                    if let Some(s) = sig {
+                    if let Some(serde_json::Value::String(s)) = extra.get("sig") {
                         if is_valid_signature(s) { part["thoughtSignature"] = json!(s); }
                     }
                     parts.push(part);
                 }
-                Content::Thinking { text, sig } => {
-                    if text.trim().is_empty() { continue; }
+                ContentBlock::Thinking { thinking, extra } => {
+                    if thinking.trim().is_empty() { continue; }
+                    let sig = extra.get("sig").and_then(|v| v.as_str());
                     // From same provider: preserve as thought
                     if let Some(s) = sig {
                         if is_valid_signature(s) {
-                            let mut part = json!({ "text": text, "thought": true });
+                            let mut part = json!({ "text": thinking, "thought": true });
                             part["thoughtSignature"] = json!(s);
                             parts.push(part);
                             continue;
                         }
                     }
                     // From other provider or no sig: convert to plain text
-                    parts.push(json!({ "text": text }));
+                    parts.push(json!({ "text": thinking }));
                 }
-                Content::ToolUse { name, input, sig, .. } => {
+                ContentBlock::ToolUse { name, input, extra, .. } => {
+                    let sig = extra.get("sig").and_then(|v| v.as_str());
                     if let Some(s) = sig {
                         if is_valid_signature(s) {
                             let mut part = json!({ "functionCall": { "name": name, "args": input } });
@@ -244,10 +251,11 @@ fn build_contents(messages: &[Message], model_id: &str) -> Vec<Value> {
                         parts.push(json!({ "functionCall": { "name": name, "args": input } }));
                     }
                 }
-                Content::ToolResult { .. } => {} // handled above
-                Content::Image { media_type, data } => {
+                ContentBlock::ToolResult { .. } => {} // handled above
+                ContentBlock::Image { media_type, data, .. } => {
                     parts.push(json!({ "inlineData": { "mimeType": media_type, "data": data } }));
                 }
+                ContentBlock::Unknown(_) => {}
             }
         }
 

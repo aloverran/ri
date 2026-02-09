@@ -1,6 +1,8 @@
 [workspace]
 members = [
+    "crates/ri-store",
     "crates/ri",
+    "research",
     "ri-cli",
 ]
 resolver = "2"
@@ -33,3 +35,4 @@ tokio-stream = "0.1"
 bytes = "1"
 tokio-util = { version = "0.7", features = ["rt"] }
 ri = { path = "crates/ri" }
+ri-store = { path = "crates/ri-store" }

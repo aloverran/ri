@@ -1,6 +1,42 @@
-use ri::agent::AgentEvent;
+use ri::agent::{AgentCallback, AgentEvent};
 use ri::api::StreamEvent;
 use std::io::Write;
+
+// Simple callback for text output mode.
+pub struct TextCallback { counter: u64 }
+
+impl TextCallback {
+    pub fn new() -> Self { TextCallback { counter: 0 } }
+}
+
+impl AgentCallback for TextCallback {
+    fn next_id(&mut self) -> String {
+        self.counter += 1;
+        format!("print_{}", self.counter)
+    }
+
+    fn on_event(&mut self, evt: AgentEvent) {
+        on_event_text(&evt);
+    }
+}
+
+// Simple callback for JSON output mode.
+pub struct JsonCallback { counter: u64 }
+
+impl JsonCallback {
+    pub fn new() -> Self { JsonCallback { counter: 0 } }
+}
+
+impl AgentCallback for JsonCallback {
+    fn next_id(&mut self) -> String {
+        self.counter += 1;
+        format!("print_{}", self.counter)
+    }
+
+    fn on_event(&mut self, evt: AgentEvent) {
+        on_event_json(&evt);
+    }
+}
 
 pub fn on_event_text(evt: &AgentEvent) {
     match evt {
@@ -59,6 +95,9 @@ pub fn event_to_json(evt: &AgentEvent) -> serde_json::Value {
         AgentEvent::ToolStart { id, name } => json!({"type": "tool_start", "id": id, "name": name}),
         AgentEvent::ToolEnd { id, output, is_error } => json!({
             "type": "tool_end", "id": id, "output": output, "is_error": is_error
+        }),
+        AgentEvent::MessageComplete(msg) => json!({
+            "type": "message_complete", "id": &msg.id, "role": msg.role
         }),
     }
 }

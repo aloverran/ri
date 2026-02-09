@@ -1,12 +1,34 @@
-use ri::agent::{self, AgentEvent, RunConfig};
+use ri::agent::{self, AgentCallback, AgentEvent, RunConfig};
 use ri::api::{GeminiVariant, Provider, StreamEvent};
 use ri::tools::ToolDef;
 use ri::types::*;
+use ri_store::types::Message;
+use ri_store::filing::SessionFiling;
 use std::io::Write;
 use std::path::PathBuf;
 use tokio::io::AsyncBufReadExt;
 
 use crate::auth::AuthStore;
+
+// Callback that persists messages to filing and displays events.
+struct InteractiveCallback<'a> {
+    filing: &'a mut SessionFiling,
+}
+
+impl AgentCallback for InteractiveCallback<'_> {
+    fn next_id(&mut self) -> String {
+        self.filing.next_id()
+    }
+
+    fn on_event(&mut self, evt: AgentEvent) {
+        if let AgentEvent::MessageComplete(ref msg) = evt {
+            if let Err(e) = self.filing.write_message(msg.clone()) {
+                tracing::error!("Failed to persist message {}: {}", msg.id, e);
+            }
+        }
+        display_event(&evt);
+    }
+}
 
 pub async fn run(
     mut provider: Provider,
@@ -16,13 +38,31 @@ pub async fn run(
     cwd: PathBuf,
     initial_prompt: Option<String>,
 ) -> eyre::Result<()> {
-    let mut messages: Vec<Message> = Vec::new();
+    // Set up session filing.
+    let sessions_dir = SessionFiling::default_dir()?;
+    let mut filing = SessionFiling::new(sessions_dir);
+    filing.load_all()?;
+
+    // Create a new session.
+    let session_name = session_name_from_prompt(initial_prompt.as_deref());
+    filing.new_session(&session_name, &cwd.display().to_string())?;
+
+    // Write system prompt as the first message.
+    let sys_id = filing.next_id();
+    let sys_msg = Message::new(sys_id, Role::System, vec![ContentBlock::text(&system_prompt)]);
+    filing.write_message(sys_msg.clone())?;
+
+    let mut messages: Vec<Message> = vec![sys_msg];
 
     // If there's an initial prompt, run it first
     if let Some(prompt) = initial_prompt {
         print_user_prefix();
         println!("{}", prompt);
-        messages.push(Message::user(&prompt));
+
+        let user_id = filing.next_id();
+        let user_msg = Message::new(user_id, Role::User, vec![ContentBlock::text(&prompt)]);
+        filing.write_message(user_msg.clone())?;
+        messages.push(user_msg);
 
         let cancel = tokio_util::sync::CancellationToken::new();
         let config = RunConfig {
@@ -34,7 +74,8 @@ pub async fn run(
             max_tokens: None,
             cwd: &cwd,
         };
-        agent::run(&config, &mut messages, &mut |evt| display_event(&evt), cancel).await?;
+        let mut cb = InteractiveCallback { filing: &mut filing };
+        agent::run(&config, &mut messages, &mut cb, cancel).await?;
     }
 
     // Main REPL loop
@@ -114,8 +155,12 @@ pub async fn run(
             _ => {}
         }
 
-        // Send to agent
-        messages.push(Message::user(trimmed));
+        // Write user message to filing.
+        let user_id = filing.next_id();
+        let user_msg = Message::new(user_id, Role::User, vec![ContentBlock::text(trimmed)]);
+        filing.write_message(user_msg.clone())?;
+        messages.push(user_msg);
+
         let cancel = tokio_util::sync::CancellationToken::new();
         let config = RunConfig {
             provider: &provider,
@@ -127,7 +172,8 @@ pub async fn run(
             cwd: &cwd,
         };
 
-        if let Err(e) = agent::run(&config, &mut messages, &mut |evt| display_event(&evt), cancel).await {
+        let mut cb = InteractiveCallback { filing: &mut filing };
+        if let Err(e) = agent::run(&config, &mut messages, &mut cb, cancel).await {
             eprintln!("\x1b[31m[error: {}]\x1b[0m", e);
         }
     }
@@ -186,6 +232,19 @@ fn display_event(evt: &AgentEvent) {
 fn print_user_prefix() {
     eprint!("\x1b[36m> \x1b[0m");
     let _ = std::io::stderr().flush();
+}
+
+fn session_name_from_prompt(prompt: Option<&str>) -> String {
+    match prompt {
+        Some(p) => {
+            let words: String = p.split_whitespace()
+                .take(5)
+                .collect::<Vec<_>>()
+                .join("-");
+            if words.is_empty() { "session".to_string() } else { words }
+        }
+        None => "interactive".to_string(),
+    }
 }
 
 async fn do_google_login(variant: GeminiVariant) -> Option<Provider> {

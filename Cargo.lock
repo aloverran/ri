@@ -1266,6 +1266,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "research"
+version = "0.1.0"
+dependencies = [
+ "ri-store",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "ri"
 version = "0.1.0"
 dependencies = [
@@ -1276,6 +1285,7 @@ dependencies = [
  "futures",
  "rand",
  "reqwest",
+ "ri-store",
  "serde",
  "serde_json",
  "sha2",
@@ -1298,12 +1308,26 @@ dependencies = [
  "eyre",
  "glob",
  "ri",
+ "ri-store",
  "serde",
  "serde_json",
  "tokio",
  "tokio-util",
  "tracing",
  "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
+name = "ri-store"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "dirs",
+ "eyre",
+ "serde",
+ "serde_json",
+ "tracing",
  "uuid",
 ]
 

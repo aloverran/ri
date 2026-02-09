@@ -89,13 +89,11 @@ async fn main() -> Result<()> {
 
             let cancel = tokio_util::sync::CancellationToken::new();
             if is_json {
-                ri::agent::run(&config, &mut messages, &mut |evt| {
-                    print_mode::on_event_json(&evt);
-                }, cancel).await?;
+                let mut cb = print_mode::JsonCallback::new();
+                ri::agent::run(&config, &mut messages, &mut cb, cancel).await?;
             } else {
-                ri::agent::run(&config, &mut messages, &mut |evt| {
-                    print_mode::on_event_text(&evt);
-                }, cancel).await?;
+                let mut cb = print_mode::TextCallback::new();
+                ri::agent::run(&config, &mut messages, &mut cb, cancel).await?;
             }
             println!();
         }

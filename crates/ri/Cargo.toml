@@ -6,6 +6,7 @@ license.workspace = true
 description = "LLM agent library -- pipeline-based, data-oriented"
 
 [dependencies]
+ri-store.workspace = true
 tokio.workspace = true
 serde.workspace = true
 serde_json.workspace = true
