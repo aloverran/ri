@@ -1,9 +1,10 @@
-// Provider trait -- the agent loop's view of an LLM provider.
+// Provider trait -- the interface that LLM providers implement.
 //
 // ri-ai implements this trait. ri defines it so the agent loop
 // can call providers without depending on ri-ai.
 
 use std::pin::Pin;
+use std::future::Future;
 use futures::Stream;
 
 use crate::event::StreamEvent;
@@ -44,10 +45,44 @@ pub enum ApiError {
 
 pub type EventStream = Pin<Box<dyn Stream<Item = Result<StreamEvent, ApiError>> + Send>>;
 
-use std::future::Future;
+// How a provider authenticates. The CLI interprets this
+// and drives the appropriate interactive flow.
+pub enum AuthMethod {
+    // User visits URL, pastes back a code.
+    PasteCode { url: String },
+    // CLI starts a local HTTP server, user visits URL via browser.
+    LocalCallback { url: String, port: u16, path: String },
+}
+
+// Info about a provider for display in login UI etc.
+pub struct ProviderInfo {
+    pub id: &'static str,
+    pub name: &'static str,
+}
 
 // The trait that LLM providers implement.
 pub trait LlmProvider: Send + Sync {
+    // Identity.
+    fn id(&self) -> &str;
+    fn name(&self) -> &str;
+
+    // Model catalog for this provider.
+    fn models(&self) -> Vec<Model>;
+
+    // Whether this provider currently has valid credentials.
+    fn is_authenticated(&self) -> bool;
+
+    // Start a login flow. Returns an AuthMethod describing what
+    // the user needs to do, or None if login is not supported.
+    fn begin_login(&self) -> eyre::Result<Option<AuthMethod>>;
+
+    // Complete a login flow. The response is the code/key from the user.
+    fn complete_login<'a>(
+        &'a self,
+        response: &'a str,
+    ) -> Pin<Box<dyn Future<Output = eyre::Result<()>> + Send + 'a>>;
+
+    // Stream a response from the LLM.
     fn stream(
         &self,
         opts: RequestOptions,

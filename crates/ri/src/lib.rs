@@ -13,6 +13,6 @@ pub use message::{
     ContentBlock, Message, MessagePool, Provenance, Role, Usage,
 };
 pub use model::{Model, ModelCost, ThinkingLevel};
-pub use provider::{ApiError, EventStream, LlmProvider, RequestOptions};
+pub use provider::{ApiError, AuthMethod, EventStream, LlmProvider, ProviderInfo, RequestOptions};
 pub use filing::{SessionFiling, SessionHeader, SessionInfo};
 pub use tool::{ToolDef, ToolFn, ToolOutput, ToolSchema};

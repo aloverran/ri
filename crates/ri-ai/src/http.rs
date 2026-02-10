@@ -2,7 +2,14 @@ use std::pin::Pin;
 use futures::Stream;
 
 use ri::ApiError;
-use crate::ApiRequest;
+
+// The HTTP request a provider builds. Fully visible, inspectable, loggable.
+#[derive(Debug, Clone)]
+pub struct ApiRequest {
+    pub url: String,
+    pub headers: Vec<(String, String)>,
+    pub body: String,
+}
 
 type ByteStream = Pin<Box<dyn Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Send>>;
 
