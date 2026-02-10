@@ -1,6 +1,7 @@
 pub mod anthropic;
 pub mod google;
 pub mod pkce;
+pub mod store;
 
 use serde::{Deserialize, Serialize};
 

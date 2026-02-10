@@ -1330,6 +1330,7 @@ dependencies = [
  "base64",
  "bytes",
  "chrono",
+ "dirs",
  "eyre",
  "futures",
  "rand",

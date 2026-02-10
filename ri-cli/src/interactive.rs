@@ -1,15 +1,13 @@
 use ri_core::agent::{self, AgentCallback, AgentEvent, RunConfig};
 use ri_core::event::StreamEvent;
+use ri_core::provider::LlmProvider;
 use ri_core::tool::ToolDef;
 use ri_core::types::*;
-use ri_ai::{GeminiVariant, Provider};
 use ri_store::types::Message;
 use ri_store::filing::SessionFiling;
 use std::io::Write;
 use std::path::PathBuf;
 use tokio::io::AsyncBufReadExt;
-
-use crate::auth::AuthStore;
 
 struct InteractiveCallback<'a> {
     filing: &'a mut SessionFiling,
@@ -31,7 +29,7 @@ impl AgentCallback for InteractiveCallback<'_> {
 }
 
 pub async fn run(
-    mut provider: Provider,
+    mut provider: Box<dyn LlmProvider>,
     model: Model,
     system_prompt: String,
     tools: Vec<ToolDef>,
@@ -62,7 +60,7 @@ pub async fn run(
 
         let cancel = tokio_util::sync::CancellationToken::new();
         let config = RunConfig {
-            provider: &provider,
+            provider: provider.as_ref(),
             model: &model,
             system_prompt: &system_prompt,
             tools: &tools,
@@ -78,10 +76,10 @@ pub async fn run(
     let reader = tokio::io::BufReader::new(stdin);
     let mut lines = reader.lines();
 
-    let mut login_pending: Option<ri_ai::auth::anthropic::LoginFlow> = None;
+    let mut paste_login: Option<ri_ai::registry::PasteCodeState> = None;
 
     loop {
-        if login_pending.is_some() {
+        if paste_login.is_some() {
             eprint!("\x1b[33mPaste code: \x1b[0m");
         } else {
             eprint!("\x1b[36m> \x1b[0m");
@@ -96,55 +94,75 @@ pub async fn run(
         let trimmed = line.trim();
         if trimmed.is_empty() { continue; }
 
-        if let Some(flow) = login_pending.take() {
-            match ri_ai::auth::anthropic::complete_login(trimmed, &flow).await {
-                Ok(creds) => {
-                    let key = creds.access.clone();
-                    let mut store = AuthStore::load();
-                    store.set("anthropic", creds);
-                    let _ = store.save();
+        if let Some(state) = paste_login.take() {
+            match ri_ai::registry::complete_paste_login(state, trimmed).await {
+                Ok(_) => {
+                    // Re-resolve provider for current model to stay consistent.
+                    match ri_ai::registry::resolve(&model.id).await {
+                        Ok((p, _)) => provider = p,
+                        Err(e) => { eprintln!("\x1b[31m[resolve error: {}]\x1b[0m", e); continue; }
+                    }
                     eprintln!("\x1b[32mLogged in successfully.\x1b[0m");
-                    provider = Provider::Anthropic { api_key: key };
                 }
                 Err(e) => eprintln!("\x1b[31m[login failed: {}]\x1b[0m", e),
             }
             continue;
         }
 
-        match trimmed {
-            "/quit" | "/exit" => break,
-            "/help" => {
-                eprintln!("\x1b[33mCommands:\x1b[0m");
-                eprintln!("  /login              - Log in via OAuth (Anthropic)");
-                eprintln!("  /login google       - Log in via OAuth (Google Antigravity)");
-                eprintln!("  /login gemini       - Log in via OAuth (Google Gemini CLI)");
-                eprintln!("  /quit, /exit        - Exit ri");
-                continue;
+        if trimmed == "/quit" || trimmed == "/exit" {
+            break;
+        }
+
+        if trimmed == "/help" {
+            eprintln!("\x1b[33mCommands:\x1b[0m");
+            for info in ri_ai::registry::available_logins() {
+                eprintln!("  /login {:<14} - {}", info.name, info.display);
             }
-            "/login" | "/login anthropic" => {
-                match ri_ai::auth::anthropic::begin_login() {
-                    Ok(flow) => {
+            eprintln!("  /quit, /exit        - Exit ri");
+            continue;
+        }
+
+        if trimmed.starts_with("/login") {
+            let login_name = trimmed.strip_prefix("/login").unwrap().trim();
+            let login_name = if login_name.is_empty() {
+                let flows = ri_ai::registry::available_logins();
+                if flows.is_empty() {
+                    eprintln!("\x1b[31mNo login flows available.\x1b[0m");
+                    continue;
+                }
+                flows[0].name
+            } else {
+                login_name
+            };
+
+            match ri_ai::registry::start_login(login_name) {
+                Ok(ri_ai::registry::LoginFlow::PasteCode { url, state }) => {
+                    eprintln!("\n\x1b[33mVisit this URL to authorize:\x1b[0m");
+                    eprintln!("\x1b[4m{}\x1b[0m\n", url);
+                    paste_login = Some(state);
+                }
+                Ok(ri_ai::registry::LoginFlow::LocalCallback { name }) => {
+                    eprintln!("\x1b[33mStarting OAuth login...\x1b[0m");
+                    match ri_ai::registry::run_callback_login(&name, |url| {
                         eprintln!("\n\x1b[33mVisit this URL to authorize:\x1b[0m");
-                        eprintln!("\x1b[4m{}\x1b[0m\n", flow.url);
-                        login_pending = Some(flow);
+                        eprintln!("\x1b[4m{}\x1b[0m\n", url);
+                        #[cfg(target_os = "macos")]
+                        { let _ = std::process::Command::new("open").arg(url).spawn(); }
+                    }).await {
+                        Ok(_) => {
+                            // Re-resolve provider for current model to stay consistent.
+                            match ri_ai::registry::resolve(&model.id).await {
+                                Ok((p, _)) => provider = p,
+                                Err(e) => { eprintln!("\x1b[31m[resolve error: {}]\x1b[0m", e); continue; }
+                            }
+                            eprintln!("\x1b[32mLogged in successfully.\x1b[0m");
+                        }
+                        Err(e) => eprintln!("\x1b[31m[login failed: {}]\x1b[0m", e),
                     }
-                    Err(e) => eprintln!("\x1b[31m[login error: {}]\x1b[0m", e),
                 }
-                continue;
+                Err(e) => eprintln!("\x1b[31m[login error: {}]\x1b[0m", e),
             }
-            cmd if cmd == "/login google" || cmd == "/login google-antigravity" => {
-                if let Some(p) = do_google_login(GeminiVariant::Antigravity).await {
-                    provider = p;
-                }
-                continue;
-            }
-            cmd if cmd == "/login gemini" || cmd == "/login google-gemini-cli" => {
-                if let Some(p) = do_google_login(GeminiVariant::Cli).await {
-                    provider = p;
-                }
-                continue;
-            }
-            _ => {}
+            continue;
         }
 
         let user_id = filing.next_id();
@@ -154,7 +172,7 @@ pub async fn run(
 
         let cancel = tokio_util::sync::CancellationToken::new();
         let config = RunConfig {
-            provider: &provider,
+            provider: provider.as_ref(),
             model: &model,
             system_prompt: &system_prompt,
             tools: &tools,
@@ -235,38 +253,5 @@ fn session_name_from_prompt(prompt: Option<&str>) -> String {
             if words.is_empty() { "session".to_string() } else { words }
         }
         None => "interactive".to_string(),
-    }
-}
-
-async fn do_google_login(variant: GeminiVariant) -> Option<Provider> {
-    let variant_name = match variant {
-        GeminiVariant::Antigravity => "google-antigravity",
-        GeminiVariant::Cli => "google-gemini-cli",
-    };
-
-    eprintln!("\x1b[33mStarting Google OAuth login...\x1b[0m");
-
-    match ri_ai::auth::google::login(variant, |url| {
-        eprintln!("\n\x1b[33mVisit this URL to authorize:\x1b[0m");
-        eprintln!("\x1b[4m{}\x1b[0m\n", url);
-        #[cfg(target_os = "macos")]
-        { let _ = std::process::Command::new("open").arg(url).spawn(); }
-    }).await {
-        Ok(creds) => {
-            let (token, project_id) = ri_ai::auth::google::build_api_key(&creds);
-            if let Some(ref email) = creds.email {
-                eprintln!("\x1b[32mLogged in as {}\x1b[0m", email);
-            } else {
-                eprintln!("\x1b[32mLogged in successfully.\x1b[0m");
-            }
-            let mut store = AuthStore::load();
-            store.set(variant_name, creds);
-            let _ = store.save();
-            Some(Provider::Gemini { variant, token, project_id })
-        }
-        Err(e) => {
-            eprintln!("\x1b[31m[Google login failed: {}]\x1b[0m", e);
-            None
-        }
     }
 }

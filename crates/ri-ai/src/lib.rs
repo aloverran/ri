@@ -3,6 +3,7 @@ pub mod http;
 pub mod anthropic;
 pub mod gemini;
 pub mod auth;
+pub mod registry;
 
 pub use ri_core;
 pub use ri_store;

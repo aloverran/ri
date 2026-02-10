@@ -1,7 +1,7 @@
 use ri_core::agent::{self, AgentCallback, AgentEvent, RunConfig};
+use ri_core::provider::LlmProvider;
 use ri_core::tool::ToolDef;
 use ri_core::types::*;
-use ri_ai::Provider;
 use ri_store::types::Message;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -46,7 +46,7 @@ fn output_json(value: &Value) {
 }
 
 pub async fn run(
-    provider: Provider,
+    provider: Box<dyn LlmProvider>,
     model: Model,
     system_prompt: String,
     tools: Vec<ToolDef>,
@@ -61,7 +61,7 @@ pub async fn run(
 
         let cancel = tokio_util::sync::CancellationToken::new();
         let config = RunConfig {
-            provider: &provider,
+            provider: provider.as_ref(),
             model: &model,
             system_prompt: &system_prompt,
             tools: &tools,
@@ -101,7 +101,7 @@ pub async fn run(
 
                 let cancel = tokio_util::sync::CancellationToken::new();
                 let config = RunConfig {
-                    provider: &provider,
+                    provider: provider.as_ref(),
                     model: &model,
                     system_prompt: &system_prompt,
                     tools: &tools,

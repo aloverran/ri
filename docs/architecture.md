@@ -139,7 +139,7 @@ Layer 3: Application (ri-cli)
   - CLI parsing, run modes (interactive, print, RPC)
   - TUI / display
   - User interaction (input, output, commands)
-  - Config resolution (models.json, settings, auth)
+  - Config resolution (settings)
   - Resource loading (context files, skills, prompts)
 ```
 
@@ -188,8 +188,11 @@ LLM provider abstraction. Handles:
 
 - LlmProvider trait: stream(messages, options) -> Stream<Event>
 - Anthropic provider: SSE parsing, request body construction, OAuth tool name remapping
-- Model definitions and model registry
-- API key resolution (env var, shell command, literal, OAuth)
+- Gemini provider: Cloud Code Assist API, Antigravity variant
+- Model catalog and registry (code-defined, no JSON config)
+- Provider resolution (auth store, env vars, token refresh)
+- Login flow registry (OAuth flows for each provider)
+- Auth store (~/.ri/auth.json persistence)
 
 Does NOT handle: message storage, tool execution, agent loop.
 
@@ -202,12 +205,14 @@ Built-in tool implementations: bash, read, write, edit, find, grep, ls. Each imp
 Application entry point. Wires everything together:
 
 - CLI argument parsing (clap)
-- Config resolution (models.json, settings.json, auth.json)
+- Config resolution (settings.json)
 - Resource loading (context files, skills, prompts)
 - System prompt construction
 - Run modes: interactive (REPL), print (single-shot), RPC (JSON-RPC over stdio)
 - Display / TUI
 - Session management (creating sessions, naming, listing)
+
+ri-cli is provider-agnostic. It receives a `Box<dyn LlmProvider>` and `Model` from ri-ai's registry and drives the agent loop without knowing which provider is behind the trait.
 
 ## The agent loop and the pool
 

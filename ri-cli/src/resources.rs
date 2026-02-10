@@ -1,9 +1,7 @@
 // Resource loading and system prompt construction.
 
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
-use ri_core::types::{Model, ModelCost};
 
 const CONTEXT_FILE_NAMES: &[&str] = &["AGENTS.md", "CLAUDE.md"];
 
@@ -35,48 +33,6 @@ pub struct Settings {
     pub compaction: CompactionSettings,
     #[serde(default, rename = "defaultModel")]
     pub default_model: Option<String>,
-    #[serde(default, rename = "defaultProvider")]
-    pub default_provider: Option<String>,
-}
-
-// -- models.json types --
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ModelsConfig {
-    #[serde(default)]
-    pub providers: HashMap<String, ProviderConfig>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ProviderConfig {
-    #[serde(default, rename = "baseUrl")]
-    pub base_url: Option<String>,
-    #[serde(default, rename = "apiKey")]
-    pub api_key: Option<String>,
-    #[serde(default)]
-    pub models: Vec<ModelDef>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ModelDef {
-    pub id: String,
-    pub name: String,
-    #[serde(default)]
-    pub reasoning: bool,
-    #[serde(default)]
-    pub cost: Option<ModelCostDef>,
-    #[serde(default, rename = "contextWindow")]
-    pub context_window: Option<usize>,
-    #[serde(default, rename = "maxTokens")]
-    pub max_tokens: Option<usize>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ModelCostDef {
-    #[serde(default)] pub input: f64,
-    #[serde(default)] pub output: f64,
-    #[serde(default, rename = "cacheRead")] pub cache_read: f64,
-    #[serde(default, rename = "cacheWrite")] pub cache_write: f64,
 }
 
 // -- Discovery types --
@@ -94,7 +50,6 @@ pub struct ResourceLoader {
     pub skills: Vec<Skill>,
     pub prompts: Vec<PromptTemplate>,
     pub settings: Settings,
-    pub models_config: Option<ModelsConfig>,
 }
 
 impl ResourceLoader {
@@ -104,41 +59,12 @@ impl ResourceLoader {
 
         Self {
             settings: load_settings(&global_dir),
-            models_config: load_models_config(&global_dir),
             context_files: discover_context_files(&global_dir, &cwd),
             skills: discover_skills(&global_dir, &cwd),
             prompts: discover_prompts(&global_dir, &cwd),
             global_dir,
             cwd,
         }
-    }
-
-    pub fn custom_models(&self) -> Vec<Model> {
-        let config = match &self.models_config {
-            Some(c) => c,
-            None => return Vec::new(),
-        };
-        let mut out = Vec::new();
-        for (_provider_name, provider_cfg) in &config.providers {
-            for m in &provider_cfg.models {
-                let cost = m.cost.as_ref().map_or(
-                    ModelCost { input: 0.0, output: 0.0, cache_read: 0.0, cache_write: 0.0 },
-                    |c| ModelCost { input: c.input, output: c.output, cache_read: c.cache_read, cache_write: c.cache_write },
-                );
-                out.push(Model {
-                    id: m.id.clone(), name: m.name.clone(),
-                    reasoning: m.reasoning,
-                    context_window: m.context_window.unwrap_or(128_000),
-                    max_tokens: m.max_tokens.unwrap_or(16_384),
-                    cost,
-                });
-            }
-        }
-        out
-    }
-
-    pub fn provider_api_key(&self, provider: &str) -> Option<String> {
-        self.models_config.as_ref()?.providers.get(provider)?.api_key.clone()
     }
 
     pub fn build_system_prompt(&self, active_skill: Option<&str>) -> String {
@@ -175,11 +101,6 @@ fn load_settings(global_dir: &Path) -> Settings {
     std::fs::read_to_string(&path).ok()
         .and_then(|c| serde_json::from_str(&c).ok())
         .unwrap_or_default()
-}
-
-fn load_models_config(global_dir: &Path) -> Option<ModelsConfig> {
-    let content = std::fs::read_to_string(global_dir.join("models.json")).ok()?;
-    serde_json::from_str(&content).ok()
 }
 
 fn discover_context_files(global_dir: &Path, cwd: &Path) -> Vec<ContextFile> {
