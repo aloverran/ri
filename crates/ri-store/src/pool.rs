@@ -13,10 +13,7 @@ impl Pool {
     }
 
     pub fn put(&mut self, msg: Message) {
-        if msg.id.is_empty() {
-            tracing::warn!("Refusing to insert message with empty ID (role={:?})", msg.role);
-            return;
-        }
+        assert!(!msg.id.is_empty(), "Message ID must not be empty (role={:?})", msg.role);
         let id = msg.id.clone();
         if !self.messages.contains_key(&id) {
             self.order.push(id.clone());

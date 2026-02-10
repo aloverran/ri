@@ -90,37 +90,90 @@ async fn run_bash(
     };
     let timeout_ms = input["timeout"].as_u64().unwrap_or(120_000);
 
-    let child = tokio::process::Command::new("sh")
-        .arg("-c")
+    let mut cmd = tokio::process::Command::new("sh");
+    cmd.arg("-c")
         .arg(command)
         .current_dir(&cwd)
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn();
+        .stderr(std::process::Stdio::piped());
 
-    let child = match child {
+    // Create a new process group so we can kill the entire tree on timeout.
+    #[cfg(unix)]
+    cmd.process_group(0);
+
+    let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => return ToolOutput { text: format!("Failed to spawn: {}", e), is_error: true },
     };
 
-    let output = tokio::select! {
-        result = child.wait_with_output() => {
-            match result {
-                Ok(o) => o,
-                Err(e) => return ToolOutput { text: format!("Process error: {}", e), is_error: true },
-            }
+    let pid = child.id();
+
+    // Take stdout/stderr handles for concurrent reading.
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+
+    let stdout_task = tokio::spawn(async move {
+        let mut buf = Vec::new();
+        if let Some(mut out) = stdout {
+            use tokio::io::AsyncReadExt;
+            let _ = out.read_to_end(&mut buf).await;
         }
-        _ = tokio::time::sleep(std::time::Duration::from_millis(timeout_ms)) => {
-            return ToolOutput { text: format!("Command timed out after {}ms", timeout_ms), is_error: true };
+        buf
+    });
+    let stderr_task = tokio::spawn(async move {
+        let mut buf = Vec::new();
+        if let Some(mut err) = stderr {
+            use tokio::io::AsyncReadExt;
+            let _ = err.read_to_end(&mut buf).await;
         }
-        _ = cancel.cancelled() => {
-            return ToolOutput { text: "Command aborted".into(), is_error: true };
+        buf
+    });
+
+    // Wait for process with timeout and cancellation.
+    let status = tokio::select! {
+        result = child.wait() => Some(result),
+        _ = tokio::time::sleep(std::time::Duration::from_millis(timeout_ms)) => None,
+        _ = cancel.cancelled() => None,
+    };
+
+    if status.is_none() {
+        // Kill the entire process group.
+        #[cfg(unix)]
+        if let Some(pid) = pid {
+            unsafe { libc::kill((pid as i32).wrapping_neg(), libc::SIGKILL); }
+        }
+        // Fallback: kill the direct child.
+        let _ = child.start_kill();
+        // Reap to avoid zombie.
+        let _ = child.wait().await;
+        // Wait for pipe readers to finish.
+        let _ = stdout_task.await;
+        let _ = stderr_task.await;
+        return ToolOutput {
+            text: if cancel.is_cancelled() {
+                "Command aborted".into()
+            } else {
+                format!("Command timed out after {}ms", timeout_ms)
+            },
+            is_error: true,
+        };
+    }
+
+    let exit_status = match status.unwrap() {
+        Ok(s) => s,
+        Err(e) => {
+            let _ = stdout_task.await;
+            let _ = stderr_task.await;
+            return ToolOutput { text: format!("Process error: {}", e), is_error: true };
         }
     };
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let exit_code = output.status.code().unwrap_or(-1);
+    let stdout_bytes = stdout_task.await.unwrap_or_default();
+    let stderr_bytes = stderr_task.await.unwrap_or_default();
+    let exit_code = exit_status.code().unwrap_or(-1);
+
+    let stdout = String::from_utf8_lossy(&stdout_bytes);
+    let stderr = String::from_utf8_lossy(&stderr_bytes);
 
     let combined = if stderr.is_empty() {
         stdout.to_string()

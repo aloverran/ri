@@ -1400,6 +1400,7 @@ dependencies = [
 name = "ri-tools"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "ri-core",
  "serde_json",
  "tokio",
