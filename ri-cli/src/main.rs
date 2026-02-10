@@ -82,23 +82,22 @@ async fn main() -> Result<()> {
             let mut session_ids = vec![sys_id, user_id];
 
             let config = agent::RunConfig {
-                provider: provider.as_ref(),
-                model: &model,
-                system_prompt: &system_prompt,
-                tools: &tools,
+                model,
+                system_prompt,
+                tools,
                 thinking,
                 max_tokens: None,
-                cwd: &cwd_path,
+                cwd: cwd_path,
                 strategy: agent::naive_strategy,
             };
 
             let cancel = tokio_util::sync::CancellationToken::new();
             if is_json {
                 let mut cb = print_mode::JsonCallback;
-                agent::run(&config, &mut filing, &mut session_ids, &mut cb, cancel).await?;
+                agent::run(provider.as_ref(), &config, &mut filing, &mut session_ids, &mut cb, cancel).await?;
             } else {
                 let mut cb = print_mode::TextCallback;
-                agent::run(&config, &mut filing, &mut session_ids, &mut cb, cancel).await?;
+                agent::run(provider.as_ref(), &config, &mut filing, &mut session_ids, &mut cb, cancel).await?;
             }
             println!();
         }

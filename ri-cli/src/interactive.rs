@@ -36,6 +36,16 @@ pub async fn run(
     filing.write_message(sys_msg)?;
     let mut session_ids = vec![sys_id];
 
+    let config = RunConfig {
+        model,
+        system_prompt,
+        tools,
+        thinking,
+        max_tokens: None,
+        cwd,
+        strategy: agent::naive_strategy,
+    };
+
     if let Some(prompt) = initial_prompt {
         print_user_prefix();
         println!("{}", prompt);
@@ -46,18 +56,8 @@ pub async fn run(
         session_ids.push(user_id);
 
         let cancel = tokio_util::sync::CancellationToken::new();
-        let config = RunConfig {
-            provider: provider.as_ref(),
-            model: &model,
-            system_prompt: &system_prompt,
-            tools: &tools,
-            thinking,
-            max_tokens: None,
-            cwd: &cwd,
-            strategy: agent::naive_strategy,
-        };
         let mut cb = InteractiveCallback;
-        agent::run(&config, &mut filing, &mut session_ids, &mut cb, cancel).await?;
+        agent::run(provider.as_ref(), &config, &mut filing, &mut session_ids, &mut cb, cancel).await?;
     }
 
     let stdin = tokio::io::stdin();
@@ -86,7 +86,7 @@ pub async fn run(
             match ri_ai::registry::complete_paste_login(state, trimmed).await {
                 Ok(_) => {
                     // Re-resolve provider for current model to stay consistent.
-                    match ri_ai::registry::resolve(&model.id).await {
+                    match ri_ai::registry::resolve(&config.model.id).await {
                         Ok((p, _)) => provider = p,
                         Err(e) => { eprintln!("\x1b[31m[resolve error: {}]\x1b[0m", e); continue; }
                     }
@@ -139,7 +139,7 @@ pub async fn run(
                     }).await {
                         Ok(_) => {
                             // Re-resolve provider for current model to stay consistent.
-                            match ri_ai::registry::resolve(&model.id).await {
+                            match ri_ai::registry::resolve(&config.model.id).await {
                                 Ok((p, _)) => provider = p,
                                 Err(e) => { eprintln!("\x1b[31m[resolve error: {}]\x1b[0m", e); continue; }
                             }
@@ -159,19 +159,8 @@ pub async fn run(
         session_ids.push(user_id);
 
         let cancel = tokio_util::sync::CancellationToken::new();
-        let config = RunConfig {
-            provider: provider.as_ref(),
-            model: &model,
-            system_prompt: &system_prompt,
-            tools: &tools,
-            thinking,
-            max_tokens: None,
-            cwd: &cwd,
-            strategy: agent::naive_strategy,
-        };
-
         let mut cb = InteractiveCallback;
-        if let Err(e) = agent::run(&config, &mut filing, &mut session_ids, &mut cb, cancel).await {
+        if let Err(e) = agent::run(provider.as_ref(), &config, &mut filing, &mut session_ids, &mut cb, cancel).await {
             eprintln!("\x1b[31m[error: {}]\x1b[0m", e);
         }
     }

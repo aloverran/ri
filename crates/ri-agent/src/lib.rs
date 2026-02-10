@@ -6,7 +6,7 @@
 // (which puts them in the pool AND appends to the active session file).
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::PathBuf;
 use futures::StreamExt;
 
 use ri::{
@@ -37,14 +37,13 @@ pub fn naive_strategy(_pool: &MessagePool, session_ids: &[String]) -> Vec<String
 }
 
 // Everything the agent loop needs for one run.
-pub struct RunConfig<'a> {
-    pub provider: &'a dyn LlmProvider,
-    pub model: &'a Model,
-    pub system_prompt: &'a str,
-    pub tools: &'a [ToolDef],
+pub struct RunConfig {
+    pub model: Model,
+    pub system_prompt: String,
+    pub tools: Vec<ToolDef>,
     pub thinking: ThinkingLevel,
     pub max_tokens: Option<usize>,
-    pub cwd: &'a Path,
+    pub cwd: PathBuf,
     pub strategy: ContextStrategy,
 }
 
@@ -56,7 +55,8 @@ pub trait AgentCallback {
 // Run the agent loop: compose context from pool, stream LLM response,
 // execute tool calls, persist everything, repeat.
 pub async fn run(
-    config: &RunConfig<'_>,
+    provider: &dyn LlmProvider,
+    config: &RunConfig,
     filing: &mut SessionFiling,
     session_ids: &mut Vec<String>,
     cb: &mut dyn AgentCallback,
@@ -82,16 +82,16 @@ pub async fn run(
             .collect();
 
         let opts = RequestOptions {
-            model: config.model,
-            system_prompt: config.system_prompt,
-            messages: &messages,
-            tools: &tool_schemas,
+            model: config.model.clone(),
+            system_prompt: config.system_prompt.clone(),
+            messages,
+            tools: tool_schemas.clone(),
             thinking: config.thinking,
             max_tokens: config.max_tokens,
         };
 
         // Stream the LLM response.
-        let mut stream = match config.provider.stream(&opts).await {
+        let mut stream = match provider.stream(opts).await {
             Ok(s) => s,
             Err(e) => {
                 cb.on_event(AgentEvent::Error(e.to_string()));

@@ -73,12 +73,12 @@ impl Provider {
 }
 
 impl LlmProvider for Provider {
-    fn stream<'a>(
-        &'a self,
-        opts: &'a RequestOptions<'a>,
-    ) -> Pin<Box<dyn Future<Output = Result<EventStream, ApiError>> + Send + 'a>> {
+    fn stream(
+        &self,
+        opts: RequestOptions,
+    ) -> Pin<Box<dyn Future<Output = Result<EventStream, ApiError>> + Send + '_>> {
         Box::pin(async move {
-            let request = self.build_request(opts);
+            let request = self.build_request(&opts);
 
             tracing::debug!(
                 url = %request.url,
@@ -87,7 +87,7 @@ impl LlmProvider for Provider {
             );
 
             let bytes = http::send(&request).await?;
-            Ok(self.event_stream(bytes, opts.tools))
+            Ok(self.event_stream(bytes, &opts.tools))
         })
     }
 }
