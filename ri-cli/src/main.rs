@@ -9,7 +9,6 @@ mod interactive;
 mod print_mode;
 mod resources;
 mod rpc_mode;
-mod session;
 
 #[derive(Parser)]
 #[command(name = "ri", about = "A Rust coding agent")]
