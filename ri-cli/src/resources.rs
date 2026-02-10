@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
-use ri::types::{Model, ModelCost};
+use ri_core::types::{Model, ModelCost};
 
 const CONTEXT_FILE_NAMES: &[&str] = &["AGENTS.md", "CLAUDE.md"];
 

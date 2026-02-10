@@ -3,16 +3,10 @@ name = "ri-tools"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Built-in coding tools (bash, read, write, edit, find, grep, ls) for ri"
+description = "Built-in coding tools (bash, read, write, edit) for ri"
 
 [dependencies]
 ri-core.workspace = true
 tokio.workspace = true
-serde.workspace = true
 serde_json.workspace = true
-async-trait.workspace = true
-thiserror.workspace = true
-tracing.workspace = true
-glob.workspace = true
-eyre.workspace = true
-tokio-util = { version = "0.7", features = ["rt"] }
+tokio-util.workspace = true

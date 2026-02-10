@@ -1,112 +1,25 @@
-// Anthropic Messages API provider.
+// Anthropic Messages API -- request building and SSE interpretation.
 //
-// Implements streaming via SSE (Server-Sent Events) with manual line parsing.
-// Reference: https://docs.anthropic.com/en/api/messages-streaming
+// Two entry points:
+//   build_request() -> ApiRequest    (pure data)
+//   event_stream()  -> EventStream   (SSE bytes -> typed events)
 
-use async_trait::async_trait;
-use futures::Stream;
-use reqwest::header::{HeaderMap, HeaderValue, CONTENT_TYPE};
-use ri_core::event::AssistantStreamEvent;
-use ri_core::provider::{LlmProvider, ProviderError, StreamOutput};
-use ri_core::types::{
-    CompletionOptions, ContentBlock, Message, Model, Role, ThinkingLevel, ToolSchema,
-};
-use serde_json::{json, Value};
 use std::collections::VecDeque;
 use std::pin::Pin;
 use std::task::{Context, Poll};
+use futures::Stream;
+use serde_json::{json, Value};
 use tracing::warn;
 
-pub struct AnthropicProvider {
-    client: reqwest::Client,
-}
+use ri_core::types::{ThinkingLevel, Role};
+use ri_store::types::{Message, ContentBlock};
+use ri_core::provider::{ApiError, EventStream, RequestOptions};
+use ri_core::event::{StreamEvent, ToolSchema};
+use crate::ApiRequest;
+use crate::sse::{SseEvent, SseParser};
 
-impl AnthropicProvider {
-    pub fn new() -> Self {
-        Self {
-            client: reqwest::Client::new(),
-        }
-    }
-}
+// -- Tool name mapping for OAuth (Claude Code compatibility) --
 
-// -- Request body construction --
-
-fn build_system_param(system_prompt: &str) -> Value {
-    json!([{
-        "type": "text",
-        "text": system_prompt,
-        "cache_control": { "type": "ephemeral" }
-    }])
-}
-
-fn convert_content_block(block: &ContentBlock) -> Value {
-    match block {
-        ContentBlock::Text { text, .. } => json!({
-            "type": "text",
-            "text": text
-        }),
-        ContentBlock::Image { media_type, data } => json!({
-            "type": "image",
-            "source": {
-                "type": "base64",
-                "media_type": media_type,
-                "data": data
-            }
-        }),
-        ContentBlock::ToolUse { id, name, input, .. } => json!({
-            "type": "tool_use",
-            "id": id,
-            "name": name,
-            "input": input
-        }),
-        ContentBlock::ToolResult {
-            tool_use_id,
-            content,
-            is_error,
-        } => {
-            let content_blocks: Vec<Value> = content.iter().map(convert_content_block).collect();
-            json!({
-                "type": "tool_result",
-                "tool_use_id": tool_use_id,
-                "content": content_blocks,
-                "is_error": is_error
-            })
-        }
-        ContentBlock::Thinking { thinking, .. } => json!({
-            "type": "thinking",
-            "thinking": thinking,
-        }),
-    }
-}
-
-fn convert_message(msg: &Message) -> Value {
-    let role = match msg.role {
-        Role::User => "user",
-        Role::Assistant => "assistant",
-        Role::System => {
-            warn!("System message in messages array -- converting to user role");
-            "user"
-        }
-    };
-
-    // Tool results must be sent as user messages in the Anthropic API
-    let content: Vec<Value> = msg.content.iter().map(convert_content_block).collect();
-
-    // Special case: if the only blocks are ToolResult, role must be "user"
-    let has_tool_results = msg
-        .content
-        .iter()
-        .any(|b| matches!(b, ContentBlock::ToolResult { .. }));
-    let effective_role = if has_tool_results { "user" } else { role };
-
-    json!({
-        "role": effective_role,
-        "content": content
-    })
-}
-
-// Claude Code canonical tool names. OAuth tokens require tool names that
-// case-insensitively match these to use the exact casing below.
 const CLAUDE_CODE_TOOLS: &[&str] = &[
     "Read", "Write", "Edit", "Bash", "Grep", "Glob",
     "AskUserQuestion", "EnterPlanMode", "ExitPlanMode",
@@ -128,106 +41,116 @@ fn from_claude_code_name(name: &str, original_tools: &[ToolSchema]) -> String {
         .unwrap_or_else(|| name.to_string())
 }
 
-fn convert_tool(tool: &ToolSchema, is_oauth: bool) -> Value {
-    let name = if is_oauth {
-        to_claude_code_name(&tool.name)
+// -- Request building --
+
+pub fn build_request(api_key: &str, opts: &RequestOptions) -> ApiRequest {
+    let is_oauth = api_key.starts_with("sk-ant-oat");
+    let body = build_body(opts, is_oauth);
+    let url = "https://api.anthropic.com/v1/messages".to_string();
+
+    let mut headers = vec![
+        ("anthropic-version".into(), "2023-06-01".into()),
+        ("content-type".into(), "application/json".into()),
+        ("accept".into(), "text/event-stream".into()),
+    ];
+
+    if is_oauth {
+        headers.push(("authorization".into(), format!("Bearer {}", api_key)));
+        headers.push((
+            "anthropic-beta".into(),
+            "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,fine-grained-tool-streaming-2025-05-14".into(),
+        ));
+        headers.push(("anthropic-dangerous-direct-browser-access".into(), "true".into()));
+        headers.push(("user-agent".into(), "claude-cli/2.1.2 (external, cli)".into()));
+        headers.push(("x-app".into(), "cli".into()));
     } else {
-        tool.name.clone()
-    };
-    json!({
-        "name": name,
-        "description": tool.description,
-        "input_schema": {
-            "type": "object",
-            "properties": tool.parameters.get("properties").unwrap_or(&json!({})),
-            "required": tool.parameters.get("required").unwrap_or(&json!([]))
-        }
-    })
+        headers.push(("x-api-key".into(), api_key.to_string()));
+        headers.push((
+            "anthropic-beta".into(),
+            "interleaved-thinking-2025-05-14,fine-grained-tool-streaming-2025-05-14".into(),
+        ));
+    }
+
+    ApiRequest { url, headers, body: body.to_string() }
 }
 
-fn build_request_body(model: &Model, messages: &[Message], options: &CompletionOptions, is_oauth: bool) -> Value {
-    let api_messages: Vec<Value> = messages
-        .iter()
+fn build_body(opts: &RequestOptions, is_oauth: bool) -> Value {
+    let messages: Vec<Value> = opts.messages.iter()
         .filter(|m| m.role != Role::System)
-        .map(convert_message)
+        .map(|m| convert_message(m))
         .collect();
 
-    let max_tokens = options
-        .max_tokens
-        .unwrap_or_else(|| (model.max_tokens / 3).max(4096));
+    let max_tokens = opts.max_tokens
+        .unwrap_or_else(|| (opts.model.max_tokens / 3).max(4096));
 
     let mut body = json!({
-        "model": model.id,
-        "messages": api_messages,
+        "model": opts.model.id,
+        "messages": messages,
         "max_tokens": max_tokens,
-        "stream": true
+        "stream": true,
     });
 
-    // System prompt as top-level field.
-    // OAuth tokens (Claude Code) require specific identity prefix.
+    // System prompt
     if is_oauth {
         let mut system_blocks = vec![json!({
             "type": "text",
             "text": "You are Claude Code, Anthropic's official CLI for Claude.",
             "cache_control": { "type": "ephemeral" }
         })];
-        if let Some(ref sys) = options.system_prompt {
-            system_blocks.push(json!({
-                "type": "text",
-                "text": sys,
-                "cache_control": { "type": "ephemeral" }
-            }));
-        }
+        system_blocks.push(json!({
+            "type": "text",
+            "text": opts.system_prompt,
+            "cache_control": { "type": "ephemeral" }
+        }));
         body["system"] = json!(system_blocks);
-    } else if let Some(ref sys) = options.system_prompt {
-        body["system"] = build_system_param(sys);
+    } else {
+        body["system"] = json!([{
+            "type": "text",
+            "text": opts.system_prompt,
+            "cache_control": { "type": "ephemeral" }
+        }]);
     }
 
     // Tools
-    if !options.tools.is_empty() {
-        let tools: Vec<Value> = options.tools.iter().map(|t| convert_tool(t, is_oauth)).collect();
+    if !opts.tools.is_empty() {
+        let tools: Vec<Value> = opts.tools.iter().map(|t| {
+            let name = if is_oauth { to_claude_code_name(&t.name) } else { t.name.clone() };
+            json!({
+                "name": name,
+                "description": t.description,
+                "input_schema": {
+                    "type": "object",
+                    "properties": t.parameters.get("properties").unwrap_or(&json!({})),
+                    "required": t.parameters.get("required").unwrap_or(&json!([]))
+                }
+            })
+        }).collect();
         body["tools"] = json!(tools);
     }
 
-    // Stop sequences
-    if !options.stop_sequences.is_empty() {
-        body["stop_sequences"] = json!(options.stop_sequences);
-    }
-
-    // Thinking / reasoning
-    if model.reasoning {
-        if let Some(level) = options.thinking_level {
-            match level {
-                ThinkingLevel::Off => {}
-                _ => {
-                    let is_opus_46 =
-                        model.id.contains("opus-4-6") || model.id.contains("opus-4.6");
-                    if is_opus_46 {
-                        // Adaptive thinking for Opus 4.6+
-                        body["thinking"] = json!({ "type": "adaptive" });
-                        let effort = match level {
-                            ThinkingLevel::Low => "low",
-                            ThinkingLevel::Medium => "medium",
-                            ThinkingLevel::High => "high",
-                            ThinkingLevel::XHigh => "max",
-                            ThinkingLevel::Off => unreachable!(),
-                        };
-                        body["output_config"] = json!({ "effort": effort });
-                    } else {
-                        // Budget-based thinking for older models
-                        let budget = match level {
-                            ThinkingLevel::Low => 1024,
-                            ThinkingLevel::Medium => 4096,
-                            ThinkingLevel::High => 16384,
-                            ThinkingLevel::XHigh => 32768,
-                            ThinkingLevel::Off => unreachable!(),
-                        };
-                        body["thinking"] = json!({
-                            "type": "enabled",
-                            "budget_tokens": budget
-                        });
-                    }
-                }
+    // Thinking
+    if opts.model.reasoning {
+        if opts.thinking != ThinkingLevel::Off {
+            let is_opus_46 = opts.model.id.contains("opus-4-6") || opts.model.id.contains("opus-4.6");
+            if is_opus_46 {
+                body["thinking"] = json!({ "type": "adaptive" });
+                let effort = match opts.thinking {
+                    ThinkingLevel::Low => "low",
+                    ThinkingLevel::Medium => "medium",
+                    ThinkingLevel::High => "high",
+                    ThinkingLevel::XHigh => "max",
+                    ThinkingLevel::Off => unreachable!(),
+                };
+                body["output_config"] = json!({ "effort": effort });
+            } else {
+                let budget = match opts.thinking {
+                    ThinkingLevel::Low => 1024,
+                    ThinkingLevel::Medium => 4096,
+                    ThinkingLevel::High => 16384,
+                    ThinkingLevel::XHigh => 32768,
+                    ThinkingLevel::Off => unreachable!(),
+                };
+                body["thinking"] = json!({ "type": "enabled", "budget_tokens": budget });
             }
         }
     }
@@ -235,9 +158,46 @@ fn build_request_body(model: &Model, messages: &[Message], options: &CompletionO
     body
 }
 
-// -- SSE parsing --
+fn convert_message(msg: &Message) -> Value {
+    let role = match msg.role {
+        Role::User => "user",
+        Role::Assistant => "assistant",
+        Role::System => "user",
+    };
 
-/// Tracks the state of content blocks during streaming.
+    let content: Vec<Value> = msg.content.iter().map(convert_content).collect();
+    let has_tool_results = msg.content.iter().any(|c| matches!(c, ContentBlock::ToolResult { .. }));
+    let effective_role = if has_tool_results { "user" } else { role };
+
+    json!({ "role": effective_role, "content": content })
+}
+
+fn convert_content(c: &ContentBlock) -> Value {
+    match c {
+        ContentBlock::Text { text, .. } => json!({ "type": "text", "text": text }),
+        ContentBlock::Thinking { thinking, .. } => json!({ "type": "thinking", "thinking": thinking }),
+        ContentBlock::Image { media_type, data, .. } => json!({
+            "type": "image",
+            "source": { "type": "base64", "media_type": media_type, "data": data }
+        }),
+        ContentBlock::ToolUse { id, name, input, .. } => json!({
+            "type": "tool_use", "id": id, "name": name, "input": input
+        }),
+        ContentBlock::ToolResult { tool_use_id, content, is_error, .. } => {
+            let content_json: Vec<Value> = content.iter().map(convert_content).collect();
+            json!({
+                "type": "tool_result",
+                "tool_use_id": tool_use_id,
+                "content": content_json,
+                "is_error": is_error,
+            })
+        }
+        ContentBlock::Unknown(v) => v.clone(),
+    }
+}
+
+// -- SSE interpretation --
+
 #[derive(Debug)]
 enum BlockKind {
     Text,
@@ -245,416 +205,220 @@ enum BlockKind {
     ToolUse { id: String },
 }
 
-/// Parses a single SSE data payload (JSON) and yields AssistantStreamEvents.
-fn parse_sse_event(
-    event_type: &str,
-    data: &str,
-    blocks: &mut Vec<BlockKind>,
-) -> Vec<Result<AssistantStreamEvent, ProviderError>> {
-    let mut events = Vec::new();
+pub struct StreamState {
+    blocks: Vec<BlockKind>,
+}
 
-    match event_type {
-        "message_start" => {
-            // Contains usage info; we don't track usage at the stream level currently.
-        }
+impl StreamState {
+    fn new() -> Self {
+        Self { blocks: Vec::new() }
+    }
 
-        "content_block_start" => {
-            let parsed: Value = match serde_json::from_str(data) {
-                Ok(v) => v,
-                Err(e) => {
-                    events.push(Err(ProviderError::StreamParse(format!(
-                        "content_block_start: {e}"
-                    ))));
-                    return events;
-                }
-            };
+    fn interpret(&mut self, sse: &SseEvent) -> Vec<Result<StreamEvent, ApiError>> {
+        let mut out = Vec::new();
 
-            let block_type = parsed["content_block"]["type"].as_str().unwrap_or("");
-            let index = parsed["index"].as_u64().unwrap_or(0) as usize;
-
-            match block_type {
-                "text" => {
-                    while blocks.len() <= index {
-                        blocks.push(BlockKind::Text);
+        match sse.event_type.as_str() {
+            "content_block_start" => {
+                let parsed: Value = match serde_json::from_str(&sse.data) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        out.push(Err(ApiError::StreamParse(format!("content_block_start: {}", e))));
+                        return out;
                     }
-                    blocks[index] = BlockKind::Text;
-                    events.push(Ok(AssistantStreamEvent::TextStart));
-                }
-                "thinking" => {
-                    while blocks.len() <= index {
-                        blocks.push(BlockKind::Text);
+                };
+                let block_type = parsed["content_block"]["type"].as_str().unwrap_or("");
+                let index = parsed["index"].as_u64().unwrap_or(0) as usize;
+
+                match block_type {
+                    "text" => {
+                        while self.blocks.len() <= index { self.blocks.push(BlockKind::Text); }
+                        self.blocks[index] = BlockKind::Text;
+                        out.push(Ok(StreamEvent::TextStart));
                     }
-                    blocks[index] = BlockKind::Thinking;
-                    events.push(Ok(AssistantStreamEvent::ThinkingStart));
-                }
-                "tool_use" => {
-                    let id = parsed["content_block"]["id"]
-                        .as_str()
-                        .unwrap_or("")
-                        .to_string();
-                    let name = parsed["content_block"]["name"]
-                        .as_str()
-                        .unwrap_or("")
-                        .to_string();
-                    while blocks.len() <= index {
-                        blocks.push(BlockKind::Text);
+                    "thinking" => {
+                        while self.blocks.len() <= index { self.blocks.push(BlockKind::Text); }
+                        self.blocks[index] = BlockKind::Thinking;
+                        out.push(Ok(StreamEvent::ThinkingStart));
                     }
-                    blocks[index] = BlockKind::ToolUse { id: id.clone() };
-                    events.push(Ok(AssistantStreamEvent::ToolCallStart { id, name }));
-                }
-                other => {
-                    warn!("Unknown content block type: {other}");
+                    "tool_use" => {
+                        let id = parsed["content_block"]["id"].as_str().unwrap_or("").to_string();
+                        let name = parsed["content_block"]["name"].as_str().unwrap_or("").to_string();
+                        while self.blocks.len() <= index { self.blocks.push(BlockKind::Text); }
+                        self.blocks[index] = BlockKind::ToolUse { id: id.clone() };
+                        out.push(Ok(StreamEvent::ToolCallStart { id, name }));
+                    }
+                    other => { warn!("Unknown content block type: {}", other); }
                 }
             }
-        }
 
-        "content_block_delta" => {
-            let parsed: Value = match serde_json::from_str(data) {
-                Ok(v) => v,
-                Err(e) => {
-                    events.push(Err(ProviderError::StreamParse(format!(
-                        "content_block_delta: {e}"
-                    ))));
-                    return events;
-                }
-            };
+            "content_block_delta" => {
+                let parsed: Value = match serde_json::from_str(&sse.data) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        out.push(Err(ApiError::StreamParse(format!("content_block_delta: {}", e))));
+                        return out;
+                    }
+                };
+                let index = parsed["index"].as_u64().unwrap_or(0) as usize;
+                let delta_type = parsed["delta"]["type"].as_str().unwrap_or("");
 
-            let index = parsed["index"].as_u64().unwrap_or(0) as usize;
-            let delta_type = parsed["delta"]["type"].as_str().unwrap_or("");
-
-            match delta_type {
-                "text_delta" => {
-                    let text = parsed["delta"]["text"].as_str().unwrap_or("").to_string();
-                    events.push(Ok(AssistantStreamEvent::TextDelta { delta: text }));
-                }
-                "thinking_delta" => {
-                    let thinking = parsed["delta"]["thinking"]
-                        .as_str()
-                        .unwrap_or("")
-                        .to_string();
-                    events.push(Ok(AssistantStreamEvent::ThinkingDelta { delta: thinking }));
-                }
-                "input_json_delta" => {
-                    let partial = parsed["delta"]["partial_json"]
-                        .as_str()
-                        .unwrap_or("")
-                        .to_string();
-                    if let Some(block) = blocks.get(index) {
-                        if let BlockKind::ToolUse { id, .. } = block {
-                            events.push(Ok(AssistantStreamEvent::ToolCallDelta {
+                match delta_type {
+                    "text_delta" => {
+                        let text = parsed["delta"]["text"].as_str().unwrap_or("").to_string();
+                        out.push(Ok(StreamEvent::TextDelta(text)));
+                    }
+                    "thinking_delta" => {
+                        let text = parsed["delta"]["thinking"].as_str().unwrap_or("").to_string();
+                        out.push(Ok(StreamEvent::ThinkingDelta(text)));
+                    }
+                    "input_json_delta" => {
+                        let partial = parsed["delta"]["partial_json"].as_str().unwrap_or("").to_string();
+                        if let Some(BlockKind::ToolUse { id }) = self.blocks.get(index) {
+                            out.push(Ok(StreamEvent::ToolCallDelta {
                                 id: id.clone(),
-                                delta: partial,
+                                json_fragment: partial,
                             }));
                         }
                     }
-                }
-                "signature_delta" => {
-                    // Thinking block signature; we don't expose this in our event model.
-                }
-                other => {
-                    warn!("Unknown delta type: {other}");
+                    "signature_delta" => {} // thinking block signature, handled at block stop
+                    other => { warn!("Unknown delta type: {}", other); }
                 }
             }
-        }
 
-        "content_block_stop" => {
-            let parsed: Value = match serde_json::from_str(data) {
-                Ok(v) => v,
-                Err(e) => {
-                    events.push(Err(ProviderError::StreamParse(format!(
-                        "content_block_stop: {e}"
-                    ))));
-                    return events;
-                }
-            };
-
-            let index = parsed["index"].as_u64().unwrap_or(0) as usize;
-            if let Some(block) = blocks.get(index) {
-                match block {
-                    BlockKind::Text => events.push(Ok(AssistantStreamEvent::TextEnd { signature: None })),
-                    BlockKind::Thinking => events.push(Ok(AssistantStreamEvent::ThinkingEnd { signature: None })),
-                    BlockKind::ToolUse { id, .. } => {
-                        events.push(Ok(AssistantStreamEvent::ToolCallEnd { id: id.clone(), signature: None }));
+            "content_block_stop" => {
+                let parsed: Value = match serde_json::from_str(&sse.data) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        out.push(Err(ApiError::StreamParse(format!("content_block_stop: {}", e))));
+                        return out;
+                    }
+                };
+                let index = parsed["index"].as_u64().unwrap_or(0) as usize;
+                if let Some(block) = self.blocks.get(index) {
+                    match block {
+                        BlockKind::Text => out.push(Ok(StreamEvent::TextEnd { sig: None })),
+                        BlockKind::Thinking => out.push(Ok(StreamEvent::ThinkingEnd { sig: None })),
+                        BlockKind::ToolUse { id } => {
+                            out.push(Ok(StreamEvent::ToolCallEnd { id: id.clone(), sig: None }));
+                        }
                     }
                 }
             }
-        }
 
-        "message_delta" => {
-            // Contains stop_reason and final usage. We emit Done on message_stop.
-        }
+            "message_start" | "message_delta" | "ping" => {}
+            "message_stop" => {
+                out.push(Ok(StreamEvent::Done));
+            }
 
-        "message_stop" => {
-            events.push(Ok(AssistantStreamEvent::Done));
-        }
-
-        "ping" => {
-            // Keepalive, ignore.
-        }
-
-        "error" => {
-            let parsed: Value = serde_json::from_str(data).unwrap_or_default();
-            let error_type = parsed["error"]["type"].as_str().unwrap_or("unknown");
-            let error_message = parsed["error"]["message"]
-                .as_str()
-                .unwrap_or("Unknown error")
-                .to_string();
-
-            match error_type {
-                "overloaded_error" => {
-                    events.push(Err(ProviderError::Other(
-                        format!("API overloaded: {error_message}"),
-                    )));
-                }
-                "rate_limit_error" => {
-                    events.push(Err(ProviderError::RateLimited {
-                        retry_after_ms: 5000,
-                    }));
-                }
-                _ => {
-                    events.push(Err(ProviderError::Api {
-                        status: 0,
-                        message: format!("{error_type}: {error_message}"),
-                    }));
+            "error" => {
+                let parsed: Value = serde_json::from_str(&sse.data).unwrap_or_default();
+                let error_type = parsed["error"]["type"].as_str().unwrap_or("unknown");
+                let error_msg = parsed["error"]["message"].as_str().unwrap_or("Unknown error").to_string();
+                match error_type {
+                    "rate_limit_error" => {
+                        out.push(Err(ApiError::RateLimited { retry_after_ms: 5000 }));
+                    }
+                    _ => {
+                        out.push(Err(ApiError::Api {
+                            status: 0,
+                            message: format!("{}: {}", error_type, error_msg),
+                        }));
+                    }
                 }
             }
+
+            other => { warn!("Unknown SSE event type: {}", other); }
         }
 
-        other => {
-            warn!("Unknown SSE event type: {other}");
-        }
+        out
     }
-
-    events
 }
 
-// -- SSE byte stream adapter --
+// -- Event stream adapter --
 
-/// Wraps a reqwest byte stream and yields parsed AssistantStreamEvents.
-struct SseStream {
+struct AnthropicStream {
     inner: Pin<Box<dyn Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Send>>,
-    buffer: String,
-    blocks: Vec<BlockKind>,
-    pending: VecDeque<Result<AssistantStreamEvent, ProviderError>>,
+    parser: SseParser,
+    state: StreamState,
+    pending: VecDeque<Result<StreamEvent, ApiError>>,
     done: bool,
     original_tools: Vec<ToolSchema>,
     is_oauth: bool,
 }
 
-impl Stream for SseStream {
-    type Item = Result<AssistantStreamEvent, ProviderError>;
+impl Stream for AnthropicStream {
+    type Item = Result<StreamEvent, ApiError>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
 
         loop {
-            // Drain any pending events first
-            if !this.pending.is_empty() {
-                return Poll::Ready(Some(this.pending.pop_front().unwrap()));
+            if let Some(event) = this.pending.pop_front() {
+                return Poll::Ready(Some(event));
             }
 
             if this.done {
                 return Poll::Ready(None);
             }
 
-            // Poll the inner byte stream
             match Pin::new(&mut this.inner).poll_next(cx) {
                 Poll::Pending => return Poll::Pending,
                 Poll::Ready(None) => {
                     this.done = true;
-                    // Process any remaining data in buffer
-                    if !this.buffer.is_empty() {
-                        this.process_buffer();
-                        if !this.pending.is_empty() {
-                            return Poll::Ready(Some(this.pending.pop_front().unwrap()));
-                        }
+                    for sse in this.parser.flush() {
+                        let events = this.state.interpret(&sse);
+                        this.pending.extend(this.remap_tools(events));
+                    }
+                    if let Some(event) = this.pending.pop_front() {
+                        return Poll::Ready(Some(event));
                     }
                     return Poll::Ready(None);
                 }
                 Poll::Ready(Some(Err(e))) => {
                     this.done = true;
-                    return Poll::Ready(Some(Err(ProviderError::Http(e))));
+                    return Poll::Ready(Some(Err(ApiError::Http(e.to_string()))));
                 }
                 Poll::Ready(Some(Ok(chunk))) => {
                     let text = String::from_utf8_lossy(&chunk);
-                    this.buffer.push_str(&text);
-                    this.process_buffer();
-                    // Loop back to drain pending
-                }
-            }
-        }
-    }
-}
-
-impl SseStream {
-    fn new(
-        inner: Pin<Box<dyn Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Send>>,
-        original_tools: Vec<ToolSchema>,
-        is_oauth: bool,
-    ) -> Self {
-        Self {
-            inner,
-            buffer: String::new(),
-            blocks: Vec::new(),
-            pending: VecDeque::new(),
-            done: false,
-            original_tools,
-            is_oauth,
-        }
-    }
-
-    /// Process complete SSE events from the buffer.
-    /// SSE format: "event: <type>\ndata: <json>\n\n"
-    fn process_buffer(&mut self) {
-        // Process all complete events (separated by double newline)
-        while let Some(end) = self.buffer.find("\n\n") {
-            let event_block = self.buffer[..end].to_string();
-            self.buffer = self.buffer[end + 2..].to_string();
-
-            let mut event_type = String::new();
-            let mut data = String::new();
-
-            for line in event_block.lines() {
-                if let Some(rest) = line.strip_prefix("event: ") {
-                    event_type = rest.trim().to_string();
-                } else if let Some(rest) = line.strip_prefix("data: ") {
-                    if !data.is_empty() {
-                        data.push('\n');
+                    for sse in this.parser.feed(&text) {
+                        let events = this.state.interpret(&sse);
+                        this.pending.extend(this.remap_tools(events));
                     }
-                    data.push_str(rest);
-                } else if line.starts_with(':') {
-                    // SSE comment, ignore
-                }
-            }
-
-            if !event_type.is_empty() {
-                let events = parse_sse_event(&event_type, &data, &mut self.blocks);
-                if self.is_oauth {
-                    self.pending.extend(events.into_iter().map(|e| {
-                        e.map(|evt| match evt {
-                            AssistantStreamEvent::ToolCallStart { id, name } => {
-                                let original_name = from_claude_code_name(&name, &self.original_tools);
-                                AssistantStreamEvent::ToolCallStart { id, name: original_name }
-                            }
-                            other => other,
-                        })
-                    }));
-                } else {
-                    self.pending.extend(events);
                 }
             }
         }
     }
 }
 
-/// Parse an error response body from the Anthropic API.
-fn parse_error_body(status: u16, body: &str) -> ProviderError {
-    let parsed: Value = serde_json::from_str(body).unwrap_or_default();
-    let error_type = parsed["error"]["type"].as_str().unwrap_or("unknown");
-    let error_message = parsed["error"]["message"]
-        .as_str()
-        .unwrap_or("Unknown error")
-        .to_string();
-
-    match error_type {
-        "overloaded_error" | "invalid_request_error"
-            if error_message.contains("token") && error_message.contains("exceed") =>
-        {
-            ProviderError::ContextOverflow {
-                used: 0,
-                limit: 0,
-            }
+impl AnthropicStream {
+    fn remap_tools(&self, events: Vec<Result<StreamEvent, ApiError>>) -> Vec<Result<StreamEvent, ApiError>> {
+        if !self.is_oauth {
+            return events;
         }
-        "rate_limit_error" => ProviderError::RateLimited {
-            retry_after_ms: 5000,
-        },
-        _ => ProviderError::Api {
-            status,
-            message: format!("{error_type}: {error_message}"),
-        },
+        events.into_iter().map(|e| {
+            e.map(|evt| match evt {
+                StreamEvent::ToolCallStart { id, name } => {
+                    let original = from_claude_code_name(&name, &self.original_tools);
+                    StreamEvent::ToolCallStart { id, name: original }
+                }
+                other => other,
+            })
+        }).collect()
     }
 }
 
-// -- Provider implementation --
-
-#[async_trait]
-impl LlmProvider for AnthropicProvider {
-    fn name(&self) -> &str {
-        "anthropic"
-    }
-
-    async fn stream(
-        &self,
-        model: &Model,
-        messages: &[Message],
-        options: &CompletionOptions,
-        api_key: &str,
-    ) -> Result<StreamOutput, ProviderError> {
-        let is_oauth = api_key.contains("sk-ant-oat");
-        let body = build_request_body(model, messages, options, is_oauth);
-        let url = format!("{}/v1/messages", model.base_url.trim_end_matches('/'));
-
-        let mut headers = HeaderMap::new();
-        if is_oauth {
-            headers.insert("authorization", HeaderValue::from_str(&format!("Bearer {api_key}")).map_err(|e| {
-                ProviderError::Other(format!("Invalid auth header: {e}"))
-            })?);
-            headers.insert(
-                "anthropic-beta",
-                HeaderValue::from_static("claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,fine-grained-tool-streaming-2025-05-14"),
-            );
-            headers.insert("anthropic-dangerous-direct-browser-access", HeaderValue::from_static("true"));
-            headers.insert("user-agent", HeaderValue::from_static("claude-cli/2.1.2 (external, cli)"));
-            headers.insert("x-app", HeaderValue::from_static("cli"));
-        } else {
-            headers.insert("x-api-key", HeaderValue::from_str(api_key).map_err(|e| {
-                ProviderError::Other(format!("Invalid API key header: {e}"))
-            })?);
-            headers.insert(
-                "anthropic-beta",
-                HeaderValue::from_static("interleaved-thinking-2025-05-14,fine-grained-tool-streaming-2025-05-14"),
-            );
-        }
-        headers.insert(
-            "anthropic-version",
-            HeaderValue::from_static("2023-06-01"),
-        );
-        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-        headers.insert("accept", HeaderValue::from_static("text/event-stream"));
-
-        tracing::debug!(
-            url = %url,
-            is_oauth = is_oauth,
-            model = %model.id,
-            body = %body,
-            "Anthropic API request"
-        );
-
-        let response = self
-            .client
-            .post(&url)
-            .headers(headers)
-            .body(body.to_string())
-            .send()
-            .await?;
-
-        let status = response.status().as_u16();
-        if status >= 400 {
-            let body_text = response.text().await.unwrap_or_default();
-            if is_oauth && body_text.contains("only authorized for use with Claude Code") {
-                let tool_names: Vec<&str> = options.tools.iter().map(|t| t.name.as_str()).collect();
-                warn!(
-                    "OAuth credential rejected by API. This usually means the request \
-                     does not match Claude Code's expected format. Tool names sent: {:?}",
-                    tool_names
-                );
-            }
-            return Err(parse_error_body(status, &body_text));
-        }
-
-        let byte_stream = response.bytes_stream();
-        let sse = SseStream::new(Box::pin(byte_stream), options.tools.clone(), is_oauth);
-
-        Ok(Box::pin(sse))
-    }
+pub fn event_stream(
+    bytes: Pin<Box<dyn Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Send>>,
+    tools: &[ToolSchema],
+    is_oauth: bool,
+) -> EventStream {
+    Box::pin(AnthropicStream {
+        inner: bytes,
+        parser: SseParser::new(),
+        state: StreamState::new(),
+        pending: VecDeque::new(),
+        done: false,
+        original_tools: tools.to_vec(),
+        is_oauth,
+    })
 }

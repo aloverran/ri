@@ -1,4 +1,4 @@
-use ri::auth::OAuthCredentials;
+use ri_ai::auth::OAuthCredentials;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;

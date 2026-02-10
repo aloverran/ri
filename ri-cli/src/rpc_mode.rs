@@ -1,7 +1,7 @@
-use ri::agent::{self, AgentCallback, AgentEvent, RunConfig};
-use ri::api::Provider;
-use ri::tools::ToolDef;
-use ri::types::*;
+use ri_core::agent::{self, AgentCallback, AgentEvent, RunConfig};
+use ri_core::tool::ToolDef;
+use ri_core::types::*;
+use ri_ai::Provider;
 use ri_store::types::Message;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -56,7 +56,6 @@ pub async fn run(
     let mut messages: Vec<Message> = Vec::new();
     let mut cb = RpcCallback::new();
 
-    // If there's an initial prompt, start the agent
     if let Some(prompt) = initial_prompt {
         messages.push(Message::user(prompt));
 
@@ -74,7 +73,6 @@ pub async fn run(
         let _ = agent::run(&config, &mut messages, &mut cb, cancel).await;
     }
 
-    // Read commands from stdin
     let stdin = tokio::io::stdin();
     let reader = tokio::io::BufReader::new(stdin);
     let mut lines = reader.lines();

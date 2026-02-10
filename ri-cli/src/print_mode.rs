@@ -1,8 +1,7 @@
-use ri::agent::{AgentCallback, AgentEvent};
-use ri::api::StreamEvent;
+use ri_core::agent::{AgentCallback, AgentEvent};
+use ri_core::event::StreamEvent;
 use std::io::Write;
 
-// Simple callback for text output mode.
 pub struct TextCallback { counter: u64 }
 
 impl TextCallback {
@@ -20,7 +19,6 @@ impl AgentCallback for TextCallback {
     }
 }
 
-// Simple callback for JSON output mode.
 pub struct JsonCallback { counter: u64 }
 
 impl JsonCallback {

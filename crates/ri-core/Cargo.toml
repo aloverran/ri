@@ -3,19 +3,16 @@ name = "ri-core"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Core types, traits, and agent loop for the ri coding agent"
+description = "Agent loop, model types, tool definitions, and stream events for ri"
 
 [dependencies]
+ri-store.workspace = true
 tokio.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 futures.workspace = true
-async-trait.workspace = true
-thiserror.workspace = true
-uuid.workspace = true
-chrono.workspace = true
-tokio-stream.workspace = true
-tracing.workspace = true
 eyre.workspace = true
-reqwest.workspace = true
-tokio-util = { version = "0.7", features = ["rt"] }
+thiserror.workspace = true
+chrono.workspace = true
+tracing.workspace = true
+tokio-util.workspace = true

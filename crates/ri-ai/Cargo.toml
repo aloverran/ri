@@ -3,15 +3,15 @@ name = "ri-ai"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "LLM provider abstraction and streaming for ri"
+description = "LLM provider implementations (Anthropic, Gemini) for ri"
 
 [dependencies]
+ri-store.workspace = true
 ri-core.workspace = true
 tokio.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 futures.workspace = true
-async-trait.workspace = true
 reqwest.workspace = true
 thiserror.workspace = true
 eyre.workspace = true

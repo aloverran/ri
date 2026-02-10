@@ -1,12 +1,11 @@
 use std::pin::Pin;
 use futures::Stream;
 
-use super::{ApiError, ApiRequest};
+use ri_core::provider::ApiError;
+use crate::ApiRequest;
 
 type ByteStream = Pin<Box<dyn Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Send>>;
 
-// Send an ApiRequest, return the response as a byte stream.
-// Checks for HTTP error status codes before returning.
 pub async fn send(request: &ApiRequest) -> Result<ByteStream, ApiError> {
     let client = reqwest::Client::new();
 
@@ -16,7 +15,7 @@ pub async fn send(request: &ApiRequest) -> Result<ByteStream, ApiError> {
     }
     builder = builder.body(request.body.clone());
 
-    let response = builder.send().await?;
+    let response = builder.send().await.map_err(|e| ApiError::Http(e.to_string()))?;
     let status = response.status().as_u16();
 
     if status >= 400 {
@@ -30,7 +29,6 @@ pub async fn send(request: &ApiRequest) -> Result<ByteStream, ApiError> {
 fn parse_http_error(status: u16, body: &str) -> ApiError {
     let parsed: serde_json::Value = serde_json::from_str(body).unwrap_or_default();
 
-    // Anthropic error shape
     if let Some(error) = parsed.get("error") {
         let error_type = error["type"].as_str().unwrap_or("unknown");
         let message = error["message"].as_str().unwrap_or(body).to_string();
@@ -44,13 +42,8 @@ fn parse_http_error(status: u16, body: &str) -> ApiError {
         return ApiError::Api { status, message: format!("{}: {}", error_type, message) };
     }
 
-    // Google error shape
-    if let Some(error) = parsed.get("error") {
-        let message = error["message"].as_str().unwrap_or(body).to_string();
-        if status == 429 || body.contains("RESOURCE_EXHAUSTED") {
-            return ApiError::RateLimited { retry_after_ms: 5000 };
-        }
-        return ApiError::Api { status, message };
+    if status == 429 || body.contains("RESOURCE_EXHAUSTED") {
+        return ApiError::RateLimited { retry_after_ms: 5000 };
     }
 
     ApiError::Api { status, message: body.to_string() }

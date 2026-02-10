@@ -1,7 +1,8 @@
 use clap::Parser;
 use color_eyre::eyre::Result;
-use ri::api::{GeminiVariant, Provider};
-use ri::types::*;
+use ri_ai::{GeminiVariant, Provider};
+use ri_core::types::*;
+use ri_store::types::Message;
 
 mod auth;
 mod interactive;
@@ -46,27 +47,18 @@ async fn main() -> Result<()> {
 
     let res = resources::ResourceLoader::load(std::path::Path::new(&cwd));
 
-    // Resolve provider name from settings or CLI
     let provider_name = res.settings.default_provider
         .as_deref()
         .unwrap_or(&cli.provider);
 
-    // Resolve model
     let model_id = cli.model
         .or_else(|| res.settings.default_model.clone())
         .unwrap_or_else(|| default_model_id(provider_name).to_string());
 
     let model = find_model(provider_name, &model_id, &res);
-
-    // Resolve API key and build provider
     let provider = build_provider(provider_name, &res).await;
-
-    // Build system prompt
     let system_prompt = res.build_system_prompt(None);
-
-    // Build tools
-    let tools = ri::tools::all_tools();
-
+    let tools = ri_tools::all_tools();
     let cwd_path = std::path::PathBuf::from(&cwd);
 
     match cli.mode.as_str() {
@@ -77,7 +69,7 @@ async fn main() -> Result<()> {
             let is_json = cli.mode == "json" || cli.output == "json";
             let mut messages = vec![Message::user(prompt)];
 
-            let config = ri::agent::RunConfig {
+            let config = ri_core::agent::RunConfig {
                 provider: &provider,
                 model: &model,
                 system_prompt: &system_prompt,
@@ -90,10 +82,10 @@ async fn main() -> Result<()> {
             let cancel = tokio_util::sync::CancellationToken::new();
             if is_json {
                 let mut cb = print_mode::JsonCallback::new();
-                ri::agent::run(&config, &mut messages, &mut cb, cancel).await?;
+                ri_core::agent::run(&config, &mut messages, &mut cb, cancel).await?;
             } else {
                 let mut cb = print_mode::TextCallback::new();
-                ri::agent::run(&config, &mut messages, &mut cb, cancel).await?;
+                ri_core::agent::run(&config, &mut messages, &mut cb, cancel).await?;
             }
             println!();
         }
@@ -120,12 +112,10 @@ fn default_model_id(provider: &str) -> &'static str {
 }
 
 fn find_model(provider: &str, model_id: &str, res: &resources::ResourceLoader) -> Model {
-    // Check custom models from models.json
     for m in res.custom_models() {
         if m.id == model_id { return m; }
     }
 
-    // Built-in models
     match (provider, model_id) {
         ("anthropic", "claude-sonnet-4-20250514") => Model {
             id: "claude-sonnet-4-20250514".into(), name: "Claude Sonnet 4".into(),
@@ -158,7 +148,6 @@ fn find_model(provider: &str, model_id: &str, res: &resources::ResourceLoader) -
             cost: ModelCost { input: 0.5, output: 1.5, cache_read: 0.125, cache_write: 0.0 },
         },
         _ => {
-            // Unknown model, make a reasonable default
             Model {
                 id: model_id.into(), name: model_id.into(),
                 reasoning: false, context_window: 128_000, max_tokens: 16_384,
@@ -169,7 +158,6 @@ fn find_model(provider: &str, model_id: &str, res: &resources::ResourceLoader) -
 }
 
 async fn build_provider(provider_name: &str, res: &resources::ResourceLoader) -> Provider {
-    // Try models.json API key, then env var, then OAuth
     let mut auth_store = auth::AuthStore::load();
 
     match provider_name {
@@ -182,12 +170,11 @@ async fn build_provider(provider_name: &str, res: &resources::ResourceLoader) ->
                 return Provider::Anthropic { api_key: key };
             }
 
-            // Try OAuth
             if let Some(creds) = auth_store.get("anthropic").cloned() {
                 if !creds.is_expired() {
                     return Provider::Anthropic { api_key: creds.access };
                 }
-                if let Ok(refreshed) = ri::auth::anthropic::refresh_token(&creds).await {
+                if let Ok(refreshed) = ri_ai::auth::anthropic::refresh_token(&creds).await {
                     let key = refreshed.access.clone();
                     auth_store.set("anthropic", refreshed);
                     let _ = auth_store.save();
@@ -207,7 +194,7 @@ async fn build_provider(provider_name: &str, res: &resources::ResourceLoader) ->
 
             if let Some(creds) = auth_store.get(name).cloned() {
                 let (token, project_id) = if creds.is_expired() {
-                    match ri::auth::google::refresh_token(&creds, variant).await {
+                    match ri_ai::auth::google::refresh_token(&creds, variant).await {
                         Ok(refreshed) => {
                             let t = refreshed.access.clone();
                             let p = refreshed.project_id.clone().unwrap_or_default();

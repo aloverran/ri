@@ -1,7 +1,8 @@
-use ri::agent::{self, AgentCallback, AgentEvent, RunConfig};
-use ri::api::{GeminiVariant, Provider, StreamEvent};
-use ri::tools::ToolDef;
-use ri::types::*;
+use ri_core::agent::{self, AgentCallback, AgentEvent, RunConfig};
+use ri_core::event::StreamEvent;
+use ri_core::tool::ToolDef;
+use ri_core::types::*;
+use ri_ai::{GeminiVariant, Provider};
 use ri_store::types::Message;
 use ri_store::filing::SessionFiling;
 use std::io::Write;
@@ -10,7 +11,6 @@ use tokio::io::AsyncBufReadExt;
 
 use crate::auth::AuthStore;
 
-// Callback that persists messages to filing and displays events.
 struct InteractiveCallback<'a> {
     filing: &'a mut SessionFiling,
 }
@@ -38,23 +38,19 @@ pub async fn run(
     cwd: PathBuf,
     initial_prompt: Option<String>,
 ) -> eyre::Result<()> {
-    // Set up session filing.
     let sessions_dir = SessionFiling::default_dir()?;
     let mut filing = SessionFiling::new(sessions_dir);
     filing.load_all()?;
 
-    // Create a new session.
     let session_name = session_name_from_prompt(initial_prompt.as_deref());
     filing.new_session(&session_name, &cwd.display().to_string())?;
 
-    // Write system prompt as the first message.
     let sys_id = filing.next_id();
     let sys_msg = Message::new(sys_id, Role::System, vec![ContentBlock::text(&system_prompt)]);
     filing.write_message(sys_msg.clone())?;
 
     let mut messages: Vec<Message> = vec![sys_msg];
 
-    // If there's an initial prompt, run it first
     if let Some(prompt) = initial_prompt {
         print_user_prefix();
         println!("{}", prompt);
@@ -78,13 +74,11 @@ pub async fn run(
         agent::run(&config, &mut messages, &mut cb, cancel).await?;
     }
 
-    // Main REPL loop
     let stdin = tokio::io::stdin();
     let reader = tokio::io::BufReader::new(stdin);
     let mut lines = reader.lines();
 
-    // Login state
-    let mut login_pending: Option<ri::auth::anthropic::LoginFlow> = None;
+    let mut login_pending: Option<ri_ai::auth::anthropic::LoginFlow> = None;
 
     loop {
         if login_pending.is_some() {
@@ -102,9 +96,8 @@ pub async fn run(
         let trimmed = line.trim();
         if trimmed.is_empty() { continue; }
 
-        // Login code completion
         if let Some(flow) = login_pending.take() {
-            match ri::auth::anthropic::complete_login(trimmed, &flow).await {
+            match ri_ai::auth::anthropic::complete_login(trimmed, &flow).await {
                 Ok(creds) => {
                     let key = creds.access.clone();
                     let mut store = AuthStore::load();
@@ -118,7 +111,6 @@ pub async fn run(
             continue;
         }
 
-        // Commands
         match trimmed {
             "/quit" | "/exit" => break,
             "/help" => {
@@ -130,7 +122,7 @@ pub async fn run(
                 continue;
             }
             "/login" | "/login anthropic" => {
-                match ri::auth::anthropic::begin_login() {
+                match ri_ai::auth::anthropic::begin_login() {
                     Ok(flow) => {
                         eprintln!("\n\x1b[33mVisit this URL to authorize:\x1b[0m");
                         eprintln!("\x1b[4m{}\x1b[0m\n", flow.url);
@@ -155,7 +147,6 @@ pub async fn run(
             _ => {}
         }
 
-        // Write user message to filing.
         let user_id = filing.next_id();
         let user_msg = Message::new(user_id, Role::User, vec![ContentBlock::text(trimmed)]);
         filing.write_message(user_msg.clone())?;
@@ -255,14 +246,14 @@ async fn do_google_login(variant: GeminiVariant) -> Option<Provider> {
 
     eprintln!("\x1b[33mStarting Google OAuth login...\x1b[0m");
 
-    match ri::auth::google::login(variant, |url| {
+    match ri_ai::auth::google::login(variant, |url| {
         eprintln!("\n\x1b[33mVisit this URL to authorize:\x1b[0m");
         eprintln!("\x1b[4m{}\x1b[0m\n", url);
         #[cfg(target_os = "macos")]
         { let _ = std::process::Command::new("open").arg(url).spawn(); }
     }).await {
         Ok(creds) => {
-            let (token, project_id) = ri::auth::google::build_api_key(&creds);
+            let (token, project_id) = ri_ai::auth::google::build_api_key(&creds);
             if let Some(ref email) = creds.email {
                 eprintln!("\x1b[32mLogged in as {}\x1b[0m", email);
             } else {

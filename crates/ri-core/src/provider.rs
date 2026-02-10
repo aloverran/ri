@@ -1,19 +1,29 @@
-// LLM provider trait -- the abstraction over Anthropic, OpenAI, Google, etc.
+// Provider trait -- the agent loop's view of an LLM provider.
+//
+// ri-ai implements this trait. ri-core defines it so the agent loop
+// can call providers without depending on ri-ai.
 
-use async_trait::async_trait;
-use futures::Stream;
 use std::pin::Pin;
+use futures::Stream;
 
-use crate::event::AssistantStreamEvent;
-use crate::types::{CompletionOptions, Message, Model};
+use crate::event::{StreamEvent, ToolSchema};
+use crate::types::{Model, ThinkingLevel};
+use ri_store::types::Message;
 
-pub type StreamOutput =
-    Pin<Box<dyn Stream<Item = Result<AssistantStreamEvent, ProviderError>> + Send>>;
+// Request-level options (provider-agnostic).
+pub struct RequestOptions<'a> {
+    pub model: &'a Model,
+    pub system_prompt: &'a str,
+    pub messages: &'a [Message],
+    pub tools: &'a [ToolSchema],
+    pub thinking: ThinkingLevel,
+    pub max_tokens: Option<usize>,
+}
 
 #[derive(Debug, thiserror::Error)]
-pub enum ProviderError {
+pub enum ApiError {
     #[error("HTTP error: {0}")]
-    Http(#[from] reqwest::Error),
+    Http(String),
 
     #[error("API error ({status}): {message}")]
     Api { status: u16, message: String },
@@ -31,15 +41,14 @@ pub enum ProviderError {
     Other(String),
 }
 
-#[async_trait]
-pub trait LlmProvider: Send + Sync {
-    fn name(&self) -> &str;
+pub type EventStream = Pin<Box<dyn Stream<Item = Result<StreamEvent, ApiError>> + Send>>;
 
-    async fn stream(
-        &self,
-        model: &Model,
-        messages: &[Message],
-        options: &CompletionOptions,
-        api_key: &str,
-    ) -> Result<StreamOutput, ProviderError>;
+use std::future::Future;
+
+// The trait that LLM providers implement.
+pub trait LlmProvider: Send + Sync {
+    fn stream<'a>(
+        &'a self,
+        opts: &'a RequestOptions<'a>,
+    ) -> Pin<Box<dyn Future<Output = Result<EventStream, ApiError>> + Send + 'a>>;
 }

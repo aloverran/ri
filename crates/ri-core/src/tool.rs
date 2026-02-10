@@ -1,32 +1,35 @@
-// Tool trait -- the interface that all built-in and custom tools implement.
+// Tools -- functions, not trait objects.
 
-use async_trait::async_trait;
-use crate::types::{ContentBlock, ToolSchema};
+use std::path::PathBuf;
+use std::pin::Pin;
+use std::future::Future;
 
-#[derive(Debug, Clone)]
-pub struct ToolResultOutput {
-    pub content: Vec<ContentBlock>,
+use crate::event::ToolSchema;
+
+pub struct ToolOutput {
+    pub text: String,
     pub is_error: bool,
 }
 
-/// Update sent during long-running tool execution.
-#[derive(Debug, Clone)]
-pub struct ToolUpdate {
-    pub content: Vec<ContentBlock>,
+pub type ToolFn = fn(
+    serde_json::Value,
+    PathBuf,
+    tokio_util::sync::CancellationToken,
+) -> Pin<Box<dyn Future<Output = ToolOutput> + Send>>;
+
+pub struct ToolDef {
+    pub name: &'static str,
+    pub description: &'static str,
+    pub parameters: serde_json::Value,
+    pub run: ToolFn,
 }
 
-#[async_trait]
-pub trait Tool: Send + Sync {
-    fn name(&self) -> &str;
-    fn label(&self) -> &str;
-    fn description(&self) -> &str;
-    fn schema(&self) -> ToolSchema;
-
-    async fn execute(
-        &self,
-        tool_call_id: &str,
-        params: serde_json::Value,
-        cancel: tokio_util::sync::CancellationToken,
-        update_tx: Option<tokio::sync::mpsc::Sender<ToolUpdate>>,
-    ) -> eyre::Result<ToolResultOutput>;
+impl ToolDef {
+    pub fn schema(&self) -> ToolSchema {
+        ToolSchema {
+            name: self.name.to_string(),
+            description: self.description.to_string(),
+            parameters: self.parameters.clone(),
+        }
+    }
 }

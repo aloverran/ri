@@ -1,213 +1,141 @@
-// Google Gemini provider (Cloud Code Assist API).
+// Google Gemini provider -- Cloud Code Assist API.
 //
-// Supports both google-gemini-cli and google-antigravity endpoints.
-// Uses SSE streaming via POST to {endpoint}/v1internal:streamGenerateContent?alt=sse.
+// Two entry points:
+//   build_request() -> ApiRequest    (pure data)
+//   event_stream()  -> EventStream   (SSE bytes -> typed events)
 //
-// The API key for this provider is JSON-encoded: {"token":"...","projectId":"..."}
+// Supports two variants:
+//   Cli:          standard Gemini models via cloudcode-pa.googleapis.com
+//   Antigravity:  Gemini 3 via daily-cloudcode-pa.sandbox.googleapis.com
 
-use async_trait::async_trait;
-use futures::Stream;
-use reqwest::header::{HeaderMap, HeaderValue, CONTENT_TYPE};
-use ri_core::event::AssistantStreamEvent;
-use ri_core::provider::{LlmProvider, ProviderError, StreamOutput};
-use ri_core::types::{
-    CompletionOptions, ContentBlock, Message, Model, Role, ThinkingLevel, ToolSchema,
-};
-use serde_json::{json, Value};
 use std::collections::VecDeque;
 use std::pin::Pin;
 use std::task::{Context, Poll};
+use futures::Stream;
+use serde_json::{json, Value};
 
-
-// -- Endpoints --
+use ri_core::types::{ThinkingLevel, Role};
+use ri_store::types::{Message, ContentBlock};
+use ri_core::provider::{ApiError, EventStream, RequestOptions};
+use ri_core::event::StreamEvent;
+use crate::{ApiRequest, GeminiVariant};
+use crate::sse::{SseEvent, SseParser};
 
 const GEMINI_CLI_ENDPOINT: &str = "https://cloudcode-pa.googleapis.com";
 const ANTIGRAVITY_DAILY_ENDPOINT: &str = "https://daily-cloudcode-pa.sandbox.googleapis.com";
 
-const DEFAULT_ANTIGRAVITY_VERSION: &str = "1.15.8";
-
-// -- Provider --
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum GeminiVariant {
-    GeminiCli,
-    Antigravity,
-}
-
-pub struct GeminiProvider {
-    client: reqwest::Client,
-    variant: GeminiVariant,
-}
-
-impl GeminiProvider {
-    pub fn new(variant: GeminiVariant) -> Self {
-        Self {
-            client: reqwest::Client::new(),
-            variant,
-        }
-    }
-}
-
-// -- Credential parsing --
-
-struct GeminiCredentials {
-    token: String,
-    project_id: String,
-}
-
-fn parse_credentials(api_key: &str) -> Result<GeminiCredentials, ProviderError> {
-    let parsed: Value = serde_json::from_str(api_key).map_err(|_| {
-        ProviderError::Other(
-            "Invalid Google credentials. Expected JSON: {\"token\":\"...\",\"projectId\":\"...\"}. Use /login google to authenticate.".to_string()
-        )
-    })?;
-    let token = parsed["token"]
-        .as_str()
-        .ok_or_else(|| ProviderError::Other("Missing 'token' in Google credentials".to_string()))?
-        .to_string();
-    let project_id = parsed["projectId"]
-        .as_str()
-        .ok_or_else(|| ProviderError::Other("Missing 'projectId' in Google credentials".to_string()))?
-        .to_string();
-    Ok(GeminiCredentials { token, project_id })
-}
-
 // -- Request building --
 
-fn convert_message_to_gemini(msg: &Message, model: &Model) -> Option<Value> {
-    if msg.role == Role::System {
-        return None;
-    }
+pub fn build_request(
+    variant: GeminiVariant,
+    token: &str,
+    project_id: &str,
+    opts: &RequestOptions,
+) -> ApiRequest {
+    let body = build_body(variant, project_id, opts);
+    let endpoint = match variant {
+        GeminiVariant::Antigravity => ANTIGRAVITY_DAILY_ENDPOINT,
+        GeminiVariant::Cli => GEMINI_CLI_ENDPOINT,
+    };
+    let url = format!("{}/v1internal:streamGenerateContent?alt=sse", endpoint);
 
-    let gemini_role = match msg.role {
-        Role::User => "user",
-        Role::Assistant => "model",
-        Role::System => return None,
+    let ua = match variant {
+        GeminiVariant::Antigravity => "antigravity/1.15.8 darwin/arm64".to_string(),
+        GeminiVariant::Cli => "google-cloud-sdk vscode_cloudshelleditor/0.1".to_string(),
     };
 
-    let is_gemini3 = model.id.contains("3-pro") || model.id.contains("3-flash");
-    // Check if this message is from the same provider (for signature preservation)
-    let is_same_provider = model.provider.starts_with("google");
+    let headers = vec![
+        ("authorization".into(), format!("Bearer {}", token)),
+        ("content-type".into(), "application/json".into()),
+        ("accept".into(), "text/event-stream".into()),
+        ("user-agent".into(), ua),
+        ("x-goog-api-client".into(), "gl-node/22.17.0".into()),
+        ("client-metadata".into(), json!({
+            "ideType": "IDE_UNSPECIFIED",
+            "platform": "PLATFORM_UNSPECIFIED",
+            "pluginType": "GEMINI"
+        }).to_string()),
+    ];
 
-    let mut parts: Vec<Value> = Vec::new();
+    ApiRequest { url, headers, body: body.to_string() }
+}
 
-    for block in &msg.content {
-        match block {
-            ContentBlock::Text { text, text_signature } => {
-                if text.trim().is_empty() {
-                    continue;
-                }
-                let mut part = json!({ "text": text });
-                if is_same_provider {
-                    if let Some(sig) = text_signature {
-                        if is_valid_signature(sig) {
-                            part["thoughtSignature"] = json!(sig);
-                        }
-                    }
-                }
-                parts.push(part);
+fn build_body(variant: GeminiVariant, project_id: &str, opts: &RequestOptions) -> Value {
+    let contents = build_contents(opts.messages, &opts.model.id);
+
+    let max_tokens = opts.max_tokens
+        .unwrap_or_else(|| (opts.model.max_tokens / 3).max(4096));
+
+    let mut generation_config = json!({ "maxOutputTokens": max_tokens });
+
+    // Thinking config
+    if opts.model.reasoning && opts.thinking != ThinkingLevel::Off {
+        let is_gemini3 = opts.model.id.contains("3-pro") || opts.model.id.contains("3-flash");
+        if is_gemini3 {
+            if let Some(level_str) = thinking_level_string(opts.thinking, &opts.model.id) {
+                generation_config["thinkingConfig"] = json!({
+                    "includeThoughts": true,
+                    "thinkingLevel": level_str,
+                });
             }
-            ContentBlock::Thinking { thinking, thinking_signature } => {
-                if thinking.trim().is_empty() {
-                    continue;
-                }
-                if is_same_provider {
-                    let mut part = json!({ "text": thinking, "thought": true });
-                    if let Some(sig) = thinking_signature {
-                        if is_valid_signature(sig) {
-                            part["thoughtSignature"] = json!(sig);
-                        }
-                    }
-                    parts.push(part);
-                } else {
-                    // Convert thinking from other providers to plain text
-                    parts.push(json!({ "text": thinking }));
-                }
-            }
-            ContentBlock::ToolUse { id: _, name, input, thought_signature } => {
-                if is_same_provider {
-                    if let Some(sig) = thought_signature {
-                        if is_valid_signature(sig) {
-                            let mut part = json!({
-                                "functionCall": { "name": name, "args": input }
-                            });
-                            part["thoughtSignature"] = json!(sig);
-                            parts.push(part);
-                            continue;
-                        }
-                    }
-                }
-                // Gemini 3 requires thoughtSignature on all function calls when thinking
-                // is enabled. Without a signature, convert to text to avoid API errors.
-                if is_gemini3 {
-                    let args_str = serde_json::to_string_pretty(input).unwrap_or_default();
-                    parts.push(json!({
-                        "text": format!("[Historical context: tool \"{}\" was called with arguments: {}. Do not mimic this format - use proper function calling.]", name, args_str)
-                    }));
-                } else {
-                    parts.push(json!({
-                        "functionCall": { "name": name, "args": input }
-                    }));
-                }
-            }
-            ContentBlock::ToolResult { tool_use_id: _, content, is_error, .. } => {
-                // Extract text from content blocks
-                let text_result: String = content
-                    .iter()
-                    .filter_map(|c| match c {
-                        ContentBlock::Text { text, .. } => Some(text.as_str()),
-                        _ => None,
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n");
-
-                let response_value = if text_result.is_empty() {
-                    "(empty)".to_string()
-                } else {
-                    text_result
-                };
-
-                // Find the tool name from the corresponding tool call.
-                // Since we don't have it directly, extract from the previous message's
-                // tool call with matching id. For now, use a placeholder.
-                // The actual name gets set during message conversion in build_contents.
-                let response = if *is_error {
-                    json!({ "error": response_value })
-                } else {
-                    json!({ "output": response_value })
-                };
-
-                parts.push(json!({
-                    "functionResponse": {
-                        "name": "_pending",
-                        "response": response
-                    }
-                }));
-            }
-            ContentBlock::Image { media_type, data } => {
-                parts.push(json!({
-                    "inlineData": {
-                        "mimeType": media_type,
-                        "data": data
-                    }
-                }));
+        } else {
+            if let Some(budget) = thinking_budget(opts.thinking) {
+                generation_config["thinkingConfig"] = json!({
+                    "includeThoughts": true,
+                    "thinkingBudget": budget,
+                });
             }
         }
     }
 
-    if parts.is_empty() {
-        return None;
+    let mut request = json!({ "contents": contents });
+
+    // System instruction
+    let system_text = if variant == GeminiVariant::Antigravity {
+        format!("{}\n\n{}\n{}", ANTIGRAVITY_SYSTEM_INSTRUCTION, BRIDGE_PROMPT, opts.system_prompt)
+    } else {
+        opts.system_prompt.to_string()
+    };
+    request["systemInstruction"] = json!({ "parts": [{ "text": system_text }] });
+
+    request["generationConfig"] = generation_config;
+
+    if !opts.tools.is_empty() {
+        let declarations: Vec<Value> = opts.tools.iter().map(|t| {
+            json!({
+                "name": t.name,
+                "description": t.description,
+                "parameters": t.parameters,
+            })
+        }).collect();
+        request["tools"] = json!([{ "functionDeclarations": declarations }]);
     }
 
-    Some(json!({ "role": gemini_role, "parts": parts }))
+    let mut body = json!({
+        "project": project_id,
+        "model": opts.model.id,
+        "request": request,
+        "userAgent": if variant == GeminiVariant::Antigravity { "antigravity" } else { "ri-coding-agent" },
+        "requestId": format!("{}-{}-{}",
+            if variant == GeminiVariant::Antigravity { "agent" } else { "ri" },
+            chrono::Utc::now().timestamp_millis(),
+            &uuid::Uuid::new_v4().to_string()[..8]
+        ),
+    });
+
+    if variant == GeminiVariant::Antigravity {
+        body["requestType"] = json!("agent");
+    }
+
+    body
 }
 
-/// Convert ri messages to Gemini contents array.
-/// Handles tool result name resolution and message merging.
-fn build_contents(messages: &[Message], model: &Model) -> Vec<Value> {
-    let mut contents: Vec<Value> = Vec::new();
+// -- Message conversion --
 
-    // Build a map of tool call id -> tool name for resolving functionResponse names
+fn build_contents(messages: &[Message], model_id: &str) -> Vec<Value> {
+    let is_gemini3 = model_id.contains("3-pro") || model_id.contains("3-flash");
+
+    // Build tool call id -> name map for resolving functionResponse names
     let mut tool_names: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     for msg in messages {
         for block in &msg.content {
@@ -217,54 +145,37 @@ fn build_contents(messages: &[Message], model: &Model) -> Vec<Value> {
         }
     }
 
-    for msg in messages {
-        if msg.role == Role::System {
-            continue;
-        }
+    let mut contents: Vec<Value> = Vec::new();
 
-        // Handle tool results specially: they need to be user messages with functionResponse
-        let has_tool_results = msg.content.iter().any(|b| matches!(b, ContentBlock::ToolResult { .. }));
+    for msg in messages {
+        if msg.role == Role::System { continue; }
+
+        let has_tool_results = msg.content.iter().any(|c| matches!(c, ContentBlock::ToolResult { .. }));
 
         if has_tool_results {
-            let mut parts = Vec::new();
-            for block in &msg.content {
-                if let ContentBlock::ToolResult { tool_use_id, content, is_error } = block {
-                    let text_result: String = content
-                        .iter()
-                        .filter_map(|c| match c {
-                            ContentBlock::Text { text, .. } => Some(text.as_str()),
-                            _ => None,
-                        })
-                        .collect::<Vec<_>>()
-                        .join("\n");
-
-                    let response_value = if text_result.is_empty() {
-                        "(empty)".to_string()
-                    } else {
-                        text_result
-                    };
-
-                    let tool_name = tool_names
-                        .get(tool_use_id)
+            let parts: Vec<Value> = msg.content.iter().filter_map(|c| {
+                if let ContentBlock::ToolResult { tool_use_id, content, is_error, .. } = c {
+                    let tool_name = tool_names.get(tool_use_id.as_str())
                         .cloned()
                         .unwrap_or_else(|| "unknown".to_string());
-
+                    // Extract text from content blocks for the response.
+                    let output_text: String = content.iter().filter_map(|b| {
+                        if let ContentBlock::Text { text, .. } = b { Some(text.as_str()) } else { None }
+                    }).collect::<Vec<_>>().join("\n");
                     let response = if *is_error {
-                        json!({ "error": response_value })
+                        json!({ "error": output_text })
                     } else {
-                        json!({ "output": response_value })
+                        json!({ "output": output_text })
                     };
-
-                    parts.push(json!({
-                        "functionResponse": {
-                            "name": tool_name,
-                            "response": response
-                        }
-                    }));
+                    Some(json!({
+                        "functionResponse": { "name": tool_name, "response": response }
+                    }))
+                } else {
+                    None
                 }
-            }
+            }).collect();
 
-            // Merge with previous user turn if it also has functionResponses
+            // Merge with previous user turn if it has functionResponses
             let should_merge = contents.last()
                 .and_then(|c| c["role"].as_str())
                 .map(|r| r == "user")
@@ -286,39 +197,84 @@ fn build_contents(messages: &[Message], model: &Model) -> Vec<Value> {
             continue;
         }
 
-        if let Some(converted) = convert_message_to_gemini(msg, model) {
-            contents.push(converted);
+        let gemini_role = match msg.role {
+            Role::User => "user",
+            Role::Assistant => "model",
+            Role::System => continue,
+        };
+
+        let mut parts: Vec<Value> = Vec::new();
+        for block in &msg.content {
+            match block {
+                ContentBlock::Text { text, extra } => {
+                    if text.trim().is_empty() { continue; }
+                    let mut part = json!({ "text": text });
+                    if let Some(serde_json::Value::String(s)) = extra.get("sig") {
+                        if is_valid_signature(s) { part["thoughtSignature"] = json!(s); }
+                    }
+                    parts.push(part);
+                }
+                ContentBlock::Thinking { thinking, extra } => {
+                    if thinking.trim().is_empty() { continue; }
+                    let sig = extra.get("sig").and_then(|v| v.as_str());
+                    // From same provider: preserve as thought
+                    if let Some(s) = sig {
+                        if is_valid_signature(s) {
+                            let mut part = json!({ "text": thinking, "thought": true });
+                            part["thoughtSignature"] = json!(s);
+                            parts.push(part);
+                            continue;
+                        }
+                    }
+                    // From other provider or no sig: convert to plain text
+                    parts.push(json!({ "text": thinking }));
+                }
+                ContentBlock::ToolUse { name, input, extra, .. } => {
+                    let sig = extra.get("sig").and_then(|v| v.as_str());
+                    if let Some(s) = sig {
+                        if is_valid_signature(s) {
+                            let mut part = json!({ "functionCall": { "name": name, "args": input } });
+                            part["thoughtSignature"] = json!(s);
+                            parts.push(part);
+                            continue;
+                        }
+                    }
+                    // Gemini 3 requires thoughtSignature on function calls when thinking
+                    // is enabled. Without one, convert to text to avoid API errors.
+                    if is_gemini3 {
+                        let args_str = serde_json::to_string_pretty(input).unwrap_or_default();
+                        parts.push(json!({
+                            "text": format!(
+                                "[Historical context: tool \"{}\" was called with arguments: {}. Do not mimic this format - use proper function calling.]",
+                                name, args_str
+                            )
+                        }));
+                    } else {
+                        parts.push(json!({ "functionCall": { "name": name, "args": input } }));
+                    }
+                }
+                ContentBlock::ToolResult { .. } => {} // handled above
+                ContentBlock::Image { media_type, data, .. } => {
+                    parts.push(json!({ "inlineData": { "mimeType": media_type, "data": data } }));
+                }
+                ContentBlock::Unknown(_) => {}
+            }
+        }
+
+        if !parts.is_empty() {
+            contents.push(json!({ "role": gemini_role, "parts": parts }));
         }
     }
 
     contents
 }
 
-fn convert_tools(tools: &[ToolSchema]) -> Value {
-    let declarations: Vec<Value> = tools
-        .iter()
-        .map(|t| {
-            json!({
-                "name": t.name,
-                "description": t.description,
-                "parameters": t.parameters
-            })
-        })
-        .collect();
-
-    json!([{ "functionDeclarations": declarations }])
-}
-
 fn thinking_level_string(level: ThinkingLevel, model_id: &str) -> Option<&'static str> {
     let is_pro = model_id.contains("3-pro");
     match level {
         ThinkingLevel::Off => None,
-        ThinkingLevel::Low => {
-            if is_pro { Some("LOW") } else { Some("LOW") }
-        }
-        ThinkingLevel::Medium => {
-            if is_pro { Some("HIGH") } else { Some("MEDIUM") }
-        }
+        ThinkingLevel::Low => Some("LOW"),
+        ThinkingLevel::Medium => if is_pro { Some("HIGH") } else { Some("MEDIUM") },
         ThinkingLevel::High => Some("HIGH"),
         ThinkingLevel::XHigh => Some("HIGH"),
     }
@@ -334,236 +290,92 @@ fn thinking_budget(level: ThinkingLevel) -> Option<u32> {
     }
 }
 
-fn build_request_body(
-    model: &Model,
-    messages: &[Message],
-    options: &CompletionOptions,
-    credentials: &GeminiCredentials,
-    variant: GeminiVariant,
-) -> Value {
-    let contents = build_contents(messages, model);
-
-    let max_tokens = options
-        .max_tokens
-        .unwrap_or_else(|| (model.max_tokens / 3).max(4096));
-
-    let mut generation_config = json!({
-        "maxOutputTokens": max_tokens
-    });
-
-    // Thinking config
-    if model.reasoning {
-        if let Some(level) = options.thinking_level {
-            if level != ThinkingLevel::Off {
-                let is_gemini3 = model.id.contains("3-pro") || model.id.contains("3-flash");
-                if is_gemini3 {
-                    if let Some(level_str) = thinking_level_string(level, &model.id) {
-                        generation_config["thinkingConfig"] = json!({
-                            "includeThoughts": true,
-                            "thinkingLevel": level_str
-                        });
-                    }
-                } else if let Some(budget) = thinking_budget(level) {
-                    generation_config["thinkingConfig"] = json!({
-                        "includeThoughts": true,
-                        "thinkingBudget": budget
-                    });
-                }
-            }
-        }
-    }
-
-    // Build the inner request
-    let mut request = json!({ "contents": contents });
-
-    // System instruction
-    if let Some(ref sys) = options.system_prompt {
-        let system_text = if variant == GeminiVariant::Antigravity {
-            format!("{}\n\n{}\n{}", ANTIGRAVITY_SYSTEM_INSTRUCTION, BRIDGE_PROMPT, sys)
-        } else {
-            sys.clone()
-        };
-        request["systemInstruction"] = json!({
-            "parts": [{ "text": system_text }]
-        });
-    }
-
-    request["generationConfig"] = generation_config;
-
-    // Tools
-    if !options.tools.is_empty() {
-        request["tools"] = convert_tools(&options.tools);
-    }
-
-    // Wrap in outer envelope
-    let mut body = json!({
-        "project": credentials.project_id,
-        "model": model.id,
-        "request": request,
-        "userAgent": if variant == GeminiVariant::Antigravity { "antigravity" } else { "ri-coding-agent" },
-        "requestId": format!("{}-{}-{}", 
-            if variant == GeminiVariant::Antigravity { "agent" } else { "ri" },
-            chrono::Utc::now().timestamp_millis(),
-            &uuid::Uuid::new_v4().to_string()[..8]
-        )
-    });
-
-    if variant == GeminiVariant::Antigravity {
-        body["requestType"] = json!("agent");
-    }
-
-    body
+fn is_valid_signature(sig: &str) -> bool {
+    if sig.is_empty() || sig.len() % 4 != 0 { return false; }
+    sig.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'+' || b == b'/' || b == b'=')
 }
 
-// -- SSE stream parsing --
+// -- SSE interpretation --
 
-/// Tracks the current streaming block for accumulating signatures.
 #[derive(Debug)]
 enum GeminiBlock {
-    Text { signature: Option<String> },
-    Thinking { signature: Option<String> },
-    ToolCall { id: String, signature: Option<String> },
+    Text { sig: Option<String> },
+    Thinking { sig: Option<String> },
+    ToolCall { id: String, sig: Option<String> },
 }
 
-pub struct GeminiSseStream {
-    inner: Pin<Box<dyn Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Send>>,
-    buffer: String,
-    sse_data_buf: String,
+struct GeminiState {
     current_block: Option<GeminiBlock>,
-    pending: VecDeque<Result<AssistantStreamEvent, ProviderError>>,
-    done: bool,
     tool_call_counter: u64,
 }
 
-impl GeminiSseStream {
-    pub fn new(inner: Pin<Box<dyn Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Send>>) -> Self {
-        Self {
-            inner,
-            buffer: String::new(),
-            sse_data_buf: String::new(),
-            current_block: None,
-            pending: VecDeque::new(),
-            done: false,
-            tool_call_counter: 0,
-        }
+impl GeminiState {
+    fn new() -> Self {
+        Self { current_block: None, tool_call_counter: 0 }
     }
 
-    fn process_buffer(&mut self) {
-        // SSE: each event is one or more `data:` lines followed by a blank line.
-        // Google's API sends one `data:` per event, but we accumulate properly
-        // in case a proxy re-chunks or the format changes.
-        while let Some(newline_pos) = self.buffer.find('\n') {
-            let line = self.buffer[..newline_pos].to_string();
-            self.buffer = self.buffer[newline_pos + 1..].to_string();
+    fn interpret(&mut self, sse: &SseEvent) -> Vec<Result<StreamEvent, ApiError>> {
+        let mut out = Vec::new();
 
-            let trimmed = line.trim_end_matches('\r').trim();
-
-            // Blank line = event boundary. Process accumulated data lines.
-            if trimmed.is_empty() {
-                if !self.sse_data_buf.is_empty() {
-                    let payload = std::mem::take(&mut self.sse_data_buf);
-                    self.process_sse_payload(&payload);
-                    if self.done {
-                        return;
-                    }
-                }
-                continue;
-            }
-
-            // SSE comment
-            if trimmed.starts_with(':') {
-                continue;
-            }
-
-            // Accumulate data: lines (concatenated with newlines per SSE spec)
-            if let Some(json_str) = trimmed.strip_prefix("data:") {
-                let data = json_str.trim();
-                if !self.sse_data_buf.is_empty() {
-                    self.sse_data_buf.push('\n');
-                }
-                self.sse_data_buf.push_str(data);
-            }
-            // Ignore other SSE fields (event:, id:, retry:)
-        }
-    }
-
-    fn process_sse_payload(&mut self, payload: &str) {
-        // Empty keep-alive: ignore
-        if payload.is_empty() {
-            return;
+        // Gemini sends data-only SSE (no event: field)
+        if sse.data.is_empty() { return out; }
+        if sse.data == "[DONE]" {
+            self.finish_block(&mut out);
+            out.push(Ok(StreamEvent::Done));
+            return out;
         }
 
-        // Explicit done signal
-        if payload == "[DONE]" {
-            self.finish_current_block();
-            self.pending.push_back(Ok(AssistantStreamEvent::Done));
-            self.done = true;
-            return;
-        }
-
-        let chunk: Value = match serde_json::from_str(payload) {
+        let chunk: Value = match serde_json::from_str(&sse.data) {
             Ok(v) => v,
             Err(e) => {
                 tracing::warn!("Failed to parse Gemini SSE payload: {}", e);
-                return;
+                return out;
             }
         };
 
-        self.process_chunk(&chunk);
-    }
-
-    fn process_chunk(&mut self, chunk: &Value) {
         // Cloud Code Assist wraps in "response"
-        let response = chunk.get("response").unwrap_or(chunk);
+        let response = chunk.get("response").unwrap_or(&chunk);
 
-        // Detect error payloads from the API
+        // Error detection
         if let Some(error) = chunk.get("error").or_else(|| response.get("error")) {
-            let message = error["message"]
-                .as_str()
-                .unwrap_or("Unknown API error")
-                .to_string();
-            self.finish_current_block();
-            self.pending.push_back(Ok(AssistantStreamEvent::Error { message }));
-            self.pending.push_back(Ok(AssistantStreamEvent::Done));
-            self.done = true;
-            return;
+            let message = error["message"].as_str().unwrap_or("Unknown API error").to_string();
+            self.finish_block(&mut out);
+            out.push(Ok(StreamEvent::Error(message)));
+            out.push(Ok(StreamEvent::Done));
+            return out;
         }
 
         let candidate = match response.get("candidates").and_then(|c| c.get(0)) {
             Some(c) => c,
-            None => return,
+            None => return out,
         };
 
-        if let Some(parts) = candidate
-            .get("content")
+        if let Some(parts) = candidate.get("content")
             .and_then(|c| c.get("parts"))
             .and_then(|p| p.as_array())
         {
             for part in parts {
-                self.process_part(part);
+                self.process_part(part, &mut out);
             }
         }
 
-        // Check for finish reason
+        // Finish reason
         if let Some(reason) = candidate.get("finishReason").and_then(|r| r.as_str()) {
-            self.finish_current_block();
+            self.finish_block(&mut out);
             match reason {
-                "STOP" | "MAX_TOKENS" => {
-                    self.pending.push_back(Ok(AssistantStreamEvent::Done));
-                }
+                "STOP" | "MAX_TOKENS" => out.push(Ok(StreamEvent::Done)),
                 other => {
-                    self.pending.push_back(Ok(AssistantStreamEvent::Error {
-                        message: format!("Gemini finish reason: {}", other),
-                    }));
-                    self.pending.push_back(Ok(AssistantStreamEvent::Done));
+                    out.push(Ok(StreamEvent::Error(format!("Gemini finish reason: {}", other))));
+                    out.push(Ok(StreamEvent::Done));
                 }
             }
-            self.done = true;
         }
+
+        out
     }
 
-    fn process_part(&mut self, part: &Value) {
-        let thought_sig_str = part.get("thoughtSignature")
+    fn process_part(&mut self, part: &Value, out: &mut Vec<Result<StreamEvent, ApiError>>) {
+        let thought_sig: Option<String> = part.get("thoughtSignature")
             .and_then(|s| s.as_str())
             .map(|s| s.to_string());
 
@@ -572,100 +384,79 @@ impl GeminiSseStream {
             let is_thinking = part.get("thought").and_then(|t| t.as_bool()).unwrap_or(false);
 
             if is_thinking {
-                match &self.current_block {
-                    Some(GeminiBlock::Thinking { .. }) => {}
-                    _ => {
-                        self.finish_current_block();
-                        self.current_block = Some(GeminiBlock::Thinking { signature: None });
-                        self.pending.push_back(Ok(AssistantStreamEvent::ThinkingStart));
-                    }
+                if !matches!(&self.current_block, Some(GeminiBlock::Thinking { .. })) {
+                    self.finish_block(out);
+                    self.current_block = Some(GeminiBlock::Thinking { sig: None });
+                    out.push(Ok(StreamEvent::ThinkingStart));
                 }
-
-                if let Some(GeminiBlock::Thinking { signature }) = &mut self.current_block {
-                    if thought_sig_str.is_some() {
-                        *signature = thought_sig_str.clone();
-                    }
+                if let Some(GeminiBlock::Thinking { sig }) = &mut self.current_block {
+                    if thought_sig.is_some() { *sig = thought_sig.clone(); }
                 }
-
-                self.pending.push_back(Ok(AssistantStreamEvent::ThinkingDelta {
-                    delta: text.to_string(),
-                }));
+                out.push(Ok(StreamEvent::ThinkingDelta(text.to_string())));
             } else {
-                match &self.current_block {
-                    Some(GeminiBlock::Text { .. }) => {}
-                    _ => {
-                        self.finish_current_block();
-                        self.current_block = Some(GeminiBlock::Text { signature: None });
-                        self.pending.push_back(Ok(AssistantStreamEvent::TextStart));
-                    }
+                if !matches!(&self.current_block, Some(GeminiBlock::Text { .. })) {
+                    self.finish_block(out);
+                    self.current_block = Some(GeminiBlock::Text { sig: None });
+                    out.push(Ok(StreamEvent::TextStart));
                 }
-
-                if let Some(GeminiBlock::Text { signature }) = &mut self.current_block {
-                    if thought_sig_str.is_some() {
-                        *signature = thought_sig_str.clone();
-                    }
+                if let Some(GeminiBlock::Text { sig }) = &mut self.current_block {
+                    if thought_sig.is_some() { *sig = thought_sig.clone(); }
                 }
-
-                self.pending.push_back(Ok(AssistantStreamEvent::TextDelta {
-                    delta: text.to_string(),
-                }));
+                out.push(Ok(StreamEvent::TextDelta(text.to_string())));
             }
         }
 
         // Function call
         if let Some(fc) = part.get("functionCall") {
-            self.finish_current_block();
+            self.finish_block(out);
 
             let name = fc.get("name").and_then(|n| n.as_str()).unwrap_or("").to_string();
             let args = fc.get("args").cloned().unwrap_or(json!({}));
 
             self.tool_call_counter += 1;
-            let provided_id = fc.get("id").and_then(|i| i.as_str()).map(|s| s.to_string());
-            let tool_call_id = provided_id.unwrap_or_else(|| {
-                format!("{}_{}", name, self.tool_call_counter)
-            });
+            let tool_call_id = fc.get("id")
+                .and_then(|i| i.as_str())
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| format!("{}_{}", name, self.tool_call_counter));
 
             self.current_block = Some(GeminiBlock::ToolCall {
                 id: tool_call_id.clone(),
-                signature: thought_sig_str,
+                sig: thought_sig,
             });
 
-            self.pending.push_back(Ok(AssistantStreamEvent::ToolCallStart {
-                id: tool_call_id.clone(),
-                name,
-            }));
+            out.push(Ok(StreamEvent::ToolCallStart { id: tool_call_id.clone(), name }));
 
-            // Gemini sends the full arguments at once (not streamed)
             let args_json = serde_json::to_string(&args).unwrap_or_default();
-            self.pending.push_back(Ok(AssistantStreamEvent::ToolCallDelta {
-                id: tool_call_id,
-                delta: args_json,
-            }));
+            out.push(Ok(StreamEvent::ToolCallDelta { id: tool_call_id, json_fragment: args_json }));
 
-            // Immediately end the tool call block
-            self.finish_current_block();
+            // Gemini sends full args at once, so immediately finish
+            self.finish_block(out);
         }
     }
 
-    fn finish_current_block(&mut self) {
+    fn finish_block(&mut self, out: &mut Vec<Result<StreamEvent, ApiError>>) {
         if let Some(block) = self.current_block.take() {
             match block {
-                GeminiBlock::Text { signature } => {
-                    self.pending.push_back(Ok(AssistantStreamEvent::TextEnd { signature }));
-                }
-                GeminiBlock::Thinking { signature } => {
-                    self.pending.push_back(Ok(AssistantStreamEvent::ThinkingEnd { signature }));
-                }
-                GeminiBlock::ToolCall { id, signature } => {
-                    self.pending.push_back(Ok(AssistantStreamEvent::ToolCallEnd { id, signature }));
-                }
+                GeminiBlock::Text { sig } => out.push(Ok(StreamEvent::TextEnd { sig })),
+                GeminiBlock::Thinking { sig } => out.push(Ok(StreamEvent::ThinkingEnd { sig })),
+                GeminiBlock::ToolCall { id, sig } => out.push(Ok(StreamEvent::ToolCallEnd { id, sig })),
             }
         }
     }
 }
 
-impl Stream for GeminiSseStream {
-    type Item = Result<AssistantStreamEvent, ProviderError>;
+// -- Event stream adapter --
+
+struct GeminiStream {
+    inner: Pin<Box<dyn Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Send>>,
+    parser: SseParser,
+    state: GeminiState,
+    pending: VecDeque<Result<StreamEvent, ApiError>>,
+    done: bool,
+}
+
+impl Stream for GeminiStream {
+    type Item = Result<StreamEvent, ApiError>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
@@ -683,186 +474,41 @@ impl Stream for GeminiSseStream {
                 Poll::Pending => return Poll::Pending,
                 Poll::Ready(None) => {
                     this.done = true;
-                    // Process any remaining buffered data
-                    if !this.sse_data_buf.is_empty() {
-                        let payload = std::mem::take(&mut this.sse_data_buf);
-                        this.process_sse_payload(&payload);
+                    for sse in this.parser.flush() {
+                        this.pending.extend(this.state.interpret(&sse));
                     }
-                    this.finish_current_block();
-                    // Ensure we always emit Done on EOF
-                    this.pending.push_back(Ok(AssistantStreamEvent::Done));
-                    return Poll::Ready(Some(this.pending.pop_front().unwrap()));
+                    this.state.finish_block(&mut Vec::new()); // drain any pending block
+                    this.pending.push_back(Ok(StreamEvent::Done));
+                    if let Some(event) = this.pending.pop_front() {
+                        return Poll::Ready(Some(event));
+                    }
+                    return Poll::Ready(None);
                 }
                 Poll::Ready(Some(Err(e))) => {
                     this.done = true;
-                    return Poll::Ready(Some(Err(ProviderError::Http(e))));
+                    return Poll::Ready(Some(Err(ApiError::Http(e.to_string()))));
                 }
                 Poll::Ready(Some(Ok(chunk))) => {
                     let text = String::from_utf8_lossy(&chunk);
-                    this.buffer.push_str(&text);
-                    this.process_buffer();
+                    for sse in this.parser.feed(&text) {
+                        this.pending.extend(this.state.interpret(&sse));
+                    }
                 }
             }
         }
     }
 }
 
-// -- Provider implementation --
-
-fn build_headers(variant: GeminiVariant, token: &str) -> Result<HeaderMap, ProviderError> {
-    let mut headers = HeaderMap::new();
-
-    headers.insert(
-        "authorization",
-        HeaderValue::from_str(&format!("Bearer {}", token)).map_err(|e| {
-            ProviderError::Other(format!("Invalid auth header: {e}"))
-        })?,
-    );
-    headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-    headers.insert("accept", HeaderValue::from_static("text/event-stream"));
-
-    match variant {
-        GeminiVariant::Antigravity => {
-            let ua = format!("antigravity/{} darwin/arm64", DEFAULT_ANTIGRAVITY_VERSION);
-            headers.insert("user-agent", HeaderValue::from_str(&ua).map_err(|e| {
-                ProviderError::Other(format!("Invalid user-agent header: {e}"))
-            })?);
-        }
-        GeminiVariant::GeminiCli => {
-            headers.insert(
-                "user-agent",
-                HeaderValue::from_static("google-cloud-sdk vscode_cloudshelleditor/0.1"),
-            );
-        }
-    }
-
-    headers.insert(
-        "x-goog-api-client",
-        HeaderValue::from_static("gl-node/22.17.0"),
-    );
-
-    let client_metadata = json!({
-        "ideType": "IDE_UNSPECIFIED",
-        "platform": "PLATFORM_UNSPECIFIED",
-        "pluginType": "GEMINI"
-    });
-    headers.insert(
-        "client-metadata",
-        HeaderValue::from_str(&client_metadata.to_string()).map_err(|e| {
-            ProviderError::Other(format!("Invalid client-metadata header: {e}"))
-        })?,
-    );
-
-    Ok(headers)
-}
-
-fn endpoints_for_variant(variant: GeminiVariant) -> Vec<&'static str> {
-    match variant {
-        GeminiVariant::Antigravity => vec![ANTIGRAVITY_DAILY_ENDPOINT, GEMINI_CLI_ENDPOINT],
-        GeminiVariant::GeminiCli => vec![GEMINI_CLI_ENDPOINT],
-    }
-}
-
-fn parse_error_body(status: u16, body: &str) -> ProviderError {
-    let parsed: Value = serde_json::from_str(body).unwrap_or_default();
-    let message = parsed["error"]["message"]
-        .as_str()
-        .unwrap_or(body)
-        .to_string();
-
-    if status == 429 || body.contains("RESOURCE_EXHAUSTED") || body.contains("rate") {
-        // Try to extract retry delay
-        ProviderError::RateLimited { retry_after_ms: 5000 }
-    } else if message.contains("token") && (message.contains("exceed") || message.contains("limit")) {
-        ProviderError::ContextOverflow { used: 0, limit: 0 }
-    } else {
-        ProviderError::Api { status, message }
-    }
-}
-
-#[async_trait]
-impl LlmProvider for GeminiProvider {
-    fn name(&self) -> &str {
-        match self.variant {
-            GeminiVariant::GeminiCli => "google-gemini-cli",
-            GeminiVariant::Antigravity => "google-antigravity",
-        }
-    }
-
-    async fn stream(
-        &self,
-        model: &Model,
-        messages: &[Message],
-        options: &CompletionOptions,
-        api_key: &str,
-    ) -> Result<StreamOutput, ProviderError> {
-        let credentials = parse_credentials(api_key)?;
-        let body = build_request_body(model, messages, options, &credentials, self.variant);
-        let headers = build_headers(self.variant, &credentials.token)?;
-        let endpoints = endpoints_for_variant(self.variant);
-
-        tracing::debug!(
-            variant = ?self.variant,
-            model = %model.id,
-            body = %body,
-            "Gemini API request"
-        );
-
-        // Try endpoints with retry
-        let mut last_error = None;
-        for (attempt, endpoint) in endpoints.iter().enumerate() {
-            let url = format!("{}/v1internal:streamGenerateContent?alt=sse", endpoint);
-
-            let response = self
-                .client
-                .post(&url)
-                .headers(headers.clone())
-                .body(body.to_string())
-                .send()
-                .await;
-
-            match response {
-                Ok(resp) => {
-                    let status = resp.status().as_u16();
-                    if status >= 400 {
-                        let body_text = resp.text().await.unwrap_or_default();
-                        let err = parse_error_body(status, &body_text);
-
-                        // Retry on 5xx or rate limit if we have more endpoints
-                        if attempt < endpoints.len() - 1
-                            && (status >= 500 || matches!(err, ProviderError::RateLimited { .. }))
-                        {
-                            last_error = Some(err);
-                            continue;
-                        }
-                        return Err(err);
-                    }
-
-                    let byte_stream = resp.bytes_stream();
-                    let sse = GeminiSseStream::new(Box::pin(byte_stream));
-                    return Ok(Box::pin(sse));
-                }
-                Err(e) => {
-                    if attempt < endpoints.len() - 1 {
-                        last_error = Some(ProviderError::Http(e));
-                        continue;
-                    }
-                    return Err(ProviderError::Http(e));
-                }
-            }
-        }
-
-        Err(last_error.unwrap_or_else(|| ProviderError::Other("No endpoints available".to_string())))
-    }
-}
-
-// -- Signature validation --
-
-fn is_valid_signature(sig: &str) -> bool {
-    if sig.is_empty() || sig.len() % 4 != 0 {
-        return false;
-    }
-    sig.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'+' || b == b'/' || b == b'=')
+pub fn event_stream(
+    bytes: Pin<Box<dyn Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Send>>,
+) -> EventStream {
+    Box::pin(GeminiStream {
+        inner: bytes,
+        parser: SseParser::new(),
+        state: GeminiState::new(),
+        pending: VecDeque::new(),
+        done: false,
+    })
 }
 
 // -- System instructions --
