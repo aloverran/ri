@@ -7,6 +7,7 @@ use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::task::{Context, Poll};
+use async_trait::async_trait;
 use futures::Stream;
 use serde_json::{json, Value};
 use tokio::sync::Mutex;
@@ -134,6 +135,7 @@ impl AnthropicProvider {
     }
 }
 
+#[async_trait]
 impl LlmProvider for AnthropicProvider {
     fn id(&self) -> &str { "anthropic" }
     fn name(&self) -> &str { "Anthropic" }
@@ -182,83 +184,73 @@ impl LlmProvider for AnthropicProvider {
         Ok(Some(AuthMethod::PasteCode { url: url.to_string() }))
     }
 
-    fn complete_login<'a>(
-        &'a self,
-        code: &'a str,
-    ) -> Pin<Box<dyn std::future::Future<Output = eyre::Result<()>> + Send + 'a>> {
-        Box::pin(async move {
-            let (verifier, login_state) = {
-                let mut state = self.state.lock().await;
-                let v = state.login_verifier.take()
-                    .ok_or_else(|| eyre::eyre!("No login in progress"))?;
-                let s = state.login_state.take()
-                    .ok_or_else(|| eyre::eyre!("No login state"))?;
-                (v, s)
-            };
-
-            let (actual_code, returned_state) = match code.split_once('#') {
-                Some((c, s)) => (c, Some(s)),
-                None => (code, None),
-            };
-
-            if let Some(rs) = returned_state {
-                if rs != login_state {
-                    return Err(eyre::eyre!("OAuth state mismatch"));
-                }
-            }
-
-            let client = reqwest::Client::new();
-            let response = client
-                .post(TOKEN_URL)
-                .json(&json!({
-                    "grant_type": "authorization_code",
-                    "client_id": CLIENT_ID,
-                    "code": actual_code,
-                    "state": returned_state.unwrap_or(&login_state),
-                    "redirect_uri": REDIRECT_URI,
-                    "code_verifier": verifier,
-                }))
-                .send()
-                .await?;
-
-            let status = response.status();
-            if !status.is_success() {
-                let body = response.text().await.unwrap_or_default();
-                return Err(eyre::eyre!("Token exchange failed ({}): {}", status, body));
-            }
-
-            let body: Value = response.json().await?;
-            let creds = parse_token_response(&body)?;
-            let key = creds.access.clone();
-            save_creds(&creds)?;
-
+    async fn complete_login(&self, code: &str) -> eyre::Result<()> {
+        let (verifier, login_state) = {
             let mut state = self.state.lock().await;
-            state.api_key = key;
-            state.is_oauth = true;
+            let v = state.login_verifier.take()
+                .ok_or_else(|| eyre::eyre!("No login in progress"))?;
+            let s = state.login_state.take()
+                .ok_or_else(|| eyre::eyre!("No login state"))?;
+            (v, s)
+        };
 
-            Ok(())
-        })
+        let (actual_code, returned_state) = match code.split_once('#') {
+            Some((c, s)) => (c, Some(s)),
+            None => (code, None),
+        };
+
+        if let Some(rs) = returned_state {
+            if rs != login_state {
+                return Err(eyre::eyre!("OAuth state mismatch"));
+            }
+        }
+
+        let client = reqwest::Client::new();
+        let response = client
+            .post(TOKEN_URL)
+            .json(&json!({
+                "grant_type": "authorization_code",
+                "client_id": CLIENT_ID,
+                "code": actual_code,
+                "state": returned_state.unwrap_or(&login_state),
+                "redirect_uri": REDIRECT_URI,
+                "code_verifier": verifier,
+            }))
+            .send()
+            .await?;
+
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(eyre::eyre!("Token exchange failed ({}): {}", status, body));
+        }
+
+        let body: Value = response.json().await?;
+        let creds = parse_token_response(&body)?;
+        let key = creds.access.clone();
+        save_creds(&creds)?;
+
+        let mut state = self.state.lock().await;
+        state.api_key = key;
+        state.is_oauth = true;
+
+        Ok(())
     }
 
-    fn stream(
-        &self,
-        opts: RequestOptions,
-    ) -> Pin<Box<dyn std::future::Future<Output = Result<EventStream, ApiError>> + Send + '_>> {
-        Box::pin(async move {
-            let (api_key, is_oauth) = self.ensure_valid_token().await
-                .map_err(|e| ApiError::Other(e.to_string()))?;
+    async fn stream(&self, opts: RequestOptions) -> Result<EventStream, ApiError> {
+        let (api_key, is_oauth) = self.ensure_valid_token().await
+            .map_err(|e| ApiError::Other(e.to_string()))?;
 
-            let request = build_request(&api_key, &opts);
+        let request = build_request(&api_key, &opts);
 
-            tracing::debug!(
-                url = %request.url,
-                body = %request.body,
-                "Anthropic API request"
-            );
+        tracing::debug!(
+            url = %request.url,
+            body = %request.body,
+            "Anthropic API request"
+        );
 
-            let bytes = http::send(&request).await?;
-            Ok(event_stream(bytes, &opts.tools, is_oauth))
-        })
+        let bytes = http::send(&request).await?;
+        Ok(event_stream(bytes, &opts.tools, is_oauth))
     }
 }
 

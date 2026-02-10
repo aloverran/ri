@@ -16,3 +16,4 @@ chrono.workspace = true
 uuid.workspace = true
 dirs.workspace = true
 tracing.workspace = true
+async-trait.workspace = true

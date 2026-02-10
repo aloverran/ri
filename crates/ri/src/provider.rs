@@ -4,7 +4,7 @@
 // can call providers without depending on ri-ai.
 
 use std::pin::Pin;
-use std::future::Future;
+use async_trait::async_trait;
 use futures::Stream;
 
 use crate::event::StreamEvent;
@@ -61,6 +61,7 @@ pub struct ProviderInfo {
 }
 
 // The trait that LLM providers implement.
+#[async_trait]
 pub trait LlmProvider: Send + Sync {
     // Identity.
     fn id(&self) -> &str;
@@ -77,14 +78,8 @@ pub trait LlmProvider: Send + Sync {
     fn begin_login(&self) -> eyre::Result<Option<AuthMethod>>;
 
     // Complete a login flow. The response is the code/key from the user.
-    fn complete_login<'a>(
-        &'a self,
-        response: &'a str,
-    ) -> Pin<Box<dyn Future<Output = eyre::Result<()>> + Send + 'a>>;
+    async fn complete_login(&self, response: &str) -> eyre::Result<()>;
 
     // Stream a response from the LLM.
-    fn stream(
-        &self,
-        opts: RequestOptions,
-    ) -> Pin<Box<dyn Future<Output = Result<EventStream, ApiError>> + Send + '_>>;
+    async fn stream(&self, opts: RequestOptions) -> Result<EventStream, ApiError>;
 }

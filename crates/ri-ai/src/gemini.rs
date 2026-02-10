@@ -8,6 +8,7 @@ use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::task::{Context, Poll};
+use async_trait::async_trait;
 use futures::Stream;
 use serde_json::{json, Value};
 use tokio::sync::Mutex;
@@ -211,6 +212,7 @@ impl GeminiProvider {
     }
 }
 
+#[async_trait]
 impl LlmProvider for GeminiProvider {
     fn id(&self) -> &str {
         match self.variant {
@@ -288,96 +290,86 @@ impl LlmProvider for GeminiProvider {
         }))
     }
 
-    fn complete_login<'a>(
-        &'a self,
-        code: &'a str,
-    ) -> Pin<Box<dyn std::future::Future<Output = eyre::Result<()>> + Send + 'a>> {
-        Box::pin(async move {
-            let (verifier, login_state) = {
-                let mut state = self.state.lock().await;
-                let v = state.login_verifier.take()
-                    .ok_or_else(|| eyre::eyre!("No login in progress"))?;
-                let s = state.login_state.take()
-                    .ok_or_else(|| eyre::eyre!("No login state"))?;
-                (v, s)
-            };
-
-            // Parse code and state from the callback URL params.
-            // The CLI passes "code#state" format, or just the code.
-            let (actual_code, returned_state) = match code.split_once('#') {
-                Some((c, s)) => (c.to_string(), s.to_string()),
-                None => (code.to_string(), login_state.clone()),
-            };
-
-            if returned_state != login_state {
-                return Err(eyre::eyre!("OAuth state mismatch"));
-            }
-
-            let cfg = config_for(self.variant);
-            let client = reqwest::Client::new();
-            let token_response = client
-                .post(TOKEN_URL)
-                .form(&[
-                    ("client_id", cfg.client_id.as_str()),
-                    ("client_secret", cfg.client_secret.as_str()),
-                    ("code", actual_code.as_str()),
-                    ("grant_type", "authorization_code"),
-                    ("redirect_uri", cfg.redirect_uri),
-                    ("code_verifier", verifier.as_str()),
-                ])
-                .send()
-                .await?;
-
-            let status = token_response.status();
-            if !status.is_success() {
-                let body = token_response.text().await.unwrap_or_default();
-                return Err(eyre::eyre!("Token exchange failed ({}): {}", status, body));
-            }
-
-            let data: Value = token_response.json().await?;
-            let access = data["access_token"].as_str()
-                .ok_or_else(|| eyre::eyre!("Missing access_token"))?.to_string();
-            let refresh = data["refresh_token"].as_str()
-                .ok_or_else(|| eyre::eyre!("No refresh token"))?.to_string();
-            let expires_in = data["expires_in"].as_u64().unwrap_or(3600);
-            let expires = crate::epoch_ms() + (expires_in * 1000).saturating_sub(300_000);
-
-            let email = get_user_email(&client, &access).await;
-            let project_id = discover_project(&client, &access, self.variant).await?;
-
-            let creds = Credentials {
-                refresh, access: access.clone(), expires,
-                project_id: Some(project_id.clone()), email,
-            };
-            save_creds(self.variant, &creds)?;
-
+    async fn complete_login(&self, code: &str) -> eyre::Result<()> {
+        let (verifier, login_state) = {
             let mut state = self.state.lock().await;
-            state.token = access;
-            state.project_id = project_id;
+            let v = state.login_verifier.take()
+                .ok_or_else(|| eyre::eyre!("No login in progress"))?;
+            let s = state.login_state.take()
+                .ok_or_else(|| eyre::eyre!("No login state"))?;
+            (v, s)
+        };
 
-            Ok(())
-        })
+        // Parse code and state from the callback URL params.
+        // The CLI passes "code#state" format, or just the code.
+        let (actual_code, returned_state) = match code.split_once('#') {
+            Some((c, s)) => (c.to_string(), s.to_string()),
+            None => (code.to_string(), login_state.clone()),
+        };
+
+        if returned_state != login_state {
+            return Err(eyre::eyre!("OAuth state mismatch"));
+        }
+
+        let cfg = config_for(self.variant);
+        let client = reqwest::Client::new();
+        let token_response = client
+            .post(TOKEN_URL)
+            .form(&[
+                ("client_id", cfg.client_id.as_str()),
+                ("client_secret", cfg.client_secret.as_str()),
+                ("code", actual_code.as_str()),
+                ("grant_type", "authorization_code"),
+                ("redirect_uri", cfg.redirect_uri),
+                ("code_verifier", verifier.as_str()),
+            ])
+            .send()
+            .await?;
+
+        let status = token_response.status();
+        if !status.is_success() {
+            let body = token_response.text().await.unwrap_or_default();
+            return Err(eyre::eyre!("Token exchange failed ({}): {}", status, body));
+        }
+
+        let data: Value = token_response.json().await?;
+        let access = data["access_token"].as_str()
+            .ok_or_else(|| eyre::eyre!("Missing access_token"))?.to_string();
+        let refresh = data["refresh_token"].as_str()
+            .ok_or_else(|| eyre::eyre!("No refresh token"))?.to_string();
+        let expires_in = data["expires_in"].as_u64().unwrap_or(3600);
+        let expires = crate::epoch_ms() + (expires_in * 1000).saturating_sub(300_000);
+
+        let email = get_user_email(&client, &access).await;
+        let project_id = discover_project(&client, &access, self.variant).await?;
+
+        let creds = Credentials {
+            refresh, access: access.clone(), expires,
+            project_id: Some(project_id.clone()), email,
+        };
+        save_creds(self.variant, &creds)?;
+
+        let mut state = self.state.lock().await;
+        state.token = access;
+        state.project_id = project_id;
+
+        Ok(())
     }
 
-    fn stream(
-        &self,
-        opts: RequestOptions,
-    ) -> Pin<Box<dyn std::future::Future<Output = Result<EventStream, ApiError>> + Send + '_>> {
-        Box::pin(async move {
-            let (token, project_id) = self.ensure_valid_token().await
-                .map_err(|e| ApiError::Other(e.to_string()))?;
+    async fn stream(&self, opts: RequestOptions) -> Result<EventStream, ApiError> {
+        let (token, project_id) = self.ensure_valid_token().await
+            .map_err(|e| ApiError::Other(e.to_string()))?;
 
-            let request = build_request(self.variant, &token, &project_id, &opts);
+        let request = build_request(self.variant, &token, &project_id, &opts);
 
-            tracing::debug!(
-                url = %request.url,
-                body = %request.body,
-                "Gemini API request"
-            );
+        tracing::debug!(
+            url = %request.url,
+            body = %request.body,
+            "Gemini API request"
+        );
 
-            let bytes = http::send(&request).await?;
-            Ok(event_stream(bytes))
-        })
+        let bytes = http::send(&request).await?;
+        Ok(event_stream(bytes))
     }
 }
 
