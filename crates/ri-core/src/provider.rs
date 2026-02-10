@@ -11,11 +11,11 @@ use crate::types::{Model, ThinkingLevel};
 use ri_store::types::Message;
 
 // Request-level options (provider-agnostic).
-pub struct RequestOptions<'a> {
-    pub model: &'a Model,
-    pub system_prompt: &'a str,
-    pub messages: &'a [Message],
-    pub tools: &'a [ToolSchema],
+pub struct RequestOptions {
+    pub model: Model,
+    pub system_prompt: String,
+    pub messages: Vec<Message>,
+    pub tools: Vec<ToolSchema>,
     pub thinking: ThinkingLevel,
     pub max_tokens: Option<usize>,
 }
@@ -47,8 +47,8 @@ use std::future::Future;
 
 // The trait that LLM providers implement.
 pub trait LlmProvider: Send + Sync {
-    fn stream<'a>(
-        &'a self,
-        opts: &'a RequestOptions<'a>,
-    ) -> Pin<Box<dyn Future<Output = Result<EventStream, ApiError>> + Send + 'a>>;
+    fn stream(
+        &self,
+        opts: RequestOptions,
+    ) -> Pin<Box<dyn Future<Output = Result<EventStream, ApiError>> + Send + '_>>;
 }

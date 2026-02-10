@@ -61,7 +61,7 @@ pub fn build_request(
 }
 
 fn build_body(variant: GeminiVariant, project_id: &str, opts: &RequestOptions) -> Value {
-    let contents = build_contents(opts.messages, &opts.model.id);
+    let contents = build_contents(&opts.messages, &opts.model.id);
 
     let max_tokens = opts.max_tokens
         .unwrap_or_else(|| (opts.model.max_tokens / 3).max(4096));

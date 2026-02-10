@@ -71,6 +71,16 @@ pub async fn run(
     let mut session_ids = vec![sys_id];
     let mut cb = RpcCallback;
 
+    let config = RunConfig {
+        model,
+        system_prompt,
+        tools,
+        thinking,
+        max_tokens: None,
+        cwd,
+        strategy: agent::naive_strategy,
+    };
+
     if let Some(prompt) = initial_prompt {
         let user_id = filing.next_id();
         let user_msg = Message::new(user_id.clone(), Role::User, vec![ContentBlock::text(&prompt)]);
@@ -81,18 +91,7 @@ pub async fn run(
         session_ids.push(user_id);
 
         let cancel = tokio_util::sync::CancellationToken::new();
-        let config = RunConfig {
-            provider: provider.as_ref(),
-            model: &model,
-            system_prompt: &system_prompt,
-            tools: &tools,
-            thinking,
-            max_tokens: None,
-            cwd: &cwd,
-            strategy: agent::naive_strategy,
-        };
-
-        let _ = agent::run(&config, &mut filing, &mut session_ids, &mut cb, cancel).await;
+        let _ = agent::run(provider.as_ref(), &config, &mut filing, &mut session_ids, &mut cb, cancel).await;
     }
 
     let stdin = tokio::io::stdin();
@@ -128,18 +127,7 @@ pub async fn run(
                 session_ids.push(user_id);
 
                 let cancel = tokio_util::sync::CancellationToken::new();
-                let config = RunConfig {
-                    provider: provider.as_ref(),
-                    model: &model,
-                    system_prompt: &system_prompt,
-                    tools: &tools,
-                    thinking,
-                    max_tokens: None,
-                    cwd: &cwd,
-                    strategy: agent::naive_strategy,
-                };
-
-                let _ = agent::run(&config, &mut filing, &mut session_ids, &mut cb, cancel).await;
+                let _ = agent::run(provider.as_ref(), &config, &mut filing, &mut session_ids, &mut cb, cancel).await;
 
                 output_json(&json!({"type": "response", "command": "prompt", "success": true}));
             }
