@@ -3,12 +3,10 @@
 // Handles: model catalog, credential management, request building,
 // SSE interpretation, and login flow.
 
-use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::pin::Pin;
-use std::task::{Context, Poll};
 use async_trait::async_trait;
-use futures::Stream;
+use futures::{Stream, StreamExt};
 use serde_json::{json, Value};
 use tokio::sync::Mutex;
 use tracing::warn;
@@ -625,77 +623,21 @@ impl StreamState {
     }
 }
 
-// -- Event stream adapter --
+// -- Event stream --
 
-struct AnthropicStream {
-    inner: Pin<Box<dyn Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Send>>,
-    parser: SseParser,
-    state: StreamState,
-    pending: VecDeque<Result<StreamEvent, ApiError>>,
-    done: bool,
-    original_tools: Vec<ToolSchema>,
+fn remap_tool_event(
+    event: Result<StreamEvent, ApiError>,
     is_oauth: bool,
-}
-
-impl Stream for AnthropicStream {
-    type Item = Result<StreamEvent, ApiError>;
-
-    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let this = self.get_mut();
-
-        loop {
-            if let Some(event) = this.pending.pop_front() {
-                return Poll::Ready(Some(event));
-            }
-
-            if this.done {
-                return Poll::Ready(None);
-            }
-
-            match Pin::new(&mut this.inner).poll_next(cx) {
-                Poll::Pending => return Poll::Pending,
-                Poll::Ready(None) => {
-                    this.done = true;
-                    for sse in this.parser.flush() {
-                        let events = this.state.interpret(&sse);
-                        this.pending.extend(this.remap_tools(events));
-                    }
-                    if let Some(event) = this.pending.pop_front() {
-                        return Poll::Ready(Some(event));
-                    }
-                    return Poll::Ready(None);
-                }
-                Poll::Ready(Some(Err(e))) => {
-                    this.done = true;
-                    return Poll::Ready(Some(Err(ApiError::Http(e.to_string()))));
-                }
-                Poll::Ready(Some(Ok(chunk))) => {
-                    let text = String::from_utf8_lossy(&chunk);
-                    for sse in this.parser.feed(&text) {
-                        let events = this.state.interpret(&sse);
-                        this.pending.extend(this.remap_tools(events));
-                    }
-                }
-            }
+    original_tools: &[ToolSchema],
+) -> Result<StreamEvent, ApiError> {
+    if !is_oauth { return event; }
+    event.map(|evt| match evt {
+        StreamEvent::ToolCallStart { id, name } => {
+            let original = from_claude_code_name(&name, original_tools);
+            StreamEvent::ToolCallStart { id, name: original }
         }
-    }
-}
-
-impl AnthropicStream {
-    fn remap_tools(&self, events: Vec<Result<StreamEvent, ApiError>>) -> Vec<Result<StreamEvent, ApiError>> {
-        if !self.is_oauth {
-            return events;
-        }
-        events.into_iter().map(|e| {
-            e.map(|evt| match evt {
-                StreamEvent::ToolCallStart { id, name } => {
-                    let original = from_claude_code_name(&name, &self.original_tools);
-                    StreamEvent::ToolCallStart { id, name: original }
-                }
-                other => other,
-            })
-        }).collect()
-    }
+        other => other,
+    })
 }
 
 fn event_stream(
@@ -703,13 +645,33 @@ fn event_stream(
     tools: &[ToolSchema],
     is_oauth: bool,
 ) -> EventStream {
-    Box::pin(AnthropicStream {
-        inner: bytes,
-        parser: SseParser::new(),
-        state: StreamState::new(),
-        pending: VecDeque::new(),
-        done: false,
-        original_tools: tools.to_vec(),
-        is_oauth,
+    let original_tools = tools.to_vec();
+    Box::pin(async_stream::stream! {
+        let mut parser = SseParser::new();
+        let mut state = StreamState::new();
+        tokio::pin!(bytes);
+
+        while let Some(chunk) = bytes.next().await {
+            match chunk {
+                Ok(data) => {
+                    let text = String::from_utf8_lossy(&data);
+                    for sse in parser.feed(&text) {
+                        for event in state.interpret(&sse) {
+                            yield remap_tool_event(event, is_oauth, &original_tools);
+                        }
+                    }
+                }
+                Err(e) => {
+                    yield Err(ApiError::Http(e.to_string()));
+                    return;
+                }
+            }
+        }
+
+        for sse in parser.flush() {
+            for event in state.interpret(&sse) {
+                yield remap_tool_event(event, is_oauth, &original_tools);
+            }
+        }
     })
 }

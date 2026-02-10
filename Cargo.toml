@@ -36,6 +36,7 @@ tokio-stream = "0.1"
 bytes = "1"
 tokio-util = { version = "0.7", features = ["rt"] }
 async-trait = "0.1"
+async-stream = "0.3"
 ri = { path = "crates/ri" }
 ri-ai = { path = "crates/ri-ai" }
 ri-tools = { path = "crates/ri-tools" }

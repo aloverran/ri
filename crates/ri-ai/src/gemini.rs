@@ -4,12 +4,10 @@
 //   Cli:          standard Gemini models via cloudcode-pa.googleapis.com
 //   Antigravity:  Gemini 3 via daily-cloudcode-pa.sandbox.googleapis.com
 
-use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::pin::Pin;
-use std::task::{Context, Poll};
 use async_trait::async_trait;
-use futures::Stream;
+use futures::{Stream, StreamExt};
 use serde_json::{json, Value};
 use tokio::sync::Mutex;
 
@@ -889,69 +887,39 @@ impl GeminiState {
     }
 }
 
-// -- Event stream adapter --
-
-struct GeminiStream {
-    inner: Pin<Box<dyn Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Send>>,
-    parser: SseParser,
-    state: GeminiState,
-    pending: VecDeque<Result<StreamEvent, ApiError>>,
-    done: bool,
-}
-
-impl Stream for GeminiStream {
-    type Item = Result<StreamEvent, ApiError>;
-
-    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let this = self.get_mut();
-
-        loop {
-            if let Some(event) = this.pending.pop_front() {
-                return Poll::Ready(Some(event));
-            }
-
-            if this.done {
-                return Poll::Ready(None);
-            }
-
-            match Pin::new(&mut this.inner).poll_next(cx) {
-                Poll::Pending => return Poll::Pending,
-                Poll::Ready(None) => {
-                    this.done = true;
-                    for sse in this.parser.flush() {
-                        this.pending.extend(this.state.interpret(&sse));
-                    }
-                    this.state.finish_block(&mut Vec::new());
-                    this.pending.push_back(Ok(StreamEvent::Done));
-                    if let Some(event) = this.pending.pop_front() {
-                        return Poll::Ready(Some(event));
-                    }
-                    return Poll::Ready(None);
-                }
-                Poll::Ready(Some(Err(e))) => {
-                    this.done = true;
-                    return Poll::Ready(Some(Err(ApiError::Http(e.to_string()))));
-                }
-                Poll::Ready(Some(Ok(chunk))) => {
-                    let text = String::from_utf8_lossy(&chunk);
-                    for sse in this.parser.feed(&text) {
-                        this.pending.extend(this.state.interpret(&sse));
-                    }
-                }
-            }
-        }
-    }
-}
+// -- Event stream --
 
 fn event_stream(
     bytes: Pin<Box<dyn Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Send>>,
 ) -> EventStream {
-    Box::pin(GeminiStream {
-        inner: bytes,
-        parser: SseParser::new(),
-        state: GeminiState::new(),
-        pending: VecDeque::new(),
-        done: false,
+    Box::pin(async_stream::stream! {
+        let mut parser = SseParser::new();
+        let mut state = GeminiState::new();
+        tokio::pin!(bytes);
+
+        while let Some(chunk) = bytes.next().await {
+            match chunk {
+                Ok(data) => {
+                    let text = String::from_utf8_lossy(&data);
+                    for sse in parser.feed(&text) {
+                        for event in state.interpret(&sse) {
+                            yield event;
+                        }
+                    }
+                }
+                Err(e) => {
+                    yield Err(ApiError::Http(e.to_string()));
+                    return;
+                }
+            }
+        }
+
+        for sse in parser.flush() {
+            for event in state.interpret(&sse) {
+                yield event;
+            }
+        }
+        yield Ok(StreamEvent::Done);
     })
 }
 

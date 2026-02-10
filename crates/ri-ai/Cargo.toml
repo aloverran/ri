@@ -24,3 +24,4 @@ chrono.workspace = true
 uuid.workspace = true
 dirs.workspace = true
 async-trait.workspace = true
+async-stream.workspace = true
