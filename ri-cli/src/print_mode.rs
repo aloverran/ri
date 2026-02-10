@@ -2,35 +2,17 @@ use ri_core::agent::{AgentCallback, AgentEvent};
 use ri_core::event::StreamEvent;
 use std::io::Write;
 
-pub struct TextCallback { counter: u64 }
-
-impl TextCallback {
-    pub fn new() -> Self { TextCallback { counter: 0 } }
-}
+pub struct TextCallback;
 
 impl AgentCallback for TextCallback {
-    fn next_id(&mut self) -> String {
-        self.counter += 1;
-        format!("print_{}", self.counter)
-    }
-
     fn on_event(&mut self, evt: AgentEvent) {
         on_event_text(&evt);
     }
 }
 
-pub struct JsonCallback { counter: u64 }
-
-impl JsonCallback {
-    pub fn new() -> Self { JsonCallback { counter: 0 } }
-}
+pub struct JsonCallback;
 
 impl AgentCallback for JsonCallback {
-    fn next_id(&mut self) -> String {
-        self.counter += 1;
-        format!("print_{}", self.counter)
-    }
-
     fn on_event(&mut self, evt: AgentEvent) {
         on_event_json(&evt);
     }

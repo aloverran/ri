@@ -3,27 +3,16 @@ use ri_core::event::StreamEvent;
 use ri_core::provider::LlmProvider;
 use ri_core::tool::ToolDef;
 use ri_core::types::*;
-use ri_store::types::Message;
+use ri_store::types::{ContentBlock, Message, Role};
 use ri_store::filing::SessionFiling;
 use std::io::Write;
 use std::path::PathBuf;
 use tokio::io::AsyncBufReadExt;
 
-struct InteractiveCallback<'a> {
-    filing: &'a mut SessionFiling,
-}
+struct InteractiveCallback;
 
-impl AgentCallback for InteractiveCallback<'_> {
-    fn next_id(&mut self) -> String {
-        self.filing.next_id()
-    }
-
+impl AgentCallback for InteractiveCallback {
     fn on_event(&mut self, evt: AgentEvent) {
-        if let AgentEvent::MessageComplete(ref msg) = evt {
-            if let Err(e) = self.filing.write_message(msg.clone()) {
-                tracing::error!("Failed to persist message {}: {}", msg.id, e);
-            }
-        }
         display_event(&evt);
     }
 }
@@ -35,6 +24,7 @@ pub async fn run(
     tools: Vec<ToolDef>,
     cwd: PathBuf,
     initial_prompt: Option<String>,
+    thinking: ThinkingLevel,
 ) -> eyre::Result<()> {
     let sessions_dir = SessionFiling::default_dir()?;
     let mut filing = SessionFiling::new(sessions_dir);
@@ -44,19 +34,18 @@ pub async fn run(
     filing.new_session(&session_name, &cwd.display().to_string())?;
 
     let sys_id = filing.next_id();
-    let sys_msg = Message::new(sys_id, Role::System, vec![ContentBlock::text(&system_prompt)]);
-    filing.write_message(sys_msg.clone())?;
-
-    let mut messages: Vec<Message> = vec![sys_msg];
+    let sys_msg = Message::new(sys_id.clone(), Role::System, vec![ContentBlock::text(&system_prompt)]);
+    filing.write_message(sys_msg)?;
+    let mut session_ids = vec![sys_id];
 
     if let Some(prompt) = initial_prompt {
         print_user_prefix();
         println!("{}", prompt);
 
         let user_id = filing.next_id();
-        let user_msg = Message::new(user_id, Role::User, vec![ContentBlock::text(&prompt)]);
-        filing.write_message(user_msg.clone())?;
-        messages.push(user_msg);
+        let user_msg = Message::new(user_id.clone(), Role::User, vec![ContentBlock::text(&prompt)]);
+        filing.write_message(user_msg)?;
+        session_ids.push(user_id);
 
         let cancel = tokio_util::sync::CancellationToken::new();
         let config = RunConfig {
@@ -64,12 +53,13 @@ pub async fn run(
             model: &model,
             system_prompt: &system_prompt,
             tools: &tools,
-            thinking: ThinkingLevel::Medium,
+            thinking,
             max_tokens: None,
             cwd: &cwd,
+            strategy: agent::naive_strategy,
         };
-        let mut cb = InteractiveCallback { filing: &mut filing };
-        agent::run(&config, &mut messages, &mut cb, cancel).await?;
+        let mut cb = InteractiveCallback;
+        agent::run(&config, &mut filing, &mut session_ids, &mut cb, cancel).await?;
     }
 
     let stdin = tokio::io::stdin();
@@ -166,9 +156,9 @@ pub async fn run(
         }
 
         let user_id = filing.next_id();
-        let user_msg = Message::new(user_id, Role::User, vec![ContentBlock::text(trimmed)]);
-        filing.write_message(user_msg.clone())?;
-        messages.push(user_msg);
+        let user_msg = Message::new(user_id.clone(), Role::User, vec![ContentBlock::text(trimmed)]);
+        filing.write_message(user_msg)?;
+        session_ids.push(user_id);
 
         let cancel = tokio_util::sync::CancellationToken::new();
         let config = RunConfig {
@@ -176,13 +166,14 @@ pub async fn run(
             model: &model,
             system_prompt: &system_prompt,
             tools: &tools,
-            thinking: ThinkingLevel::Medium,
+            thinking,
             max_tokens: None,
             cwd: &cwd,
+            strategy: agent::naive_strategy,
         };
 
-        let mut cb = InteractiveCallback { filing: &mut filing };
-        if let Err(e) = agent::run(&config, &mut messages, &mut cb, cancel).await {
+        let mut cb = InteractiveCallback;
+        if let Err(e) = agent::run(&config, &mut filing, &mut session_ids, &mut cb, cancel).await {
             eprintln!("\x1b[31m[error: {}]\x1b[0m", e);
         }
     }

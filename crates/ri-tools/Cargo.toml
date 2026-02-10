@@ -10,3 +10,6 @@ ri-core.workspace = true
 tokio.workspace = true
 serde_json.workspace = true
 tokio-util.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

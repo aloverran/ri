@@ -1,13 +1,16 @@
-// Agent loop -- a function, not a struct.
+// Agent loop -- pool-aware.
 //
-// The caller owns the message history. The loop runs one prompt
-// to completion (possibly multiple tool-call rounds), emitting events
-// via callback, and returns when done.
+// The loop operates on the Pool (via SessionFiling) rather than a bare Vec.
+// A ContextStrategy selects which messages from the pool to send each turn.
+// New messages (assistant responses, tool results) are written through filing
+// (which puts them in the pool AND appends to the active session file).
 
 use std::collections::HashMap;
 use std::path::Path;
 use futures::StreamExt;
 
+use ri_store::pool::Pool;
+use ri_store::filing::SessionFiling;
 use ri_store::types::{ContentBlock, Message, Provenance, Role};
 use crate::types::*;
 use crate::event::{StreamEvent, ToolSchema};
@@ -23,8 +26,17 @@ pub enum AgentEvent {
     ToolStart { id: String, name: String },
     ToolEnd { id: String, output: String, is_error: bool },
     Error(String),
-    // Emitted after each message is fully constructed (with ID and provenance).
+    // Emitted after each message is fully constructed and persisted.
     MessageComplete(Message),
+}
+
+// Strategy: given the pool and current session message IDs,
+// return the ordered list of message IDs for the next LLM call.
+pub type ContextStrategy = fn(&Pool, &[String]) -> Vec<String>;
+
+// Naive strategy: return all session message IDs in order.
+pub fn naive_strategy(_pool: &Pool, session_ids: &[String]) -> Vec<String> {
+    session_ids.to_vec()
 }
 
 // Everything the agent loop needs for one run.
@@ -36,27 +48,20 @@ pub struct RunConfig<'a> {
     pub thinking: ThinkingLevel,
     pub max_tokens: Option<usize>,
     pub cwd: &'a Path,
+    pub strategy: ContextStrategy,
 }
 
-// Callback trait for the agent loop. Combines ID generation and event handling
-// into one object so the caller can use a single mutable borrow.
+// Callback trait for event observation (display, logging, RPC output).
 pub trait AgentCallback {
-    fn next_id(&mut self) -> String;
     fn on_event(&mut self, event: AgentEvent);
 }
 
-// Extracted tool call.
-#[derive(Debug, Clone)]
-pub struct ToolCall {
-    pub id: String,
-    pub name: String,
-    pub input: serde_json::Value,
-}
-
-// Run the agent loop: stream LLM response, execute tool calls, repeat.
+// Run the agent loop: compose context from pool, stream LLM response,
+// execute tool calls, persist everything, repeat.
 pub async fn run(
     config: &RunConfig<'_>,
-    messages: &mut Vec<Message>,
+    filing: &mut SessionFiling,
+    session_ids: &mut Vec<String>,
     cb: &mut dyn AgentCallback,
     cancel: tokio_util::sync::CancellationToken,
 ) -> eyre::Result<()> {
@@ -70,16 +75,19 @@ pub async fn run(
 
         cb.on_event(AgentEvent::TurnStart);
 
-        // Snapshot input message IDs for provenance.
-        let input_ids: Vec<String> = messages.iter()
-            .filter(|m| !m.id.is_empty())
-            .map(|m| m.id.clone())
+        // Strategy selects message IDs for this LLM call.
+        let input_ids = (config.strategy)(&filing.pool, session_ids);
+
+        // Resolve messages from the pool.
+        let messages: Vec<Message> = filing.pool.resolve_existing(&input_ids)
+            .into_iter()
+            .cloned()
             .collect();
 
         let opts = RequestOptions {
             model: config.model,
             system_prompt: config.system_prompt,
-            messages: messages,
+            messages: &messages,
             tools: &tool_schemas,
             thinking: config.thinking,
             max_tokens: config.max_tokens,
@@ -191,10 +199,11 @@ pub async fn run(
             content_blocks.push(ContentBlock::tool_use(id, name, input));
         }
 
-        // Build assistant message with ID and provenance.
+        // Build assistant message with provenance.
+        let assistant_id = filing.next_id();
         let ts = chrono::Utc::now().to_rfc3339();
         let assistant_msg = Message {
-            id: cb.next_id(),
+            id: assistant_id.clone(),
             role: Role::Assistant,
             content: content_blocks.clone(),
             provenance: Some(Provenance {
@@ -206,14 +215,15 @@ pub async fn run(
             meta: None,
             extra: HashMap::new(),
         };
-        cb.on_event(AgentEvent::MessageComplete(assistant_msg.clone()));
-        messages.push(assistant_msg);
+        filing.write_message(assistant_msg.clone())?;
+        session_ids.push(assistant_id);
+        cb.on_event(AgentEvent::MessageComplete(assistant_msg));
 
-        // Extract and execute tool calls.
-        let calls: Vec<ToolCall> = content_blocks.iter().filter_map(|c| match c {
-            ContentBlock::ToolUse { id, name, input, .. } => Some(ToolCall {
-                id: id.clone(), name: name.clone(), input: input.clone(),
-            }),
+        // Extract tool calls from the response.
+        let calls: Vec<(String, String, serde_json::Value)> = content_blocks.iter().filter_map(|c| match c {
+            ContentBlock::ToolUse { id, name, input, .. } => Some((
+                id.clone(), name.clone(), input.clone(),
+            )),
             _ => None,
         }).collect();
 
@@ -224,41 +234,39 @@ pub async fn run(
 
         // Execute tool calls.
         let mut results: Vec<ContentBlock> = Vec::new();
-        for call in &calls {
+        for (call_id, call_name, call_input) in &calls {
             if cancel.is_cancelled() {
-                results.push(ContentBlock::tool_result_text(&call.id, "Cancelled", true));
+                results.push(ContentBlock::tool_result_text(call_id, "Cancelled", true));
                 continue;
             }
 
-            cb.on_event(AgentEvent::ToolStart { id: call.id.clone(), name: call.name.clone() });
+            cb.on_event(AgentEvent::ToolStart { id: call_id.clone(), name: call_name.clone() });
 
-            let output = match tool_map.get(call.name.as_str()) {
+            let output = match tool_map.get(call_name.as_str()) {
                 Some(tool) => {
-                    (tool.run)(call.input.clone(), config.cwd.to_path_buf(), cancel.clone()).await
+                    (tool.run)(call_input.clone(), config.cwd.to_path_buf(), cancel.clone()).await
                 }
                 None => ToolOutput {
-                    text: format!("Tool '{}' not found", call.name),
+                    text: format!("Tool '{}' not found", call_name),
                     is_error: true,
                 },
             };
 
             cb.on_event(AgentEvent::ToolEnd {
-                id: call.id.clone(),
+                id: call_id.clone(),
                 output: output.text.clone(),
                 is_error: output.is_error,
             });
 
-            results.push(ContentBlock::tool_result_text(&call.id, &output.text, output.is_error));
+            results.push(ContentBlock::tool_result_text(call_id, &output.text, output.is_error));
         }
 
-        // Append tool results as a user message.
-        let tool_msg = Message::new(
-            cb.next_id(),
-            Role::User,
-            results,
-        );
-        cb.on_event(AgentEvent::MessageComplete(tool_msg.clone()));
-        messages.push(tool_msg);
+        // Write tool results as a user message.
+        let tool_id = filing.next_id();
+        let tool_msg = Message::new(tool_id.clone(), Role::User, results);
+        filing.write_message(tool_msg.clone())?;
+        session_ids.push(tool_id);
+        cb.on_event(AgentEvent::MessageComplete(tool_msg));
 
         cb.on_event(AgentEvent::TurnEnd);
     }

@@ -43,6 +43,13 @@ pub struct ApiRequest {
 }
 
 impl Provider {
+    pub fn is_authenticated(&self) -> bool {
+        match self {
+            Provider::Anthropic { api_key } => !api_key.is_empty(),
+            Provider::Gemini { token, .. } => !token.is_empty(),
+        }
+    }
+
     pub fn build_request(&self, opts: &RequestOptions) -> ApiRequest {
         match self {
             Provider::Anthropic { api_key } => anthropic::build_request(api_key, opts),
