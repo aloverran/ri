@@ -257,18 +257,17 @@ fn read_session_header(path: &Path) -> eyre::Result<SessionInfo> {
     })
 }
 
-// Generate a session prefix from name + timestamp.
-// Format: <name_slug>_<time_component> to ensure uniqueness across sessions.
+// Generate a session prefix from name + random suffix.
 fn gen_session_prefix(name: &str) -> String {
     let slug: String = name.chars()
         .filter(|c| c.is_ascii_alphanumeric())
         .take(6)
         .collect();
-    let ts = Utc::now().format("%H%M%S").to_string();
+    let rand = &uuid::Uuid::new_v4().simple().to_string()[..6];
     if slug.is_empty() {
-        format!("s{}", ts)
+        format!("s_{}", rand)
     } else {
-        format!("{}{}", slug, ts)
+        format!("{}_{}", slug, rand)
     }
 }
 

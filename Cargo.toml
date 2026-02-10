@@ -4,7 +4,6 @@ members = [
     "crates/ri-core",
     "crates/ri-ai",
     "crates/ri-tools",
-    "research",
     "ri-cli",
 ]
 resolver = "2"
