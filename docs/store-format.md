@@ -250,7 +250,7 @@ The session metadata (name, cwd, timestamp) is file-level, not pool-level. It de
 ## In-memory representation
 
 ```rust
-struct Pool {
+struct MessagePool {
     messages: HashMap<String, Message>,
 }
 
@@ -280,7 +280,7 @@ struct Usage {
 ### Core pool operations
 
 ```rust
-impl Pool {
+impl MessagePool {
     // Add a message to the pool (does not write to disk -- filing layer handles that)
     fn put(&mut self, msg: Message);
 
@@ -305,7 +305,7 @@ impl Pool {
 
 ```rust
 struct SessionFiling {
-    pool: Pool,
+    pool: MessagePool,
     sessions_dir: PathBuf,
     active_session: Option<ActiveSession>,
 }

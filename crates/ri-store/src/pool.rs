@@ -1,15 +1,15 @@
 use std::collections::HashMap;
 use crate::types::Message;
 
-pub struct Pool {
+pub struct MessagePool {
     messages: HashMap<String, Message>,
     // Insertion order for deterministic iteration.
     order: Vec<String>,
 }
 
-impl Pool {
+impl MessagePool {
     pub fn new() -> Self {
-        Pool { messages: HashMap::new(), order: Vec::new() }
+        MessagePool { messages: HashMap::new(), order: Vec::new() }
     }
 
     pub fn put(&mut self, msg: Message) {

@@ -1,6 +1,6 @@
 use clap::Parser;
 use color_eyre::eyre::Result;
-use ri_core::agent;
+use ri_agent as agent;
 use ri_core::types::*;
 use ri_store::types::{ContentBlock, Message, Role};
 use ri_store::filing::SessionFiling;

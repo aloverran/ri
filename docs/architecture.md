@@ -59,9 +59,9 @@ Both can carry `meta` for application-specific data (e.g., a timestamp on author
 
 A message is immutable once written. It exists in the pool forever (or until the pool is archived/compacted at the storage level).
 
-## The pool
+## The message pool
 
-The pool is the set of all messages. In memory, it's a `HashMap<Id, Message>`. It's the palette you compose from.
+The message pool is the set of all messages. In memory, it's a `HashMap<Id, Message>`. It's the palette you compose from.
 
 Core operations:
 
@@ -69,7 +69,7 @@ Core operations:
 - `get(id) -> Message` -- retrieve a message by ID
 - `run(input_ids, model) -> Id` -- call LLM with the given messages, write the output as a new message with provenance, return its ID
 
-The pool doesn't know about sessions, conversations, agents, or tools. It's a bag of messages with a "derive new message via LLM" operation.
+The message pool doesn't know about sessions, conversations, agents, or tools. It's a bag of messages with a "derive new message via LLM" operation.
 
 ## Filing: how messages are organized on disk
 
@@ -111,7 +111,7 @@ For the chat agent, a "session" means a linear chain of LLM calls (derived messa
 ## Architecture layers
 
 ```
-Layer 0: Pool (ri-store)
+Layer 0: MessagePool (ri-store)
   - Messages (with optional provenance)
   - HashMap<Id, Message> in memory
   - The universal data model
@@ -122,14 +122,20 @@ Layer 0.5: Filing (ri-store)
   - Writing new messages to the active file
   - Application-pluggable filing strategy
 
-Layer 1: Provider (ri-ai)
-  - LLM API abstraction
+Layer 1: Shared vocabulary (ri-core)
+  - Model, ThinkingLevel, ModelCost
+  - LlmProvider trait, RequestOptions, ApiError
+  - ToolDef, ToolFn, ToolOutput
+  - StreamEvent, ToolSchema
+
+Layer 1.5: Provider (ri-ai)
+  - LLM API implementations (Anthropic, Gemini)
   - Streaming SSE
-  - Provider-specific request formatting (Anthropic, OpenAI, etc.)
+  - Provider-specific request formatting
   - OAuth, API keys
   - Takes Vec<Message>, returns streamed Response
 
-Layer 2: Agent / Strategy (ri-core)
+Layer 2: Agent / Strategy (ri-agent)
   - The agent loop (compose messages, call LLM, execute tools, repeat)
   - Context strategy (how to select and arrange messages for each LLM call)
   - Tool execution
@@ -150,10 +156,11 @@ Each layer depends only on the layers below it.
 ```
 ri/
   crates/
-    ri-store/       # Layer 0 + 0.5: Message pool, filing, on-disk format
-    ri-core/        # Layer 2: Agent loop, strategy, tool trait, event system, types
-    ri-ai/          # Layer 1: LLM providers (Anthropic, etc.), streaming, auth
-    ri-tools/       # Layer 2: Built-in tool implementations
+    ri-store/       # Layer 0 + 0.5: MessagePool, filing, on-disk format
+    ri-core/        # Layer 1: Shared types, traits, stream events
+    ri-ai/          # Layer 1.5: LLM providers (Anthropic, Gemini), streaming, auth
+    ri-tools/       # Layer 1.5: Built-in tool implementations
+    ri-agent/       # Layer 2: Agent loop, context strategy
   ri-cli/           # Layer 3: CLI entry point, modes, config, TUI
 ```
 
@@ -162,9 +169,9 @@ ri/
 The message pool and filing system. Handles:
 
 - Message type definition (id, role, content, provenance)
-- In-memory pool (HashMap of messages)
+- In-memory MessagePool (HashMap of messages with insertion-order tracking)
 - Filing: read/write per-session JSONL files
-- Pool queries: get by ID, find by criteria, walk provenance chains
+- MessagePool queries: get by ID, find by criteria, resolve ID lists
 
 Does NOT handle: LLM API calls, tool execution, context strategy, agent loop logic.
 
@@ -172,21 +179,34 @@ This crate defines the universal data model. It is small (~300-400 lines) and sh
 
 ### ri-core
 
-Agent types and the agent loop. Handles:
+Shared vocabulary: the types and traits that connect all other crates. Handles:
 
-- ContentBlock types (text, image, tool_use, tool_result, thinking)
-- The Tool trait and ToolResult types
+- Model, ModelCost, ThinkingLevel definitions
+- Re-exports of store types (Role, ContentBlock, Message, Provenance, Usage, etc.)
+- The LlmProvider trait and RequestOptions
+- ApiError types (Http, Api, ContextOverflow, RateLimited, StreamParse)
+- ToolDef, ToolFn, ToolOutput (tool definitions as function pointers)
+- StreamEvent (normalized stream events from any provider)
+- ToolSchema (tool definitions as seen by the LLM API)
+
+Depends on ri-store. Does NOT handle: LLM API calls, tool execution, agent loop logic.
+
+### ri-agent
+
+The agent loop. Handles:
+
+- The `run()` function: compose context -> call LLM -> execute tools -> repeat
+- RunConfig: everything the loop needs (provider, model, tools, strategy)
+- ContextStrategy: how to select messages from the MessagePool for each LLM call
 - AgentEvent system (broadcast events to observers: TUI, RPC, logging)
-- The agent loop: compose context -> call LLM -> execute tools -> repeat
-- Context strategy: how to select messages from the pool for each LLM call
+- AgentCallback trait for event observation
 
-Depends on ri-store (to read/write messages) and ri-ai (to call LLMs).
+Depends on ri-store (to read/write messages via filing) and ri-core (for shared types/traits).
 
 ### ri-ai
 
-LLM provider abstraction. Handles:
+LLM provider implementations. Handles:
 
-- LlmProvider trait: stream(messages, options) -> Stream<Event>
 - Anthropic provider: SSE parsing, request body construction, OAuth tool name remapping
 - Gemini provider: Cloud Code Assist API, Antigravity variant
 - Model catalog and registry (code-defined, no JSON config)
@@ -198,7 +218,7 @@ Does NOT handle: message storage, tool execution, agent loop.
 
 ### ri-tools
 
-Built-in tool implementations: bash, read, write, edit, find, grep, ls. Each implements the Tool trait from ri-core. These are simple, mostly-finished modules.
+Built-in tool implementations: bash, read, write, edit. Each uses the ToolDef type from ri-core. These are simple, mostly-finished modules.
 
 ### ri-cli
 

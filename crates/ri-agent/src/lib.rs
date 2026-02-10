@@ -1,6 +1,6 @@
-// Agent loop -- pool-aware.
+// Agent loop -- MessagePool-aware.
 //
-// The loop operates on the Pool (via SessionFiling) rather than a bare Vec.
+// The loop operates on the MessagePool (via SessionFiling) rather than a bare Vec.
 // A ContextStrategy selects which messages from the pool to send each turn.
 // New messages (assistant responses, tool results) are written through filing
 // (which puts them in the pool AND appends to the active session file).
@@ -9,13 +9,13 @@ use std::collections::HashMap;
 use std::path::Path;
 use futures::StreamExt;
 
-use ri_store::pool::Pool;
+use ri_store::pool::MessagePool;
 use ri_store::filing::SessionFiling;
 use ri_store::types::{ContentBlock, Message, Provenance, Role};
-use crate::types::*;
-use crate::event::{StreamEvent, ToolSchema};
-use crate::tool::{ToolDef, ToolOutput};
-use crate::provider::{LlmProvider, RequestOptions};
+use ri_core::types::*;
+use ri_core::event::{StreamEvent, ToolSchema};
+use ri_core::tool::{ToolDef, ToolOutput};
+use ri_core::provider::{LlmProvider, RequestOptions};
 
 // What the agent loop emits to the caller.
 #[derive(Debug, Clone)]
@@ -32,10 +32,10 @@ pub enum AgentEvent {
 
 // Strategy: given the pool and current session message IDs,
 // return the ordered list of message IDs for the next LLM call.
-pub type ContextStrategy = fn(&Pool, &[String]) -> Vec<String>;
+pub type ContextStrategy = fn(&MessagePool, &[String]) -> Vec<String>;
 
 // Naive strategy: return all session message IDs in order.
-pub fn naive_strategy(_pool: &Pool, session_ids: &[String]) -> Vec<String> {
+pub fn naive_strategy(_pool: &MessagePool, session_ids: &[String]) -> Vec<String> {
     session_ids.to_vec()
 }
 
@@ -210,7 +210,7 @@ pub async fn run(
                 input: input_ids,
                 model: config.model.id.clone(),
                 ts,
-                usage: None, // TODO: capture from stream when providers emit it
+                usage: None,
             }),
             meta: None,
             extra: HashMap::new(),

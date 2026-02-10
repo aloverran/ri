@@ -1,4 +1,4 @@
-use ri_core::agent::{self, AgentCallback, AgentEvent, RunConfig};
+use ri_agent::{self as agent, AgentCallback, AgentEvent, RunConfig};
 use ri_core::provider::LlmProvider;
 use ri_core::tool::ToolDef;
 use ri_core::types::*;

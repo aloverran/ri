@@ -3,12 +3,12 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use chrono::Utc;
 
-use crate::pool::Pool;
+use crate::pool::MessagePool;
 use crate::types::{Message, SessionHeader, SessionInfo};
 use crate::id::gen_id;
 
 pub struct SessionFiling {
-    pub pool: Pool,
+    pub pool: MessagePool,
     sessions_dir: PathBuf,
     active: Option<ActiveSession>,
     // Session prefix for generating message IDs in the active session.
@@ -25,7 +25,7 @@ struct ActiveSession {
 impl SessionFiling {
     pub fn new(sessions_dir: PathBuf) -> Self {
         SessionFiling {
-            pool: Pool::new(),
+            pool: MessagePool::new(),
             sessions_dir,
             active: None,
             active_prefix: String::new(),

@@ -11,6 +11,7 @@ path = "src/main.rs"
 [dependencies]
 ri-store.workspace = true
 ri-core.workspace = true
+ri-agent.workspace = true
 ri-ai.workspace = true
 ri-tools.workspace = true
 tokio.workspace = true

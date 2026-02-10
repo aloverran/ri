@@ -3,9 +3,6 @@ pub use ri_store::types::{
     Role, ContentBlock, Message, Provenance, Usage,
     SessionHeader, SessionInfo,
 };
-pub use ri_store::pool::Pool;
-pub use ri_store::filing::SessionFiling;
-pub use ri_store::id::gen_id;
 
 use serde::{Deserialize, Serialize};
 

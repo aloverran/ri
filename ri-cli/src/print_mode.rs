@@ -1,4 +1,4 @@
-use ri_core::agent::{AgentCallback, AgentEvent};
+use ri_agent::{AgentCallback, AgentEvent};
 use ri_core::event::StreamEvent;
 use std::io::Write;
 

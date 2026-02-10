@@ -2,6 +2,7 @@
 members = [
     "crates/ri-store",
     "crates/ri-core",
+    "crates/ri-agent",
     "crates/ri-ai",
     "crates/ri-tools",
     "ri-cli",
@@ -39,3 +40,4 @@ ri-store = { path = "crates/ri-store" }
 ri-core = { path = "crates/ri-core" }
 ri-ai = { path = "crates/ri-ai" }
 ri-tools = { path = "crates/ri-tools" }
+ri-agent = { path = "crates/ri-agent" }
