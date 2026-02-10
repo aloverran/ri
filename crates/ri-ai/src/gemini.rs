@@ -14,10 +14,9 @@ use std::task::{Context, Poll};
 use futures::Stream;
 use serde_json::{json, Value};
 
-use ri_core::types::{ThinkingLevel, Role};
-use ri_store::types::{Message, ContentBlock};
-use ri_core::provider::{ApiError, EventStream, RequestOptions};
-use ri_core::event::StreamEvent;
+use ri::{
+    ApiError, ContentBlock, EventStream, Message, RequestOptions, Role, StreamEvent, ThinkingLevel,
+};
 use crate::{ApiRequest, GeminiVariant};
 use crate::sse::{SseEvent, SseParser};
 

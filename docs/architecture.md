@@ -111,29 +111,24 @@ For the chat agent, a "session" means a linear chain of LLM calls (derived messa
 ## Architecture layers
 
 ```
-Layer 0: MessagePool (ri-store)
+Layer 0: Foundation (ri)
   - Messages (with optional provenance)
-  - HashMap<Id, Message> in memory
-  - The universal data model
-
-Layer 0.5: Filing (ri-store)
-  - Per-session JSONL files
-  - Loading files into the pool
-  - Writing new messages to the active file
-  - Application-pluggable filing strategy
-
-Layer 1: Shared vocabulary (ri-core)
+  - MessagePool: HashMap<Id, Message> in memory
+  - Filing: per-session JSONL files
   - Model, ThinkingLevel, ModelCost
   - LlmProvider trait, RequestOptions, ApiError
   - ToolDef, ToolFn, ToolOutput
   - StreamEvent, ToolSchema
 
-Layer 1.5: Provider (ri-ai)
+Layer 1: Provider (ri-ai)
   - LLM API implementations (Anthropic, Gemini)
   - Streaming SSE
   - Provider-specific request formatting
   - OAuth, API keys
   - Takes Vec<Message>, returns streamed Response
+
+Layer 1: Tools (ri-tools)
+  - Built-in tool implementations (bash, read, write, edit)
 
 Layer 2: Agent / Strategy (ri-agent)
   - The agent loop (compose messages, call LLM, execute tools, repeat)
@@ -156,40 +151,28 @@ Each layer depends only on the layers below it.
 ```
 ri/
   crates/
-    ri-store/       # Layer 0 + 0.5: MessagePool, filing, on-disk format
-    ri-core/        # Layer 1: Shared types, traits, stream events
-    ri-ai/          # Layer 1.5: LLM providers (Anthropic, Gemini), streaming, auth
-    ri-tools/       # Layer 1.5: Built-in tool implementations
+    ri/             # Layer 0: Foundation -- types, pool, filing, traits
+    ri-ai/          # Layer 1: LLM providers (Anthropic, Gemini), streaming, auth
+    ri-tools/       # Layer 1: Built-in tool implementations
     ri-agent/       # Layer 2: Agent loop, context strategy
   ri-cli/           # Layer 3: CLI entry point, modes, config, TUI
 ```
 
-### ri-store
+### ri
 
-The message pool and filing system. Handles:
+The foundation crate. Everything the rest of the system depends on:
 
-- Message type definition (id, role, content, provenance)
-- In-memory MessagePool (HashMap of messages with insertion-order tracking)
-- Filing: read/write per-session JSONL files
-- MessagePool queries: get by ID, find by criteria, resolve ID lists
+- Message types: `Message`, `Role`, `ContentBlock`, `Provenance`, `Usage`
+- `MessagePool`: in-memory store with insertion-order iteration
+- `SessionFiling`: per-session JSONL file read/write
+- Model types: `Model`, `ModelCost`, `ThinkingLevel`
+- `LlmProvider` trait and `RequestOptions`
+- `ApiError` types (Http, Api, ContextOverflow, RateLimited, StreamParse)
+- `ToolDef`, `ToolFn`, `ToolOutput` (tool definitions as function pointers)
+- `StreamEvent` (normalized stream events from any provider)
+- `ToolSchema` (tool definitions as seen by the LLM API)
 
 Does NOT handle: LLM API calls, tool execution, context strategy, agent loop logic.
-
-This crate defines the universal data model. It is small (~300-400 lines) and should be finished early -- it changes rarely once the message format is stable.
-
-### ri-core
-
-Shared vocabulary: the types and traits that connect all other crates. Handles:
-
-- Model, ModelCost, ThinkingLevel definitions
-- Re-exports of store types (Role, ContentBlock, Message, Provenance, Usage, etc.)
-- The LlmProvider trait and RequestOptions
-- ApiError types (Http, Api, ContextOverflow, RateLimited, StreamParse)
-- ToolDef, ToolFn, ToolOutput (tool definitions as function pointers)
-- StreamEvent (normalized stream events from any provider)
-- ToolSchema (tool definitions as seen by the LLM API)
-
-Depends on ri-store. Does NOT handle: LLM API calls, tool execution, agent loop logic.
 
 ### ri-agent
 
@@ -201,7 +184,7 @@ The agent loop. Handles:
 - AgentEvent system (broadcast events to observers: TUI, RPC, logging)
 - AgentCallback trait for event observation
 
-Depends on ri-store (to read/write messages via filing) and ri-core (for shared types/traits).
+Depends on ri (for types, pool, filing, and provider trait).
 
 ### ri-ai
 
@@ -218,7 +201,7 @@ Does NOT handle: message storage, tool execution, agent loop.
 
 ### ri-tools
 
-Built-in tool implementations: bash, read, write, edit. Each uses the ToolDef type from ri-core. These are simple, mostly-finished modules.
+Built-in tool implementations: bash, read, write, edit. Each uses the `ToolDef` type from ri. These are simple, mostly-finished modules.
 
 ### ri-cli
 

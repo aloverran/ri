@@ -1,6 +1,6 @@
 # ri-cli
 
-The `ri` binary. Wires together ri-store, ri-core, ri-ai, and ri-tools into a working coding agent.
+The `ri` binary. Wires together ri, ri-ai, ri-agent, and ri-tools into a working coding agent.
 
 ## Run modes
 
@@ -22,4 +22,4 @@ The `ri` binary. Wires together ri-store, ri-core, ri-ai, and ri-tools into a wo
 
 ## Depends on
 
-ri-store, ri-core, ri-ai, ri-tools. External: clap, color-eyre, tokio, serde, dirs, glob, tracing-subscriber.
+ri, ri-ai, ri-agent, ri-tools. External: clap, color-eyre, tokio, serde, dirs, glob, tracing-subscriber.

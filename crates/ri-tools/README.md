@@ -2,7 +2,7 @@
 
 Built-in tool implementations: `bash`, `read`, `write`, `edit`.
 
-Each is a function that returns a `ToolDef` (from ri-core). `all_tools()` returns the full set.
+Each is a function that returns a `ToolDef` (from ri). `all_tools()` returns the full set.
 
 ## Tools
 
@@ -16,4 +16,4 @@ Each is a function that returns a `ToolDef` (from ri-core). `all_tools()` return
 
 ## Depends on
 
-ri-core. External: tokio, serde_json, tokio-util.
+ri. External: tokio, serde_json, tokio-util.

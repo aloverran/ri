@@ -3,8 +3,7 @@
 // This module is the public interface for resolving providers and models.
 // ri-cli calls into here without knowing about specific providers.
 
-use ri_core::types::{Model, ModelCost};
-use ri_core::provider::LlmProvider;
+use ri::{LlmProvider, Model, ModelCost};
 use crate::auth::store::AuthStore;
 use crate::{Provider, GeminiVariant};
 

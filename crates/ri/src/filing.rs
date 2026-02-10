@@ -1,11 +1,34 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
+use std::collections::HashMap;
 use chrono::Utc;
+use serde::{Serialize, Deserialize};
 
-use crate::pool::MessagePool;
-use crate::types::{Message, SessionHeader, SessionInfo};
-use crate::id::gen_id;
+use crate::message::{Message, MessagePool};
+use crate::id::{gen_id, gen_session_prefix};
+
+// -- Session header (first line of a session file) --
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionHeader {
+    pub session: String,
+    pub ts: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    #[serde(flatten)]
+    pub extra: HashMap<String, serde_json::Value>,
+}
+
+// -- Session info for listing --
+
+#[derive(Debug, Clone)]
+pub struct SessionInfo {
+    pub path: std::path::PathBuf,
+    pub name: String,
+    pub ts: String,
+    pub cwd: Option<String>,
+}
 
 pub struct SessionFiling {
     pub pool: MessagePool,
@@ -101,8 +124,6 @@ impl SessionFiling {
                 }
                 Err(e) => {
                     tracing::warn!("{}:{}: malformed message, skipping: {}", path.display(), line_num + 1, e);
-                    // Only skip if it's the last line (crash recovery).
-                    // For interior lines, still warn but continue.
                 }
             }
         }
@@ -227,7 +248,6 @@ fn read_session_header(path: &Path) -> eyre::Result<SessionInfo> {
         }
 
         // First non-empty line should be the header.
-        // Detect structurally: has "session" key, no "role" key.
         if let Ok(obj) = serde_json::from_str::<serde_json::Value>(trimmed) {
             if obj.get("session").is_some() && obj.get("role").is_none() {
                 if let Ok(header) = serde_json::from_str::<SessionHeader>(trimmed) {
@@ -240,8 +260,6 @@ fn read_session_header(path: &Path) -> eyre::Result<SessionInfo> {
                 }
             }
         }
-
-        // Not a header, try to derive info from filename.
         break;
     }
 
@@ -255,20 +273,6 @@ fn read_session_header(path: &Path) -> eyre::Result<SessionInfo> {
         ts: String::new(),
         cwd: None,
     })
-}
-
-// Generate a session prefix from name + random suffix.
-fn gen_session_prefix(name: &str) -> String {
-    let slug: String = name.chars()
-        .filter(|c| c.is_ascii_alphanumeric())
-        .take(6)
-        .collect();
-    let rand = &uuid::Uuid::new_v4().simple().to_string()[..6];
-    if slug.is_empty() {
-        format!("s_{}", rand)
-    } else {
-        format!("{}_{}", slug, rand)
-    }
 }
 
 fn slugify(name: &str) -> String {

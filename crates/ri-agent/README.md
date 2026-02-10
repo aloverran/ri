@@ -10,4 +10,4 @@ The agent loop: compose context from the message pool, stream an LLM response, e
 
 ## Depends on
 
-ri-store, ri-core. External: tokio, serde, serde_json, futures, eyre, chrono, tokio-util.
+ri. External: tokio, serde, serde_json, futures, eyre, chrono, tokio-util.

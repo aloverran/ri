@@ -1,9 +1,3 @@
-// Re-export store types as canonical.
-pub use ri_store::types::{
-    Role, ContentBlock, Message, Provenance, Usage,
-    SessionHeader, SessionInfo,
-};
-
 use serde::{Deserialize, Serialize};
 
 // Model definition (provider-level).

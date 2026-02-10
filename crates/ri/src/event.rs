@@ -13,11 +13,3 @@ pub enum StreamEvent {
     Done,
     Error(String),
 }
-
-// Tool schema as seen by the LLM API.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct ToolSchema {
-    pub name: String,
-    pub description: String,
-    pub parameters: serde_json::Value,
-}

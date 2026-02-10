@@ -1,10 +1,8 @@
 use ri_agent::{self as agent, AgentCallback, AgentEvent, RunConfig};
-use ri_core::event::StreamEvent;
-use ri_core::provider::LlmProvider;
-use ri_core::tool::ToolDef;
-use ri_core::types::*;
-use ri_store::types::{ContentBlock, Message, Role};
-use ri_store::filing::SessionFiling;
+use ri::{
+    ContentBlock, LlmProvider, Message, Model, Role, SessionFiling, StreamEvent, ThinkingLevel,
+    ToolDef,
+};
 use std::io::Write;
 use std::path::PathBuf;
 use tokio::io::AsyncBufReadExt;

@@ -1,7 +1,7 @@
 use std::pin::Pin;
 use futures::Stream;
 
-use ri_core::provider::ApiError;
+use ri::ApiError;
 use crate::ApiRequest;
 
 type ByteStream = Pin<Box<dyn Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Send>>;

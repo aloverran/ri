@@ -1,7 +1,6 @@
 [workspace]
 members = [
-    "crates/ri-store",
-    "crates/ri-core",
+    "crates/ri",
     "crates/ri-agent",
     "crates/ri-ai",
     "crates/ri-tools",
@@ -36,8 +35,7 @@ glob = "0.3"
 tokio-stream = "0.1"
 bytes = "1"
 tokio-util = { version = "0.7", features = ["rt"] }
-ri-store = { path = "crates/ri-store" }
-ri-core = { path = "crates/ri-core" }
+ri = { path = "crates/ri" }
 ri-ai = { path = "crates/ri-ai" }
 ri-tools = { path = "crates/ri-tools" }
 ri-agent = { path = "crates/ri-agent" }

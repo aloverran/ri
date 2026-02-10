@@ -9,13 +9,10 @@ use std::collections::HashMap;
 use std::path::Path;
 use futures::StreamExt;
 
-use ri_store::pool::MessagePool;
-use ri_store::filing::SessionFiling;
-use ri_store::types::{ContentBlock, Message, Provenance, Role};
-use ri_core::types::*;
-use ri_core::event::{StreamEvent, ToolSchema};
-use ri_core::tool::{ToolDef, ToolOutput};
-use ri_core::provider::{LlmProvider, RequestOptions};
+use ri::{
+    ContentBlock, LlmProvider, Message, MessagePool, Model, Provenance, RequestOptions, Role,
+    SessionFiling, StreamEvent, ThinkingLevel, ToolDef, ToolOutput, ToolSchema,
+};
 
 // What the agent loop emits to the caller.
 #[derive(Debug, Clone)]

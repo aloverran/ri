@@ -1,14 +1,15 @@
 // Provider trait -- the agent loop's view of an LLM provider.
 //
-// ri-ai implements this trait. ri-core defines it so the agent loop
+// ri-ai implements this trait. ri defines it so the agent loop
 // can call providers without depending on ri-ai.
 
 use std::pin::Pin;
 use futures::Stream;
 
-use crate::event::{StreamEvent, ToolSchema};
-use crate::types::{Model, ThinkingLevel};
-use ri_store::types::Message;
+use crate::event::StreamEvent;
+use crate::tool::ToolSchema;
+use crate::model::{Model, ThinkingLevel};
+use crate::message::Message;
 
 // Request-level options (provider-agnostic).
 pub struct RequestOptions<'a> {

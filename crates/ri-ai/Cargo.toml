@@ -6,8 +6,7 @@ license.workspace = true
 description = "LLM provider implementations (Anthropic, Gemini) for ri"
 
 [dependencies]
-ri-store.workspace = true
-ri-core.workspace = true
+ri.workspace = true
 tokio.workspace = true
 serde.workspace = true
 serde_json.workspace = true

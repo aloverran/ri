@@ -6,7 +6,7 @@ Currently supports Anthropic (Messages API) and Google Gemini (Cloud Code Assist
 
 ## What's here
 
-**Provider enum** — `Provider::Anthropic { api_key }` and `Provider::Gemini { variant, token, project_id }`. Implements `LlmProvider` from ri-core. The flow is: `build_request()` produces an `ApiRequest` (url, headers, body as plain data), `http::send()` fires it and returns a byte stream, `event_stream()` wraps that in a provider-specific SSE interpreter.
+**Provider enum** — `Provider::Anthropic { api_key }` and `Provider::Gemini { variant, token, project_id }`. Implements `LlmProvider` from ri. The flow is: `build_request()` produces an `ApiRequest` (url, headers, body as plain data), `http::send()` fires it and returns a byte stream, `event_stream()` wraps that in a provider-specific SSE interpreter.
 
 **anthropic** — Builds Anthropic Messages API requests. Handles two auth modes: API key (`x-api-key` header) and OAuth (`Bearer` token with claude-code beta headers). For OAuth, tool names are mapped to/from Claude Code's PascalCase convention. Supports thinking configuration: adaptive mode for Opus 4.6, budget-based for other reasoning models.
 
@@ -20,4 +20,4 @@ Currently supports Anthropic (Messages API) and Google Gemini (Cloud Code Assist
 
 ## Depends on
 
-ri-store, ri-core. External: reqwest, tokio, serde, futures, bytes, sha2, rand, base64, chrono, uuid.
+ri. External: reqwest, tokio, serde, futures, bytes, sha2, rand, base64, chrono, uuid.

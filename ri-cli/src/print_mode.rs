@@ -1,5 +1,5 @@
 use ri_agent::{AgentCallback, AgentEvent};
-use ri_core::event::StreamEvent;
+use ri::StreamEvent;
 use std::io::Write;
 
 pub struct TextCallback;

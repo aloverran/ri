@@ -1324,14 +1324,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "ri"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "dirs",
+ "eyre",
+ "futures",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio-util",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "ri-agent"
 version = "0.1.0"
 dependencies = [
  "chrono",
  "eyre",
  "futures",
- "ri-core",
- "ri-store",
+ "ri",
  "serde",
  "serde_json",
  "tokio",
@@ -1350,8 +1365,7 @@ dependencies = [
  "futures",
  "rand",
  "reqwest",
- "ri-core",
- "ri-store",
+ "ri",
  "serde",
  "serde_json",
  "sha2",
@@ -1371,10 +1385,9 @@ dependencies = [
  "dirs",
  "eyre",
  "glob",
+ "ri",
  "ri-agent",
  "ri-ai",
- "ri-core",
- "ri-store",
  "ri-tools",
  "serde",
  "serde_json",
@@ -1385,36 +1398,11 @@ dependencies = [
 ]
 
 [[package]]
-name = "ri-core"
-version = "0.1.0"
-dependencies = [
- "futures",
- "ri-store",
- "serde",
- "serde_json",
- "thiserror",
- "tokio-util",
-]
-
-[[package]]
-name = "ri-store"
-version = "0.1.0"
-dependencies = [
- "chrono",
- "dirs",
- "eyre",
- "serde",
- "serde_json",
- "tracing",
- "uuid",
-]
-
-[[package]]
 name = "ri-tools"
 version = "0.1.0"
 dependencies = [
  "libc",
- "ri-core",
+ "ri",
  "serde_json",
  "tokio",
  "tokio-util",

@@ -5,15 +5,11 @@ pub mod gemini;
 pub mod auth;
 pub mod registry;
 
-pub use ri_core;
-pub use ri_store;
-
 use std::pin::Pin;
 use std::future::Future;
 use futures::Stream;
 
-use ri_core::event::ToolSchema;
-use ri_core::provider::{ApiError, EventStream, LlmProvider, RequestOptions};
+use ri::{ApiError, EventStream, LlmProvider, RequestOptions, ToolSchema};
 
 // The provider enum. Closed set.
 #[derive(Debug, Clone)]

@@ -6,7 +6,7 @@ license.workspace = true
 description = "Built-in coding tools (bash, read, write, edit) for ri"
 
 [dependencies]
-ri-core.workspace = true
+ri.workspace = true
 tokio.workspace = true
 serde_json.workspace = true
 tokio-util.workspace = true

@@ -1,9 +1,7 @@
 use clap::Parser;
 use color_eyre::eyre::Result;
 use ri_agent as agent;
-use ri_core::types::*;
-use ri_store::types::{ContentBlock, Message, Role};
-use ri_store::filing::SessionFiling;
+use ri::{ContentBlock, Message, Role, SessionFiling, ThinkingLevel};
 
 mod interactive;
 mod print_mode;

@@ -5,7 +5,7 @@
 
 use std::path::{Path, PathBuf};
 
-use ri_core::tool::{ToolDef, ToolOutput};
+use ri::{ToolDef, ToolOutput};
 
 pub fn all_tools() -> Vec<ToolDef> {
     vec![bash(), read(), write(), edit()]

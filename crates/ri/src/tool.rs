@@ -4,7 +4,13 @@ use std::path::PathBuf;
 use std::pin::Pin;
 use std::future::Future;
 
-use crate::event::ToolSchema;
+// Tool schema as seen by the LLM API.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ToolSchema {
+    pub name: String,
+    pub description: String,
+    pub parameters: serde_json::Value,
+}
 
 pub struct ToolOutput {
     pub text: String,
