@@ -3,25 +3,9 @@ use futures::Stream;
 
 use ri::ApiError;
 
-// The HTTP request a provider builds. Fully visible, inspectable, loggable.
-#[derive(Debug, Clone)]
-pub struct ApiRequest {
-    pub url: String,
-    pub headers: Vec<(String, String)>,
-    pub body: String,
-}
+pub type ByteStream = Pin<Box<dyn Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Send>>;
 
-type ByteStream = Pin<Box<dyn Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Send>>;
-
-pub async fn send(request: &ApiRequest) -> Result<ByteStream, ApiError> {
-    let client = reqwest::Client::new();
-
-    let mut builder = client.post(&request.url);
-    for (key, value) in &request.headers {
-        builder = builder.header(key.as_str(), value.as_str());
-    }
-    builder = builder.body(request.body.clone());
-
+pub async fn send(builder: reqwest::RequestBuilder) -> Result<ByteStream, ApiError> {
     let response = builder.send().await.map_err(|e| ApiError::Http(e.to_string()))?;
     let status = response.status().as_u16();
 

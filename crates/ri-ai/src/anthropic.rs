@@ -16,7 +16,7 @@ use ri::{
     RequestOptions, Role, StreamEvent, ThinkingLevel, ToolSchema,
 };
 use crate::sse::{SseEvent, SseParser};
-use crate::http::{self, ApiRequest};
+use crate::http;
 
 // -- Credentials --
 
@@ -240,14 +240,7 @@ impl LlmProvider for AnthropicProvider {
             .map_err(|e| ApiError::Other(e.to_string()))?;
 
         let request = build_request(&api_key, &opts);
-
-        tracing::debug!(
-            url = %request.url,
-            body = %request.body,
-            "Anthropic API request"
-        );
-
-        let bytes = http::send(&request).await?;
+        let bytes = http::send(request).await?;
         Ok(event_stream(bytes, &opts.tools, is_oauth))
     }
 }
@@ -335,35 +328,33 @@ fn from_claude_code_name(name: &str, original_tools: &[ToolSchema]) -> String {
 
 // -- Request building --
 
-fn build_request(api_key: &str, opts: &RequestOptions) -> ApiRequest {
+fn build_request(api_key: &str, opts: &RequestOptions) -> reqwest::RequestBuilder {
     let is_oauth = api_key.starts_with("sk-ant-oat");
     let body = build_body(opts, is_oauth);
-    let url = "https://api.anthropic.com/v1/messages".to_string();
+    let url = "https://api.anthropic.com/v1/messages";
 
-    let mut headers = vec![
-        ("anthropic-version".into(), "2023-06-01".into()),
-        ("content-type".into(), "application/json".into()),
-        ("accept".into(), "text/event-stream".into()),
-    ];
+    tracing::debug!(url, body = %body, "Anthropic API request");
+
+    let mut builder = reqwest::Client::new()
+        .post(url)
+        .header("anthropic-version", "2023-06-01")
+        .header("content-type", "application/json")
+        .header("accept", "text/event-stream");
 
     if is_oauth {
-        headers.push(("authorization".into(), format!("Bearer {}", api_key)));
-        headers.push((
-            "anthropic-beta".into(),
-            "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,fine-grained-tool-streaming-2025-05-14".into(),
-        ));
-        headers.push(("anthropic-dangerous-direct-browser-access".into(), "true".into()));
-        headers.push(("user-agent".into(), "claude-cli/2.1.2 (external, cli)".into()));
-        headers.push(("x-app".into(), "cli".into()));
+        builder = builder
+            .header("authorization", format!("Bearer {}", api_key))
+            .header("anthropic-beta", "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,fine-grained-tool-streaming-2025-05-14")
+            .header("anthropic-dangerous-direct-browser-access", "true")
+            .header("user-agent", "claude-cli/2.1.2 (external, cli)")
+            .header("x-app", "cli");
     } else {
-        headers.push(("x-api-key".into(), api_key.to_string()));
-        headers.push((
-            "anthropic-beta".into(),
-            "interleaved-thinking-2025-05-14,fine-grained-tool-streaming-2025-05-14".into(),
-        ));
+        builder = builder
+            .header("x-api-key", api_key)
+            .header("anthropic-beta", "interleaved-thinking-2025-05-14,fine-grained-tool-streaming-2025-05-14");
     }
 
-    ApiRequest { url, headers, body: body.to_string() }
+    builder.body(body.to_string())
 }
 
 fn build_body(opts: &RequestOptions, is_oauth: bool) -> Value {

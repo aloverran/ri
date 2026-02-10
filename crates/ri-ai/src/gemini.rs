@@ -16,7 +16,7 @@ use ri::{
     RequestOptions, Role, StreamEvent, ThinkingLevel,
 };
 use crate::sse::{SseEvent, SseParser};
-use crate::http::{self, ApiRequest};
+use crate::http;
 
 // -- Variant --
 
@@ -359,14 +359,7 @@ impl LlmProvider for GeminiProvider {
             .map_err(|e| ApiError::Other(e.to_string()))?;
 
         let request = build_request(self.variant, &token, &project_id, &opts);
-
-        tracing::debug!(
-            url = %request.url,
-            body = %request.body,
-            "Gemini API request"
-        );
-
-        let bytes = http::send(&request).await?;
+        let bytes = http::send(request).await?;
         Ok(event_stream(bytes))
     }
 }
@@ -489,7 +482,7 @@ fn build_request(
     token: &str,
     project_id: &str,
     opts: &RequestOptions,
-) -> ApiRequest {
+) -> reqwest::RequestBuilder {
     let body = build_body(variant, project_id, opts);
     let endpoint = match variant {
         GeminiVariant::Antigravity => ANTIGRAVITY_DAILY_ENDPOINT,
@@ -498,24 +491,25 @@ fn build_request(
     let url = format!("{}/v1internal:streamGenerateContent?alt=sse", endpoint);
 
     let ua = match variant {
-        GeminiVariant::Antigravity => "antigravity/1.15.8 darwin/arm64".to_string(),
-        GeminiVariant::Cli => "google-cloud-sdk vscode_cloudshelleditor/0.1".to_string(),
+        GeminiVariant::Antigravity => "antigravity/1.15.8 darwin/arm64",
+        GeminiVariant::Cli => "google-cloud-sdk vscode_cloudshelleditor/0.1",
     };
 
-    let headers = vec![
-        ("authorization".into(), format!("Bearer {}", token)),
-        ("content-type".into(), "application/json".into()),
-        ("accept".into(), "text/event-stream".into()),
-        ("user-agent".into(), ua),
-        ("x-goog-api-client".into(), "gl-node/22.17.0".into()),
-        ("client-metadata".into(), json!({
+    tracing::debug!(url = %url, body = %body, "Gemini API request");
+
+    reqwest::Client::new()
+        .post(&url)
+        .header("authorization", format!("Bearer {}", token))
+        .header("content-type", "application/json")
+        .header("accept", "text/event-stream")
+        .header("user-agent", ua)
+        .header("x-goog-api-client", "gl-node/22.17.0")
+        .header("client-metadata", json!({
             "ideType": "IDE_UNSPECIFIED",
             "platform": "PLATFORM_UNSPECIFIED",
             "pluginType": "GEMINI"
-        }).to_string()),
-    ];
-
-    ApiRequest { url, headers, body: body.to_string() }
+        }).to_string())
+        .body(body.to_string())
 }
 
 fn build_body(variant: GeminiVariant, project_id: &str, opts: &RequestOptions) -> Value {
