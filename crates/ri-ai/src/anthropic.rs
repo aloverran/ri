@@ -18,45 +18,18 @@ use ri::{
 use crate::sse::{SseEvent, SseParser};
 use crate::http;
 
-// -- Credentials --
-
-#[derive(Clone, serde::Serialize, serde::Deserialize)]
-struct Credentials {
-    access: String,
-    refresh: String,
-    expires: u64,
-}
-
-impl Credentials {
-    fn is_expired(&self) -> bool {
-        let now = crate::epoch_ms();
-        now >= self.expires.saturating_sub(60_000)
-    }
-}
+use crate::creds::{self, Credentials};
 
 fn creds_path() -> PathBuf {
-    dirs::home_dir().expect("No home directory").join(".ri").join("anthropic_auth.json")
+    creds::ri_dir().join("anthropic_auth.json")
 }
 
 fn load_creds() -> Option<Credentials> {
-    let path = creds_path();
-    let data = std::fs::read_to_string(&path).ok()?;
-    serde_json::from_str(&data).ok()
+    creds::load(&creds_path())
 }
 
 fn save_creds(creds: &Credentials) -> eyre::Result<()> {
-    let path = creds_path();
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let data = serde_json::to_string_pretty(creds)?;
-    std::fs::write(&path, data)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
-    }
-    Ok(())
+    creds::save(&creds_path(), creds)
 }
 
 // -- PKCE + OAuth constants --
@@ -279,9 +252,9 @@ async fn refresh_token(credentials: &Credentials) -> eyre::Result<Credentials> {
     }
 
     let expires_in = body["expires_in"].as_u64().unwrap_or(3600);
-    let expires = crate::epoch_ms() + (expires_in * 1000).saturating_sub(300_000);
+    let expires = Credentials::compute_expiry(expires_in);
 
-    Ok(Credentials { access, refresh, expires })
+    Ok(Credentials { access, refresh, expires, project_id: None, email: None })
 }
 
 fn parse_token_response(body: &Value) -> eyre::Result<Credentials> {
@@ -298,9 +271,9 @@ fn parse_token_response(body: &Value) -> eyre::Result<Credentials> {
         .to_string();
 
     let expires_in = body["expires_in"].as_u64().unwrap_or(3600);
-    let expires = crate::epoch_ms() + (expires_in * 1000).saturating_sub(300_000);
+    let expires = Credentials::compute_expiry(expires_in);
 
-    Ok(Credentials { access, refresh, expires })
+    Ok(Credentials { access, refresh, expires, project_id: None, email: None })
 }
 
 // -- Tool name mapping for OAuth (Claude Code compatibility) --

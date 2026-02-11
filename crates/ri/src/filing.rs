@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use chrono::Utc;
 use serde::{Serialize, Deserialize};
 
-use crate::message::{Message, MessagePool};
+use crate::message::{ContentBlock, Message, MessagePool, Role};
 use crate::id::{gen_id, gen_session_prefix};
 
 // -- Session header (first line of a session file) --
@@ -60,6 +60,25 @@ impl SessionFiling {
         let home = dirs::home_dir()
             .ok_or_else(|| eyre::eyre!("Could not determine home directory"))?;
         Ok(home.join(".ri").join("sessions"))
+    }
+
+    // Create a new filing, load history, start a session, and write the system message.
+    // Returns (filing, session_ids) ready for the agent loop.
+    pub fn init(name: &str, cwd: &str, system_prompt: &str) -> eyre::Result<(Self, Vec<String>)> {
+        let sessions_dir = Self::default_dir()?;
+        let mut filing = Self::new(sessions_dir);
+        filing.load_all()?;
+        filing.new_session(name, cwd)?;
+
+        let sys_id = filing.next_id();
+        let sys_msg = Message::new(
+            sys_id.clone(),
+            Role::System,
+            vec![ContentBlock::text(system_prompt)],
+        );
+        filing.write_message(sys_msg)?;
+
+        Ok((filing, vec![sys_id]))
     }
 
     // Load all session files into the pool.

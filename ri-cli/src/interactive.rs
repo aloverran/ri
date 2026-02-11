@@ -24,17 +24,12 @@ pub async fn run(
     initial_prompt: Option<String>,
     thinking: ThinkingLevel,
 ) -> eyre::Result<()> {
-    let sessions_dir = SessionFiling::default_dir()?;
-    let mut filing = SessionFiling::new(sessions_dir);
-    filing.load_all()?;
-
     let session_name = session_name_from_prompt(initial_prompt.as_deref());
-    filing.new_session(&session_name, &cwd.display().to_string())?;
-
-    let sys_id = filing.next_id();
-    let sys_msg = Message::new(sys_id.clone(), Role::System, vec![ContentBlock::text(&system_prompt)]);
-    filing.write_message(sys_msg)?;
-    let mut session_ids = vec![sys_id];
+    let (mut filing, mut session_ids) = SessionFiling::init(
+        &session_name,
+        &cwd.display().to_string(),
+        &system_prompt,
+    )?;
 
     let config = RunConfig {
         model,
@@ -243,7 +238,7 @@ async fn run_local_callback_login(
 
         for param in query.split('&') {
             if let Some((key, value)) = param.split_once('=') {
-                let value = urldecoded(value);
+                let value = ri_ai::url::decode(value);
                 match key {
                     "code" => auth_code = Some(value),
                     "error" => error = Some(value),
@@ -270,21 +265,7 @@ async fn run_local_callback_login(
     Ok(())
 }
 
-fn urldecoded(s: &str) -> String {
-    let mut result = String::new();
-    let mut chars = s.bytes();
-    while let Some(b) = chars.next() {
-        if b == b'%' {
-            let hi = chars.next().unwrap_or(b'0');
-            let lo = chars.next().unwrap_or(b'0');
-            if let Ok(byte) = u8::from_str_radix(&format!("{}{}", hi as char, lo as char), 16) {
-                result.push(byte as char);
-            }
-        } else if b == b'+' { result.push(' '); }
-        else { result.push(b as char); }
-    }
-    result
-}
+
 
 fn display_event(evt: &AgentEvent) {
     match evt {

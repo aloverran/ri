@@ -45,4 +45,8 @@ Clean code also asks, what is the delta to making a change I want to make? It fo
 
 We avoid unnecessary code bloat or abstractions because it means that *changing* a small goal of the code requires large pieces to move or be added/deleted. We always take time to choose the right structures and architecture to build clean code. This is always worth the time up-front, we never rush.
 
+We try not to write longer code, where simpler code will do, because there is less surface area for introducing bugs in the future! For example we try to always use async primitives instead of cumbersome box/pin/etc.
+
+When we modify code, we don't just add/edit/remove willy nilly. We think of the codebase as a whole ecology, and take pride in how we "garden" it, how it's balanced, and how different elements interplay. We take time to think this through even if it doesn't immediately seem relevant because we care about the codebase as an entire artifact more than our specific immediate goal.
+
 In general, we always favor clean code over performance, because Rust is extremely fast by default. Even with allocations, copies, etc. We rarely try to prematurely optimize.

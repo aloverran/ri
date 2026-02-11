@@ -26,53 +26,22 @@ pub enum GeminiVariant {
     Antigravity,
 }
 
-// -- Credentials --
-
-#[derive(Clone, serde::Serialize, serde::Deserialize)]
-struct Credentials {
-    access: String,
-    refresh: String,
-    expires: u64,
-    #[serde(default)]
-    project_id: Option<String>,
-    #[serde(default)]
-    email: Option<String>,
-}
-
-impl Credentials {
-    fn is_expired(&self) -> bool {
-        let now = crate::epoch_ms();
-        now >= self.expires.saturating_sub(60_000)
-    }
-}
+use crate::creds::{self, Credentials};
 
 fn creds_path(variant: GeminiVariant) -> PathBuf {
     let name = match variant {
         GeminiVariant::Cli => "gemini_cli_auth.json",
         GeminiVariant::Antigravity => "gemini_antigravity_auth.json",
     };
-    dirs::home_dir().expect("No home directory").join(".ri").join(name)
+    creds::ri_dir().join(name)
 }
 
 fn load_creds(variant: GeminiVariant) -> Option<Credentials> {
-    let path = creds_path(variant);
-    let data = std::fs::read_to_string(&path).ok()?;
-    serde_json::from_str(&data).ok()
+    creds::load(&creds_path(variant))
 }
 
 fn save_creds(variant: GeminiVariant, creds: &Credentials) -> eyre::Result<()> {
-    let path = creds_path(variant);
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let data = serde_json::to_string_pretty(creds)?;
-    std::fs::write(&path, data)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
-    }
-    Ok(())
+    creds::save(&creds_path(variant), creds)
 }
 
 // -- OAuth constants --
@@ -269,11 +238,11 @@ impl LlmProvider for GeminiProvider {
         let auth_url = format!(
             "{}?client_id={}&response_type=code&redirect_uri={}&scope={}&code_challenge={}&code_challenge_method=S256&state={}&access_type=offline&prompt=consent",
             AUTH_URL,
-            urlencoded(&cfg.client_id),
-            urlencoded(cfg.redirect_uri),
-            urlencoded(&scopes),
-            urlencoded(&challenge),
-            urlencoded(&login_state),
+            crate::url::encode(&cfg.client_id),
+            crate::url::encode(cfg.redirect_uri),
+            crate::url::encode(&scopes),
+            crate::url::encode(&challenge),
+            crate::url::encode(&login_state),
         );
 
         if let Ok(mut state) = self.state.try_lock() {
@@ -336,7 +305,7 @@ impl LlmProvider for GeminiProvider {
         let refresh = data["refresh_token"].as_str()
             .ok_or_else(|| eyre::eyre!("No refresh token"))?.to_string();
         let expires_in = data["expires_in"].as_u64().unwrap_or(3600);
-        let expires = crate::epoch_ms() + (expires_in * 1000).saturating_sub(300_000);
+        let expires = Credentials::compute_expiry(expires_in);
 
         let email = get_user_email(&client, &access).await;
         let project_id = discover_project(&client, &access, self.variant).await?;
@@ -393,7 +362,7 @@ async fn refresh_token(credentials: &Credentials, variant: GeminiVariant) -> eyr
     let refresh = data["refresh_token"].as_str()
         .unwrap_or(&credentials.refresh).to_string();
     let expires_in = data["expires_in"].as_u64().unwrap_or(3600);
-    let expires = crate::epoch_ms() + (expires_in * 1000).saturating_sub(300_000);
+    let expires = Credentials::compute_expiry(expires_in);
 
     Ok(Credentials {
         refresh, access, expires,
@@ -917,14 +886,7 @@ fn event_stream(
     })
 }
 
-// -- URL encoding --
 
-fn urlencoded(s: &str) -> String {
-    s.bytes().map(|b| match b {
-        b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => (b as char).to_string(),
-        _ => format!("%{:02X}", b),
-    }).collect()
-}
 
 // -- System instructions --
 

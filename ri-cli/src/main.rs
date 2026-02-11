@@ -66,20 +66,12 @@ async fn main() -> Result<()> {
 
             let is_json = cli.mode == "json" || cli.output == "json";
 
-            let sessions_dir = SessionFiling::default_dir()?;
-            let mut filing = SessionFiling::new(sessions_dir);
-            filing.load_all()?;
-            filing.new_session("print", &cwd)?;
-
-            let sys_id = filing.next_id();
-            let sys_msg = Message::new(sys_id.clone(), Role::System, vec![ContentBlock::text(&system_prompt)]);
-            filing.write_message(sys_msg)?;
+            let (mut filing, mut session_ids) = SessionFiling::init("print", &cwd, &system_prompt)?;
 
             let user_id = filing.next_id();
             let user_msg = Message::new(user_id.clone(), Role::User, vec![ContentBlock::text(&prompt)]);
             filing.write_message(user_msg)?;
-
-            let mut session_ids = vec![sys_id, user_id];
+            session_ids.push(user_id);
 
             let config = agent::RunConfig {
                 model,

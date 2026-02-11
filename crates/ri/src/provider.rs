@@ -54,12 +54,6 @@ pub enum AuthMethod {
     LocalCallback { url: String, port: u16, path: String },
 }
 
-// Info about a provider for display in login UI etc.
-pub struct ProviderInfo {
-    pub id: &'static str,
-    pub name: &'static str,
-}
-
 // The trait that LLM providers implement.
 #[async_trait]
 pub trait LlmProvider: Send + Sync {

@@ -43,30 +43,13 @@ pub async fn run(
     initial_prompt: Option<String>,
     thinking: ThinkingLevel,
 ) {
-    let sessions_dir = match SessionFiling::default_dir() {
-        Ok(d) => d,
+    let (mut filing, mut session_ids) = match SessionFiling::init("rpc", &cwd.display().to_string(), &system_prompt) {
+        Ok(v) => v,
         Err(e) => {
-            output_json(&json!({"type": "error", "message": format!("Failed to init sessions: {}", e)}));
+            output_json(&json!({"type": "error", "message": format!("Failed to init session: {}", e)}));
             return;
         }
     };
-    let mut filing = SessionFiling::new(sessions_dir);
-    if let Err(e) = filing.load_all() {
-        output_json(&json!({"type": "error", "message": format!("Failed to load sessions: {}", e)}));
-        return;
-    }
-    if let Err(e) = filing.new_session("rpc", &cwd.display().to_string()) {
-        output_json(&json!({"type": "error", "message": format!("Failed to create session: {}", e)}));
-        return;
-    }
-
-    let sys_id = filing.next_id();
-    let sys_msg = Message::new(sys_id.clone(), Role::System, vec![ContentBlock::text(&system_prompt)]);
-    if let Err(e) = filing.write_message(sys_msg) {
-        output_json(&json!({"type": "error", "message": format!("Failed to write message: {}", e)}));
-        return;
-    }
-    let mut session_ids = vec![sys_id];
     let mut cb = RpcCallback;
 
     let config = RunConfig {
