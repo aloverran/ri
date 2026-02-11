@@ -52,3 +52,16 @@ When we modify code, we don't just add/edit/remove willy nilly. We think of the 
 In general, we always favor clean code over performance, because Rust is extremely fast by default. Even with allocations, copies, etc. We rarely try to prematurely optimize.
 
 On documentation and commenting, the more fundamental (used) or public something is, the more it deserves a doc comment. On the other hand, the more strange something is the more it deserves a comment. But we don't stress about documenting everything, we use good sense to help those who are ramping onto the codebase get their bearings and understand what the purpose of code is. Purpose is very helpful -- what purpose does this code serve in the broader system? That's what we aim to document, not what is obvious in the code itself.
+
+On API-design: A well-designed API has the property that any ordering of function calls to it forms a valid system state. These APIs form almost a language for expressing what you want out of them, and they are robust because changes to the way it is used do not create hidden bugs or put the system in an invalid state. Great APIs are often expressive: they are flexible, made of simple building blocks but with the ability to form various more-complex shapes.
+
+# Composability
+So what makes a system composable? I see two major properties:
+Self-Similarity — Composable systems usually have a simple primitive that is self-similar. Think of a game grid, tetris pieces, repeating tessellations, etc.  Self-similarity means most things can plug into other things. They may not do something useful, but they can be infinitely re-arranged.
+Merging / Splitting — Two groups of primitives can be merged into a single primitive, and that 'merged primitive' acts just like any other primitive. Similarly, a primitive can be split into several 'pieces' and each of those pieces acts like any other primitive.
+
+Take Legos, perhaps the most composable system in existence. So composable, in fact, that talking about them is almost reductive. Notice how not only can Legos be split into separate pieces, but they can be split in many different ways. Put another way, Legos have lots of seams: places where they can be split apart into component chunks.
+
+Lego chunks can be split along many different seams. A system with many seams is indicative of a very composable system: new behavior is built purely through composition, not by defining new primitives.
+
+I think about composability a lot in my game design work, why do some game mechanics have so much emergent behavior? We can see splitting/merging at work there too. Factorio, with its endlessly recombinable and splittable factory tiles. Or a roguelike deck-builders with their infinitely splittable/mergeable decks. Or an action game with 20 different abilities giving you an incredible number of seams to rip apart builds and reconfigure them.
