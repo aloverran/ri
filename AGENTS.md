@@ -29,9 +29,19 @@ None
 ### The "Gotchas" & Solutions
 #### The Send Bound Problem:
 Native async traits return an opaque future (impl Future). The compiler cannot automatically prove this future is Send. If you try to spawn this future on a multi-threaded runtime (like Tokio), it will fail to compile.
-Solution: Use the trait_variant crate or the #[async_trait] macro to explicitly enforce Send.
+Solution: #[async_trait] macro to explicitly enforce Send.
+
 #### The Dyn Dispatch Problem:
 Native async traits are generally not object-safe. You cannot use Box<dyn Database> because the trait returns an unnameable impl Future type, which varies per implementation.
-Solution: You must box the future manually or continue using #[async_trait], which handles the boxing for you.
+Solution: Use #[async_trait], which handles the boxing for you.
 
 
+## Clean Code
+
+What does clean code mean? It is not about being easy to read, or easy to 'maintain'. It is asking "if this code is perterbed by a small change, how likely is it to break? And secondly, how likely is that breakage to show up in a build?".
+
+Following from our philosophy of 1% bugs (ie. bugs that show up on 1% of users) being the worst possible bugs, clean code should make it *hard* to write these kinds of bugs. We avoid pin, manual futures, etc, because it's very easy to make a tiny change that then creates a bug that only fails in an occasional async situation. 
+
+Clean code also asks, what is the delta to making a change I want to make? It follows the idea that "friction is tooling bug". We avoid overuse of deep lifetime references in Rust because it means that a tiny change requires a massive refactor / rethreading of lifetimes.
+
+We avoid unnecessary code bloat or abstractions because it means that *changing* a small goal of the code requires large pieces to move or be added/deleted. We always take time to choose the right structures and architecture to build clean code. This is always worth the time up-front, we never rush.
