@@ -132,18 +132,6 @@ impl Message {
     pub fn user(text: impl Into<String>) -> Self {
         Self::new(gen_id(), Role::User, vec![ContentBlock::text(text)])
     }
-
-    pub fn assistant(text: impl Into<String>) -> Self {
-        Self::new(gen_id(), Role::Assistant, vec![ContentBlock::text(text)])
-    }
-
-    pub fn system(text: impl Into<String>) -> Self {
-        Self::new(gen_id(), Role::System, vec![ContentBlock::text(text)])
-    }
-
-    pub fn is_derived(&self) -> bool {
-        self.provenance.is_some()
-    }
 }
 
 // -- MessagePool --

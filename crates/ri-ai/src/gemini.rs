@@ -28,20 +28,20 @@ pub enum GeminiVariant {
 
 use crate::creds::{self, Credentials};
 
-fn creds_path(variant: GeminiVariant) -> PathBuf {
+fn creds_path(variant: GeminiVariant) -> eyre::Result<PathBuf> {
     let name = match variant {
         GeminiVariant::Cli => "gemini_cli_auth.json",
         GeminiVariant::Antigravity => "gemini_antigravity_auth.json",
     };
-    creds::ri_dir().join(name)
+    Ok(creds::ri_dir()?.join(name))
 }
 
 fn load_creds(variant: GeminiVariant) -> Option<Credentials> {
-    creds::load(&creds_path(variant))
+    creds::load(&creds_path(variant).ok()?)
 }
 
 fn save_creds(variant: GeminiVariant, creds: &Credentials) -> eyre::Result<()> {
-    creds::save(&creds_path(variant), creds)
+    creds::save(&creds_path(variant)?, creds)
 }
 
 // -- OAuth constants --

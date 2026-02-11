@@ -20,16 +20,16 @@ use crate::http;
 
 use crate::creds::{self, Credentials};
 
-fn creds_path() -> PathBuf {
-    creds::ri_dir().join("anthropic_auth.json")
+fn creds_path() -> eyre::Result<PathBuf> {
+    Ok(creds::ri_dir()?.join("anthropic_auth.json"))
 }
 
 fn load_creds() -> Option<Credentials> {
-    creds::load(&creds_path())
+    creds::load(&creds_path().ok()?)
 }
 
 fn save_creds(creds: &Credentials) -> eyre::Result<()> {
-    creds::save(&creds_path(), creds)
+    creds::save(&creds_path()?, creds)
 }
 
 // -- PKCE + OAuth constants --

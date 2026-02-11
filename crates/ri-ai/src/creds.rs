@@ -9,8 +9,8 @@ pub fn epoch_ms() -> u64 {
         .as_millis() as u64
 }
 
-pub fn ri_dir() -> PathBuf {
-    dirs::home_dir().expect("No home directory").join(".ri")
+pub fn ri_dir() -> eyre::Result<PathBuf> {
+    ri::home_dir()
 }
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]

@@ -20,29 +20,13 @@ pub struct SessionHeader {
     pub extra: HashMap<String, serde_json::Value>,
 }
 
-// -- Session info for listing --
-
-#[derive(Debug, Clone)]
-pub struct SessionInfo {
-    pub path: std::path::PathBuf,
-    pub name: String,
-    pub ts: String,
-    pub cwd: Option<String>,
-}
-
 pub struct SessionFiling {
     pub pool: MessagePool,
     sessions_dir: PathBuf,
-    active: Option<ActiveSession>,
+    active: Option<File>,
     // Session prefix for generating message IDs in the active session.
     active_prefix: String,
     active_counter: u64,
-}
-
-struct ActiveSession {
-    file: File,
-    path: PathBuf,
-    name: String,
 }
 
 impl SessionFiling {
@@ -57,9 +41,7 @@ impl SessionFiling {
     }
 
     pub fn default_dir() -> eyre::Result<PathBuf> {
-        let home = dirs::home_dir()
-            .ok_or_else(|| eyre::eyre!("Could not determine home directory"))?;
-        Ok(home.join(".ri").join("sessions"))
+        Ok(crate::home_dir()?.join("sessions"))
     }
 
     // Create a new filing, load history, start a session, and write the system message.
@@ -179,11 +161,7 @@ impl SessionFiling {
         // Generate prefix for message IDs.
         let prefix = gen_session_prefix(name);
 
-        self.active = Some(ActiveSession {
-            file,
-            path: path.clone(),
-            name: name.to_string(),
-        });
+        self.active = Some(file);
         self.active_prefix = prefix;
         self.active_counter = 0;
 
@@ -207,91 +185,16 @@ impl SessionFiling {
         }
         let id = msg.id.clone();
 
-        if let Some(ref mut session) = self.active {
+        if let Some(ref mut file) = self.active {
             let json = serde_json::to_string(&msg)?;
-            writeln!(session.file, "{}", json)?;
-            session.file.flush()?;
+            writeln!(file, "{}", json)?;
+            file.flush()?;
         }
 
         self.pool.put(msg);
         Ok(id)
     }
 
-    // List all sessions (from filenames + headers).
-    pub fn list_sessions(&self) -> eyre::Result<Vec<SessionInfo>> {
-        if !self.sessions_dir.exists() {
-            return Ok(Vec::new());
-        }
-
-        let mut sessions = Vec::new();
-        let mut entries: Vec<_> = fs::read_dir(&self.sessions_dir)?
-            .filter_map(|e| e.ok())
-            .filter(|e| {
-                e.path().extension()
-                    .map_or(false, |ext| ext == "jsonl")
-            })
-            .collect();
-
-        // Sort descending (newest first).
-        entries.sort_by(|a, b| b.file_name().cmp(&a.file_name()));
-
-        for entry in entries {
-            let path = entry.path();
-            match read_session_header(&path) {
-                Ok(info) => sessions.push(info),
-                Err(_) => continue,
-            }
-        }
-
-        Ok(sessions)
-    }
-
-    pub fn active_session_name(&self) -> Option<&str> {
-        self.active.as_ref().map(|s| s.name.as_str())
-    }
-
-    pub fn active_session_path(&self) -> Option<&Path> {
-        self.active.as_ref().map(|s| s.path.as_path())
-    }
-}
-
-fn read_session_header(path: &Path) -> eyre::Result<SessionInfo> {
-    let file = File::open(path)?;
-    let reader = BufReader::new(file);
-
-    for line in reader.lines() {
-        let line = line?;
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-
-        // First non-empty line should be the header.
-        if let Ok(obj) = serde_json::from_str::<serde_json::Value>(trimmed) {
-            if obj.get("session").is_some() && obj.get("role").is_none() {
-                if let Ok(header) = serde_json::from_str::<SessionHeader>(trimmed) {
-                    return Ok(SessionInfo {
-                        path: path.to_path_buf(),
-                        name: header.session,
-                        ts: header.ts,
-                        cwd: header.cwd,
-                    });
-                }
-            }
-        }
-        break;
-    }
-
-    // Fallback: derive from filename.
-    let stem = path.file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("unknown");
-    Ok(SessionInfo {
-        path: path.to_path_buf(),
-        name: stem.to_string(),
-        ts: String::new(),
-        cwd: None,
-    })
 }
 
 fn slugify(name: &str) -> String {
