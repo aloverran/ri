@@ -84,6 +84,8 @@ fn discover_context_files(global_dir: &Path, cwd: &Path) -> Vec<ContextFile> {
                 }
             }
         }
+        // Stop walking at repo root to avoid traversing into unrelated parent dirs.
+        if d.join(".git").exists() { break; }
         dir = d.parent().map(|p| p.to_path_buf());
     }
 

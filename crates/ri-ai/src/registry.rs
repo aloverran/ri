@@ -1,6 +1,6 @@
 // Provider registry -- simple list of all providers.
 
-use ri::{LlmProvider, Model, ModelCost};
+use ri::{LlmProvider, Model};
 use crate::{AnthropicProvider, GeminiProvider, GeminiVariant};
 
 pub fn all_providers() -> Vec<Box<dyn LlmProvider>> {
@@ -24,12 +24,9 @@ pub async fn resolve(model_id: &str) -> eyre::Result<(Box<dyn LlmProvider>, Mode
         }
     }
 
-    // Fallback: unknown model, use first provider with a default model.
-    let provider = Box::new(AnthropicProvider::new());
-    let model = Model {
-        id: model_id.into(), name: model_id.into(),
-        reasoning: false, context_window: 128_000, max_tokens: 16_384,
-        cost: ModelCost { input: 0.0, output: 0.0, cache_read: 0.0, cache_write: 0.0 },
-    };
-    Ok((provider, model))
+    let available: Vec<String> = all_providers().iter()
+        .flat_map(|p| p.models())
+        .map(|m| m.id)
+        .collect();
+    Err(eyre::eyre!("Unknown model '{}'. Available: {}", model_id, available.join(", ")))
 }

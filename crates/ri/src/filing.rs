@@ -8,8 +8,7 @@ use serde::{Serialize, Deserialize};
 use crate::message::{ContentBlock, Message, MessagePool, Role};
 use crate::id::{gen_id, gen_session_prefix};
 
-// -- Session header (first line of a session file) --
-
+/// Session header -- serialized as the first line of a .jsonl session file.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionHeader {
     pub session: String,
@@ -20,6 +19,8 @@ pub struct SessionHeader {
     pub extra: HashMap<String, serde_json::Value>,
 }
 
+/// Manages the message pool and active session file. Loads history from
+/// existing .jsonl files and writes new messages to the active session.
 pub struct SessionFiling {
     pub pool: MessagePool,
     sessions_dir: PathBuf,
@@ -44,8 +45,8 @@ impl SessionFiling {
         Ok(crate::home_dir()?.join("sessions"))
     }
 
-    // Create a new filing, load history, start a session, and write the system message.
-    // Returns (filing, session_ids) ready for the agent loop.
+    /// Create a new filing, load history, start a session, and write the system message.
+    /// Returns (filing, session_ids) ready for the agent loop.
     pub fn init(name: &str, cwd: &str, system_prompt: &str) -> eyre::Result<(Self, Vec<String>)> {
         let sessions_dir = Self::default_dir()?;
         let mut filing = Self::new(sessions_dir);
@@ -63,7 +64,7 @@ impl SessionFiling {
         Ok((filing, vec![sys_id]))
     }
 
-    // Load all session files into the pool.
+    /// Load all .jsonl session files from the sessions directory into the pool.
     pub fn load_all(&mut self) -> eyre::Result<()> {
         if !self.sessions_dir.exists() {
             return Ok(());
@@ -132,7 +133,7 @@ impl SessionFiling {
         Ok(())
     }
 
-    // Create a new session file and set it as active.
+    /// Create a new .jsonl session file and set it as active.
     pub fn new_session(&mut self, name: &str, cwd: &str) -> eyre::Result<PathBuf> {
         fs::create_dir_all(&self.sessions_dir)?;
 
@@ -168,7 +169,7 @@ impl SessionFiling {
         Ok(path)
     }
 
-    // Generate a new message ID for the active session.
+    /// Generate a new message ID for the active session.
     pub fn next_id(&mut self) -> String {
         self.active_counter += 1;
         if self.active_prefix.is_empty() {
@@ -178,7 +179,7 @@ impl SessionFiling {
         }
     }
 
-    // Write a message to the pool AND append to the active session file.
+    /// Write a message to the pool AND append to the active session file.
     pub fn write_message(&mut self, msg: Message) -> eyre::Result<String> {
         if msg.id.is_empty() {
             return Err(eyre::eyre!("Cannot write message with empty ID"));

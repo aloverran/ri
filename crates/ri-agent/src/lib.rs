@@ -1,9 +1,9 @@
-// Agent loop -- MessagePool-aware.
-//
-// The loop operates on the MessagePool (via SessionFiling) rather than a bare Vec.
-// A ContextStrategy selects which messages from the pool to send each turn.
-// New messages (assistant responses, tool results) are written through filing
-// (which puts them in the pool AND appends to the active session file).
+//! Agent loop -- MessagePool-aware.
+//!
+//! The loop operates on the MessagePool (via SessionFiling) rather than a bare Vec.
+//! A ContextStrategy selects which messages from the pool to send each turn.
+//! New messages (assistant responses, tool results) are written through filing
+//! (which puts them in the pool AND appends to the active session file).
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -14,7 +14,7 @@ use ri::{
     SessionFiling, StreamEvent, ThinkingLevel, ToolDef, ToolOutput, ToolSchema,
 };
 
-// What the agent loop emits to the caller.
+/// Events emitted by the agent loop for display, logging, or RPC output.
 #[derive(Debug, Clone)]
 pub enum AgentEvent {
     TurnStart,
@@ -23,20 +23,20 @@ pub enum AgentEvent {
     ToolStart { id: String, name: String },
     ToolEnd { id: String, output: String, is_error: bool },
     Error(String),
-    // Emitted after each message is fully constructed and persisted.
+    /// Emitted after each message is fully constructed and persisted.
     MessageComplete(Message),
 }
 
-// Strategy: given the pool and current session message IDs,
-// return the ordered list of message IDs for the next LLM call.
+/// Given the pool and current session message IDs, return the ordered
+/// list of message IDs to include in the next LLM call.
 pub type ContextStrategy = fn(&MessagePool, &[String]) -> Vec<String>;
 
-// Naive strategy: return all session message IDs in order.
+/// Naive strategy: include all session message IDs in order (no compaction).
 pub fn naive_strategy(_pool: &MessagePool, session_ids: &[String]) -> Vec<String> {
     session_ids.to_vec()
 }
 
-// Everything the agent loop needs for one run.
+/// Everything the agent loop needs for one run.
 pub struct RunConfig {
     pub model: Model,
     pub system_prompt: String,
@@ -47,13 +47,14 @@ pub struct RunConfig {
     pub strategy: ContextStrategy,
 }
 
-// Callback trait for event observation (display, logging, RPC output).
+/// Callback trait for event observation (display, logging, RPC output).
 pub trait AgentCallback {
     fn on_event(&mut self, event: AgentEvent);
 }
 
-// Run the agent loop: compose context from pool, stream LLM response,
-// execute tool calls, persist everything, repeat.
+/// Run the agent loop: compose context from pool, stream LLM response,
+/// execute tool calls, persist everything, repeat until the model stops
+/// issuing tool calls.
 pub async fn run(
     provider: &dyn LlmProvider,
     config: &RunConfig,

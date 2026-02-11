@@ -8,20 +8,20 @@ pub fn encode(s: &str) -> String {
 }
 
 pub fn decode(s: &str) -> String {
-    let mut result = String::new();
+    let mut buf = Vec::new();
     let mut bytes = s.bytes();
     while let Some(b) = bytes.next() {
         if b == b'%' {
             let hi = bytes.next().unwrap_or(b'0');
             let lo = bytes.next().unwrap_or(b'0');
             if let Ok(byte) = u8::from_str_radix(&format!("{}{}", hi as char, lo as char), 16) {
-                result.push(byte as char);
+                buf.push(byte);
             }
         } else if b == b'+' {
-            result.push(' ');
+            buf.push(b' ');
         } else {
-            result.push(b as char);
+            buf.push(b);
         }
     }
-    result
+    String::from_utf8_lossy(&buf).into_owned()
 }

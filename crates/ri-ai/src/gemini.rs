@@ -245,10 +245,11 @@ impl LlmProvider for GeminiProvider {
             crate::url::encode(&login_state),
         );
 
-        if let Ok(mut state) = self.state.try_lock() {
-            state.login_verifier = Some(verifier);
-            state.login_state = Some(login_state);
-        }
+        let mut state = self.state.try_lock()
+            .map_err(|_| eyre::eyre!("Provider state locked during login"))?;
+        state.login_verifier = Some(verifier);
+        state.login_state = Some(login_state);
+        drop(state);
 
         Ok(Some(AuthMethod::LocalCallback {
             url: auth_url,

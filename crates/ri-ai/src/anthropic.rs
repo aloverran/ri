@@ -3,6 +3,7 @@
 // Handles: model catalog, credential management, request building,
 // SSE interpretation, and login flow.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::pin::Pin;
 use async_trait::async_trait;
@@ -146,11 +147,11 @@ impl LlmProvider for AnthropicProvider {
             .append_pair("code_challenge_method", "S256")
             .append_pair("state", &login_state);
 
-        // Store PKCE state for complete_login
-        if let Ok(mut state) = self.state.try_lock() {
-            state.login_verifier = Some(verifier);
-            state.login_state = Some(login_state);
-        }
+        let mut state = self.state.try_lock()
+            .map_err(|_| eyre::eyre!("Provider state locked during login"))?;
+        state.login_verifier = Some(verifier);
+        state.login_state = Some(login_state);
+        drop(state);
 
         Ok(Some(AuthMethod::PasteCode { url: url.to_string() }))
     }
@@ -459,12 +460,12 @@ enum BlockKind {
 }
 
 struct StreamState {
-    blocks: Vec<BlockKind>,
+    blocks: HashMap<usize, BlockKind>,
 }
 
 impl StreamState {
     fn new() -> Self {
-        Self { blocks: Vec::new() }
+        Self { blocks: HashMap::new() }
     }
 
     fn interpret(&mut self, sse: &SseEvent) -> Vec<Result<StreamEvent, ApiError>> {
@@ -484,20 +485,17 @@ impl StreamState {
 
                 match block_type {
                     "text" => {
-                        while self.blocks.len() <= index { self.blocks.push(BlockKind::Text); }
-                        self.blocks[index] = BlockKind::Text;
+                        self.blocks.insert(index, BlockKind::Text);
                         out.push(Ok(StreamEvent::TextStart));
                     }
                     "thinking" => {
-                        while self.blocks.len() <= index { self.blocks.push(BlockKind::Text); }
-                        self.blocks[index] = BlockKind::Thinking;
+                        self.blocks.insert(index, BlockKind::Thinking);
                         out.push(Ok(StreamEvent::ThinkingStart));
                     }
                     "tool_use" => {
                         let id = parsed["content_block"]["id"].as_str().unwrap_or("").to_string();
                         let name = parsed["content_block"]["name"].as_str().unwrap_or("").to_string();
-                        while self.blocks.len() <= index { self.blocks.push(BlockKind::Text); }
-                        self.blocks[index] = BlockKind::ToolUse { id: id.clone() };
+                        self.blocks.insert(index, BlockKind::ToolUse { id: id.clone() });
                         out.push(Ok(StreamEvent::ToolCallStart { id, name }));
                     }
                     other => { warn!("Unknown content block type: {}", other); }
@@ -526,7 +524,7 @@ impl StreamState {
                     }
                     "input_json_delta" => {
                         let partial = parsed["delta"]["partial_json"].as_str().unwrap_or("").to_string();
-                        if let Some(BlockKind::ToolUse { id }) = self.blocks.get(index) {
+                        if let Some(BlockKind::ToolUse { id }) = self.blocks.get(&index) {
                             out.push(Ok(StreamEvent::ToolCallDelta {
                                 id: id.clone(),
                                 json_fragment: partial,
@@ -547,7 +545,7 @@ impl StreamState {
                     }
                 };
                 let index = parsed["index"].as_u64().unwrap_or(0) as usize;
-                if let Some(block) = self.blocks.get(index) {
+                if let Some(block) = self.blocks.get(&index) {
                     match block {
                         BlockKind::Text => out.push(Ok(StreamEvent::TextEnd { sig: None })),
                         BlockKind::Thinking => out.push(Ok(StreamEvent::ThinkingEnd { sig: None })),

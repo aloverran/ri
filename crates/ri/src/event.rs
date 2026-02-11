@@ -1,4 +1,5 @@
-// Normalized stream events, shared across providers.
+/// Normalized stream events emitted by LLM providers during response streaming.
+/// The agent loop consumes these to accumulate content blocks and detect tool calls.
 #[derive(Debug, Clone)]
 pub enum StreamEvent {
     TextStart,

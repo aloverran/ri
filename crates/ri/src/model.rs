@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-// Model definition (provider-level).
+/// An LLM model with its capabilities and pricing.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Model {
     pub id: String,
@@ -11,6 +11,7 @@ pub struct Model {
     pub cost: ModelCost,
 }
 
+/// Per-million-token pricing for a model.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelCost {
     pub input: f64,
