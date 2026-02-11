@@ -1,8 +1,7 @@
 # Rust Guidelines
 
 While rust gives us lots of tools to maximize performance, we aim for the subset of Rust that gives us 90% performance 
-but allows us to avoid some of the particularly annoying syntax and lifetimes. For instance, using owned values in POD data
-structs, instead of references which require feeding through lifetimes. In general the <'a> generic lifetime syntax should be used sparingly, only in situations where it is truly valuable to reference another object.
+but allows us to avoid some of the particularly annoying syntax and lifetimes. 
 
 ## Async in Traits
 Async functions in traits are stable in Rust (since version 1.75.0, released December 2023)! You can now write async fn directly inside trait definitions without external crates.
@@ -45,3 +44,5 @@ Following from our philosophy of 1% bugs (ie. bugs that show up on 1% of users) 
 Clean code also asks, what is the delta to making a change I want to make? It follows the idea that "friction is tooling bug". We avoid overuse of deep lifetime references in Rust because it means that a tiny change requires a massive refactor / rethreading of lifetimes.
 
 We avoid unnecessary code bloat or abstractions because it means that *changing* a small goal of the code requires large pieces to move or be added/deleted. We always take time to choose the right structures and architecture to build clean code. This is always worth the time up-front, we never rush.
+
+In general, we always favor clean code over performance, because Rust is extremely fast by default. Even with allocations, copies, etc. We rarely try to prematurely optimize.
