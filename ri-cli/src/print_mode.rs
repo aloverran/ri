@@ -69,6 +69,7 @@ pub fn event_to_json(evt: &AgentEvent) -> serde_json::Value {
             StreamEvent::ToolCallStart { id, name } => json!({"type": "toolcall_start", "id": id, "name": name}),
             StreamEvent::ToolCallDelta { id, json_fragment } => json!({"type": "toolcall_delta", "id": id, "delta": json_fragment}),
             StreamEvent::ToolCallEnd { id, .. } => json!({"type": "toolcall_end", "id": id}),
+            StreamEvent::Usage(u) => json!({"type": "usage", "input_tokens": u.input_tokens, "output_tokens": u.output_tokens, "cache_read_tokens": u.cache_read_tokens, "cache_write_tokens": u.cache_write_tokens}),
             StreamEvent::Done => json!({"type": "done"}),
             StreamEvent::Error(msg) => json!({"type": "stream_error", "message": msg}),
         },

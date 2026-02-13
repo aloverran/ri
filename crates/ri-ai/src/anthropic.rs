@@ -14,7 +14,7 @@ use tracing::warn;
 
 use ri::{
     ApiError, AuthMethod, ContentBlock, EventStream, LlmProvider, Message, Model, ModelCost,
-    RequestOptions, Role, StreamEvent, ThinkingLevel, ToolSchema,
+    RequestOptions, Role, StreamEvent, ThinkingLevel, ToolSchema, Usage,
 };
 use crate::sse::{SseEvent, SseParser};
 use crate::http;
@@ -461,11 +461,12 @@ enum BlockKind {
 
 struct StreamState {
     blocks: HashMap<usize, BlockKind>,
+    usage: Usage,
 }
 
 impl StreamState {
     fn new() -> Self {
-        Self { blocks: HashMap::new() }
+        Self { blocks: HashMap::new(), usage: Usage::default() }
     }
 
     fn interpret(&mut self, sse: &SseEvent) -> Vec<Result<StreamEvent, ApiError>> {
@@ -556,8 +557,30 @@ impl StreamState {
                 }
             }
 
-            "message_start" | "message_delta" | "ping" => {}
+            "message_start" => {
+                if let Ok(parsed) = serde_json::from_str::<Value>(&sse.data) {
+                    if let Some(usage) = parsed.get("message").and_then(|m| m.get("usage")) {
+                        if let Some(n) = usage["input_tokens"].as_u64() { self.usage.input_tokens = n; }
+                        if let Some(n) = usage["cache_read_input_tokens"].as_u64() { self.usage.cache_read_tokens = n; }
+                        if let Some(n) = usage["cache_creation_input_tokens"].as_u64() { self.usage.cache_write_tokens = n; }
+                    }
+                }
+            }
+
+            "message_delta" => {
+                if let Ok(parsed) = serde_json::from_str::<Value>(&sse.data) {
+                    if let Some(usage) = parsed.get("usage") {
+                        if let Some(n) = usage["output_tokens"].as_u64() { self.usage.output_tokens = n; }
+                    }
+                }
+            }
+
+            "ping" => {}
             "message_stop" => {
+                let u = &self.usage;
+                if u.input_tokens > 0 || u.output_tokens > 0 {
+                    out.push(Ok(StreamEvent::Usage(u.clone())));
+                }
                 out.push(Ok(StreamEvent::Done));
             }
 

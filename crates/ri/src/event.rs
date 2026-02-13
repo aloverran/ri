@@ -1,3 +1,5 @@
+use crate::message::Usage;
+
 /// Normalized stream events emitted by LLM providers during response streaming.
 /// The agent loop consumes these to accumulate content blocks and detect tool calls.
 #[derive(Debug, Clone)]
@@ -11,6 +13,7 @@ pub enum StreamEvent {
     ToolCallStart { id: String, name: String },
     ToolCallDelta { id: String, json_fragment: String },
     ToolCallEnd { id: String, sig: Option<String> },
+    Usage(Usage),
     Done,
     Error(String),
 }

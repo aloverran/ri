@@ -59,7 +59,7 @@ pub async fn run(
         thinking,
         max_tokens: None,
         cwd,
-        strategy: agent::naive_strategy,
+        strategy: agent::naive_strategy(),
     };
 
     if let Some(prompt) = initial_prompt {

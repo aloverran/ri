@@ -80,7 +80,7 @@ async fn main() -> Result<()> {
                 thinking,
                 max_tokens: None,
                 cwd: cwd_path,
-                strategy: agent::naive_strategy,
+                strategy: agent::naive_strategy(),
             };
 
             let cancel = tokio_util::sync::CancellationToken::new();

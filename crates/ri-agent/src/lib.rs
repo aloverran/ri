@@ -11,7 +11,7 @@ use futures::StreamExt;
 
 use ri::{
     ContentBlock, LlmProvider, Message, MessagePool, Model, Provenance, RequestOptions, Role,
-    SessionFiling, StreamEvent, ThinkingLevel, ToolDef, ToolOutput, ToolSchema,
+    SessionFiling, StreamEvent, ThinkingLevel, ToolDef, ToolOutput, ToolSchema, Usage,
 };
 
 /// Events emitted by the agent loop for display, logging, or RPC output.
@@ -29,11 +29,11 @@ pub enum AgentEvent {
 
 /// Given the pool and current session message IDs, return the ordered
 /// list of message IDs to include in the next LLM call.
-pub type ContextStrategy = fn(&MessagePool, &[String]) -> Vec<String>;
+pub type ContextStrategy = Box<dyn Fn(&MessagePool, &[String]) -> Vec<String> + Send + Sync>;
 
 /// Naive strategy: include all session message IDs in order (no compaction).
-pub fn naive_strategy(_pool: &MessagePool, session_ids: &[String]) -> Vec<String> {
-    session_ids.to_vec()
+pub fn naive_strategy() -> ContextStrategy {
+    Box::new(|_pool, session_ids| session_ids.to_vec())
 }
 
 /// Everything the agent loop needs for one run.
@@ -106,6 +106,7 @@ pub async fn run(
         let mut thinking_buf = String::new();
         let mut tool_calls: HashMap<String, (String, String)> = HashMap::new();
         let mut content_blocks: Vec<ContentBlock> = Vec::new();
+        let mut usage: Option<Usage> = None;
 
         while let Some(event) = stream.next().await {
             if cancel.is_cancelled() { break; }
@@ -170,6 +171,7 @@ pub async fn run(
                                 });
                             }
                         }
+                        StreamEvent::Usage(u) => { usage = Some(u.clone()); }
                         StreamEvent::Done => {}
                         StreamEvent::Error(msg) => {
                             cb.on_event(AgentEvent::Error(msg.clone()));
@@ -208,7 +210,7 @@ pub async fn run(
                 input: input_ids,
                 model: config.model.id.clone(),
                 ts,
-                usage: None,
+                usage,
             }),
             meta: None,
             extra: HashMap::new(),

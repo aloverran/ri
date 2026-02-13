@@ -13,7 +13,7 @@ use tokio::sync::Mutex;
 
 use ri::{
     ApiError, AuthMethod, ContentBlock, EventStream, LlmProvider, Message, Model, ModelCost,
-    RequestOptions, Role, StreamEvent, ThinkingLevel,
+    RequestOptions, Role, StreamEvent, ThinkingLevel, Usage,
 };
 use crate::sse::{SseEvent, SseParser};
 use crate::http;
@@ -720,11 +720,19 @@ enum GeminiBlock {
 struct GeminiState {
     current_block: Option<GeminiBlock>,
     tool_call_counter: u64,
+    usage: Usage,
 }
 
 impl GeminiState {
     fn new() -> Self {
-        Self { current_block: None, tool_call_counter: 0 }
+        Self { current_block: None, tool_call_counter: 0, usage: Usage::default() }
+    }
+
+    fn emit_usage(&self, out: &mut Vec<Result<StreamEvent, ApiError>>) {
+        let u = &self.usage;
+        if u.input_tokens > 0 || u.output_tokens > 0 {
+            out.push(Ok(StreamEvent::Usage(u.clone())));
+        }
     }
 
     fn interpret(&mut self, sse: &SseEvent) -> Vec<Result<StreamEvent, ApiError>> {
@@ -733,6 +741,7 @@ impl GeminiState {
         if sse.data.is_empty() { return out; }
         if sse.data == "[DONE]" {
             self.finish_block(&mut out);
+            self.emit_usage(&mut out);
             out.push(Ok(StreamEvent::Done));
             return out;
         }
@@ -769,8 +778,15 @@ impl GeminiState {
             }
         }
 
+        if let Some(um) = response.get("usageMetadata") {
+            if let Some(n) = um["promptTokenCount"].as_u64() { self.usage.input_tokens = n; }
+            if let Some(n) = um["candidatesTokenCount"].as_u64() { self.usage.output_tokens = n; }
+            if let Some(n) = um["cachedContentTokenCount"].as_u64() { self.usage.cache_read_tokens = n; }
+        }
+
         if let Some(reason) = candidate.get("finishReason").and_then(|r| r.as_str()) {
             self.finish_block(&mut out);
+            self.emit_usage(&mut out);
             match reason {
                 "STOP" | "MAX_TOKENS" => out.push(Ok(StreamEvent::Done)),
                 other => {
@@ -882,6 +898,10 @@ fn event_stream(
             for event in state.interpret(&sse) {
                 yield event;
             }
+        }
+        let u = &state.usage;
+        if u.input_tokens > 0 || u.output_tokens > 0 {
+            yield Ok(StreamEvent::Usage(u.clone()));
         }
         yield Ok(StreamEvent::Done);
     })

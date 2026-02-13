@@ -157,6 +157,66 @@ impl MessagePool {
     pub fn resolve_existing(&self, ids: &[String]) -> Vec<&Message> {
         ids.iter().filter_map(|id| self.messages.get(id.as_str())).collect()
     }
+
+    pub fn len(&self) -> usize {
+        self.messages.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.messages.is_empty()
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (&String, &Message)> {
+        self.messages.iter()
+    }
+
+    /// All messages whose provenance.input contains the given ID.
+    pub fn derived_from(&self, id: &str) -> Vec<&Message> {
+        self.messages.values()
+            .filter(|m| {
+                m.provenance.as_ref()
+                    .map_or(false, |p| p.input.iter().any(|i| i == id))
+            })
+            .collect()
+    }
+
+    /// Walk provenance.input recursively to find all ancestor messages.
+    pub fn ancestors(&self, id: &str) -> Vec<&Message> {
+        let mut visited = std::collections::HashSet::new();
+        let mut stack = vec![id.to_string()];
+        let mut result = Vec::new();
+
+        while let Some(current) = stack.pop() {
+            if !visited.insert(current.clone()) { continue; }
+            if let Some(msg) = self.messages.get(&current) {
+                if current != id {
+                    result.push(msg);
+                }
+                if let Some(prov) = &msg.provenance {
+                    for input_id in &prov.input {
+                        if !visited.contains(input_id) {
+                            stack.push(input_id.clone());
+                        }
+                    }
+                }
+            }
+        }
+        result
+    }
+
+    /// All derived messages (messages with provenance).
+    pub fn derived(&self) -> Vec<&Message> {
+        self.messages.values()
+            .filter(|m| m.provenance.is_some())
+            .collect()
+    }
+
+    /// All authored messages (messages without provenance).
+    pub fn authored(&self) -> Vec<&Message> {
+        self.messages.values()
+            .filter(|m| m.provenance.is_none())
+            .collect()
+    }
 }
 
 impl Default for MessagePool {
