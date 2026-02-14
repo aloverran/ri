@@ -398,17 +398,15 @@ async fn discover_project(
             }))
             .send().await;
 
-        if let Ok(resp) = resp {
-            if resp.status().is_success() {
-                if let Ok(data) = resp.json::<Value>().await {
-                    if let Some(id) = data["cloudaicompanionProject"].as_str() {
-                        if !id.is_empty() { return Ok(id.to_string()); }
-                    }
-                    if let Some(id) = data["cloudaicompanionProject"]["id"].as_str() {
-                        if !id.is_empty() { return Ok(id.to_string()); }
-                    }
-                }
-            }
+        let Ok(resp) = resp else { continue; };
+        if !resp.status().is_success() { continue; }
+        let Ok(data) = resp.json::<Value>().await else { continue; };
+
+        let project = data["cloudaicompanionProject"].as_str()
+            .filter(|s| !s.is_empty())
+            .or_else(|| data["cloudaicompanionProject"]["id"].as_str().filter(|s| !s.is_empty()));
+        if let Some(id) = project {
+            return Ok(id.to_string());
         }
     }
 
