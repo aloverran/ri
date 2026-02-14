@@ -4,6 +4,7 @@
 //   Cli:          standard Gemini models via cloudcode-pa.googleapis.com
 //   Antigravity:  Gemini 3 via daily-cloudcode-pa.sandbox.googleapis.com
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::pin::Pin;
 use async_trait::async_trait;
@@ -555,7 +556,7 @@ fn build_body(variant: GeminiVariant, project_id: &str, opts: &RequestOptions) -
 fn build_contents(messages: &[Message], model_id: &str) -> Vec<Value> {
     let is_gemini3 = model_id.contains("3-pro") || model_id.contains("3-flash");
 
-    let mut tool_names: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut tool_names: HashMap<String, String> = HashMap::new();
     for msg in messages {
         for block in &msg.content {
             if let ContentBlock::ToolUse { id, name, .. } = block {
@@ -576,7 +577,10 @@ fn build_contents(messages: &[Message], model_id: &str) -> Vec<Value> {
                 if let ContentBlock::ToolResult { tool_use_id, content, is_error, .. } = c {
                     let tool_name = tool_names.get(tool_use_id.as_str())
                         .cloned()
-                        .unwrap_or_else(|| "unknown".to_string());
+                        .unwrap_or_else(|| {
+                            tracing::warn!("No tool name found for tool_use_id '{}'", tool_use_id);
+                            "unknown".to_string()
+                        });
                     let output_text: String = content.iter().filter_map(|b| {
                         if let ContentBlock::Text { text, .. } = b { Some(text.as_str()) } else { None }
                     }).collect::<Vec<_>>().join("\n");
