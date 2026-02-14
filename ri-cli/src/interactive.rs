@@ -22,291 +22,6 @@ use reedline::{
 };
 
 // ---------------------------------------------------------------------------
-// Prompt
-// ---------------------------------------------------------------------------
-
-struct RiPrompt;
-
-impl Prompt for RiPrompt {
-    fn render_prompt_left(&self) -> Cow<'_, str> {
-        Cow::Borrowed("ri")
-    }
-
-    fn render_prompt_right(&self) -> Cow<'_, str> {
-        Cow::Borrowed("")
-    }
-
-    fn render_prompt_indicator(&self, _mode: PromptEditMode) -> Cow<'_, str> {
-        Cow::Borrowed("> ")
-    }
-
-    fn render_prompt_multiline_indicator(&self) -> Cow<'_, str> {
-        Cow::Borrowed(".. ")
-    }
-
-    fn render_prompt_history_search_indicator(
-        &self,
-        history_search: PromptHistorySearch,
-    ) -> Cow<'_, str> {
-        let prefix = match history_search.status {
-            PromptHistorySearchStatus::Passing => "",
-            PromptHistorySearchStatus::Failing => "(failed) ",
-        };
-        Cow::Owned(format!("{}search: {} ", prefix, history_search.term))
-    }
-
-    fn get_prompt_color(&self) -> Color {
-        Color::Cyan
-    }
-
-    fn get_indicator_color(&self) -> Color {
-        Color::Cyan
-    }
-}
-
-// ---------------------------------------------------------------------------
-// TUI renderer -- drives the inline viewport during agent streaming
-// ---------------------------------------------------------------------------
-
-/// Height of the inline viewport: 1 border line + 1 content line.
-const VIEWPORT_HEIGHT: u16 = 2;
-
-/// Rendering phase for the status viewport.
-enum Phase {
-    Waiting,
-    Thinking,
-    Responding,
-    Tool { name: String },
-    Idle,
-}
-
-/// Renders agent events into a ratatui inline viewport. Completed content
-/// (thinking lines, rendered markdown, tool results) is pushed above the
-/// viewport via `insert_before` so it lives in terminal scrollback.
-/// The viewport itself is a small 2-line status bar showing current activity.
-struct TuiRenderer {
-    terminal: Terminal<CrosstermBackend<io::Stdout>>,
-    phase: Phase,
-    /// Accumulates response text during streaming; rendered as markdown on TextEnd.
-    text_buf: String,
-    /// Accumulates the current incomplete thinking line for streaming to scrollback.
-    thinking_line: String,
-    tick: usize,
-}
-
-impl TuiRenderer {
-    fn new() -> eyre::Result<Self> {
-        crossterm::terminal::enable_raw_mode()?;
-
-        let backend = CrosstermBackend::new(io::stdout());
-        let terminal = Terminal::with_options(
-            backend,
-            TerminalOptions {
-                viewport: Viewport::Inline(VIEWPORT_HEIGHT),
-            },
-        )?;
-
-        let mut renderer = Self {
-            terminal,
-            phase: Phase::Waiting,
-            text_buf: String::new(),
-            thinking_line: String::new(),
-            tick: 0,
-        };
-
-        // Draw immediately so the viewport is never blank.
-        renderer.render_viewport();
-
-        Ok(renderer)
-    }
-
-    /// Push a single styled line into terminal scrollback above the viewport.
-    fn emit_line(&mut self, line: Line<'static>) {
-        let _ = self.terminal.insert_before(1, |buf| {
-            Paragraph::new(line).render(buf.area, buf);
-        });
-    }
-
-    /// Render markdown text and push it into scrollback above the viewport.
-    fn emit_markdown(&mut self, md: &str) {
-        if md.trim().is_empty() {
-            return;
-        }
-        let text = tui_markdown::from_str(md);
-        if text.lines.is_empty() {
-            return;
-        }
-
-        let width = self.terminal.size().map(|s| s.width).unwrap_or(80);
-        let para = Paragraph::new(text).wrap(Wrap { trim: false });
-        let height = para.line_count(width);
-
-        if height == 0 {
-            return;
-        }
-
-        let height = height.min(u16::MAX as usize) as u16;
-        let _ = self.terminal.insert_before(height, |buf| {
-            (&para).render(buf.area, buf);
-        });
-    }
-
-    /// Flush any complete thinking lines (ending with '\n') into scrollback as dim text.
-    fn flush_thinking_lines(&mut self) {
-        while let Some(pos) = self.thinking_line.find('\n') {
-            let line_text: String = self.thinking_line.drain(..=pos).collect();
-            let trimmed = line_text.trim_end();
-            if !trimmed.is_empty() {
-                self.emit_line(Line::styled(
-                    trimmed.to_string(),
-                    Style::default().add_modifier(Modifier::DIM),
-                ));
-            }
-        }
-    }
-
-    /// Draw the 2-line status viewport (border + content).
-    fn render_viewport(&mut self) {
-        self.tick += 1;
-        let spinner = spinner_frame(self.tick);
-
-        let (title, detail) = match &self.phase {
-            Phase::Waiting => ("waiting", "sending request...".to_string()),
-            Phase::Thinking => ("thinking", tail_line(&self.thinking_line)),
-            Phase::Responding => ("responding", tail_line(&self.text_buf)),
-            Phase::Tool { name } => ("tool", format!("executing: {}", name)),
-            Phase::Idle => ("idle", String::new()),
-        };
-
-        let title_str = format!(" {} {} ", spinner, title);
-
-        let _ = self.terminal.draw(|frame| {
-            let area = frame.area();
-            let block = Block::default()
-                .borders(Borders::TOP)
-                .title(title_str)
-                .style(Style::default().add_modifier(Modifier::DIM));
-
-            let inner = block.inner(area);
-            frame.render_widget(block, area);
-
-            let para = Paragraph::new(detail)
-                .style(Style::default().add_modifier(Modifier::DIM))
-                .wrap(Wrap { trim: false });
-            frame.render_widget(para, inner);
-        });
-    }
-
-    fn handle(&mut self, evt: &AgentEvent) {
-        match evt {
-            AgentEvent::Stream(se) => match se {
-                StreamEvent::ThinkingStart => {
-                    self.thinking_line.clear();
-                    self.phase = Phase::Thinking;
-                    self.render_viewport();
-                }
-                StreamEvent::ThinkingDelta(d) => {
-                    self.thinking_line.push_str(d);
-                    self.flush_thinking_lines();
-                    self.render_viewport();
-                }
-                StreamEvent::ThinkingEnd { .. } => {
-                    // Flush any remaining incomplete thinking line.
-                    if !self.thinking_line.is_empty() {
-                        let remaining = std::mem::take(&mut self.thinking_line);
-                        self.emit_line(Line::styled(
-                            remaining,
-                            Style::default().add_modifier(Modifier::DIM),
-                        ));
-                    }
-                    self.phase = Phase::Idle;
-                }
-
-                StreamEvent::TextStart => {
-                    self.text_buf.clear();
-                    self.phase = Phase::Responding;
-                    self.render_viewport();
-                }
-                StreamEvent::TextDelta(d) => {
-                    self.text_buf.push_str(d);
-                    self.render_viewport();
-                }
-                StreamEvent::TextEnd { .. } => {
-                    let text = std::mem::take(&mut self.text_buf);
-                    self.emit_markdown(&text);
-                    self.phase = Phase::Idle;
-                }
-
-                StreamEvent::ToolCallStart { name, .. } => {
-                    self.emit_line(Line::from(vec![
-                        Span::styled("tool: ", Style::default().fg(ratatui::style::Color::Yellow)),
-                        Span::raw(name.clone()),
-                    ]));
-                }
-
-                StreamEvent::Error(msg) => {
-                    self.emit_line(Line::styled(
-                        format!("error: {}", msg),
-                        Style::default().fg(ratatui::style::Color::Red),
-                    ));
-                }
-
-                StreamEvent::Usage(u) => {
-                    let usage_str = format!(
-                        "tokens: {} in / {} out / {} cached",
-                        u.input_tokens, u.output_tokens, u.cache_read_tokens
-                    );
-                    self.emit_line(Line::styled(
-                        usage_str,
-                        Style::default().add_modifier(Modifier::DIM),
-                    ));
-                }
-
-                _ => {}
-            },
-
-            AgentEvent::ToolStart { name, .. } => {
-                self.phase = Phase::Tool { name: name.clone() };
-                self.render_viewport();
-            }
-
-            AgentEvent::ToolEnd { output, is_error, .. } => {
-                if *is_error {
-                    self.emit_line(Line::styled(
-                        format!("tool error: {}", truncate(output, 200)),
-                        Style::default().fg(ratatui::style::Color::Red),
-                    ));
-                } else {
-                    self.emit_line(Line::styled(
-                        format!("result: {}", truncate(output, 200)),
-                        Style::default().add_modifier(Modifier::DIM),
-                    ));
-                }
-                self.phase = Phase::Idle;
-                self.render_viewport();
-            }
-
-            AgentEvent::Error(msg) => {
-                self.emit_line(Line::styled(
-                    format!("error: {}", msg),
-                    Style::default().fg(ratatui::style::Color::Red),
-                ));
-            }
-
-            AgentEvent::MessageComplete(_) => {}
-        }
-    }
-
-    /// Clear the viewport and restore normal terminal mode.
-    fn teardown(self) {
-        drop(self.terminal);
-        let _ = crossterm::terminal::disable_raw_mode();
-        // Newline so the next reedline prompt starts on a fresh line.
-        println!();
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Main interactive loop
 // ---------------------------------------------------------------------------
 
@@ -578,6 +293,291 @@ async fn run_local_callback_login(
 
     provider.complete_login(&code).await?;
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// TUI renderer -- drives the inline viewport during agent streaming
+// ---------------------------------------------------------------------------
+
+/// Height of the inline viewport: 1 border line + 1 content line.
+const VIEWPORT_HEIGHT: u16 = 2;
+
+/// Rendering phase for the status viewport.
+enum Phase {
+    Waiting,
+    Thinking,
+    Responding,
+    Tool { name: String },
+    Idle,
+}
+
+/// Renders agent events into a ratatui inline viewport. Completed content
+/// (thinking lines, rendered markdown, tool results) is pushed above the
+/// viewport via `insert_before` so it lives in terminal scrollback.
+/// The viewport itself is a small 2-line status bar showing current activity.
+struct TuiRenderer {
+    terminal: Terminal<CrosstermBackend<io::Stdout>>,
+    phase: Phase,
+    /// Accumulates response text during streaming; rendered as markdown on TextEnd.
+    text_buf: String,
+    /// Accumulates the current incomplete thinking line for streaming to scrollback.
+    thinking_line: String,
+    tick: usize,
+}
+
+impl TuiRenderer {
+    fn new() -> eyre::Result<Self> {
+        crossterm::terminal::enable_raw_mode()?;
+
+        let backend = CrosstermBackend::new(io::stdout());
+        let terminal = Terminal::with_options(
+            backend,
+            TerminalOptions {
+                viewport: Viewport::Inline(VIEWPORT_HEIGHT),
+            },
+        )?;
+
+        let mut renderer = Self {
+            terminal,
+            phase: Phase::Waiting,
+            text_buf: String::new(),
+            thinking_line: String::new(),
+            tick: 0,
+        };
+
+        // Draw immediately so the viewport is never blank.
+        renderer.render_viewport();
+
+        Ok(renderer)
+    }
+
+    /// Push a single styled line into terminal scrollback above the viewport.
+    fn emit_line(&mut self, line: Line<'static>) {
+        let _ = self.terminal.insert_before(1, |buf| {
+            Paragraph::new(line).render(buf.area, buf);
+        });
+    }
+
+    /// Render markdown text and push it into scrollback above the viewport.
+    fn emit_markdown(&mut self, md: &str) {
+        if md.trim().is_empty() {
+            return;
+        }
+        let text = tui_markdown::from_str(md);
+        if text.lines.is_empty() {
+            return;
+        }
+
+        let width = self.terminal.size().map(|s| s.width).unwrap_or(80);
+        let para = Paragraph::new(text).wrap(Wrap { trim: false });
+        let height = para.line_count(width);
+
+        if height == 0 {
+            return;
+        }
+
+        let height = height.min(u16::MAX as usize) as u16;
+        let _ = self.terminal.insert_before(height, |buf| {
+            (&para).render(buf.area, buf);
+        });
+    }
+
+    /// Flush any complete thinking lines (ending with '\n') into scrollback as dim text.
+    fn flush_thinking_lines(&mut self) {
+        while let Some(pos) = self.thinking_line.find('\n') {
+            let line_text: String = self.thinking_line.drain(..=pos).collect();
+            let trimmed = line_text.trim_end();
+            if !trimmed.is_empty() {
+                self.emit_line(Line::styled(
+                    trimmed.to_string(),
+                    Style::default().add_modifier(Modifier::DIM),
+                ));
+            }
+        }
+    }
+
+    /// Draw the 2-line status viewport (border + content).
+    fn render_viewport(&mut self) {
+        self.tick += 1;
+        let spinner = spinner_frame(self.tick);
+
+        let (title, detail) = match &self.phase {
+            Phase::Waiting => ("waiting", "sending request...".to_string()),
+            Phase::Thinking => ("thinking", tail_line(&self.thinking_line)),
+            Phase::Responding => ("responding", tail_line(&self.text_buf)),
+            Phase::Tool { name } => ("tool", format!("executing: {}", name)),
+            Phase::Idle => ("idle", String::new()),
+        };
+
+        let title_str = format!(" {} {} ", spinner, title);
+
+        let _ = self.terminal.draw(|frame| {
+            let area = frame.area();
+            let block = Block::default()
+                .borders(Borders::TOP)
+                .title(title_str)
+                .style(Style::default().add_modifier(Modifier::DIM));
+
+            let inner = block.inner(area);
+            frame.render_widget(block, area);
+
+            let para = Paragraph::new(detail)
+                .style(Style::default().add_modifier(Modifier::DIM))
+                .wrap(Wrap { trim: false });
+            frame.render_widget(para, inner);
+        });
+    }
+
+    fn handle(&mut self, evt: &AgentEvent) {
+        match evt {
+            AgentEvent::Stream(se) => match se {
+                StreamEvent::ThinkingStart => {
+                    self.thinking_line.clear();
+                    self.phase = Phase::Thinking;
+                    self.render_viewport();
+                }
+                StreamEvent::ThinkingDelta(d) => {
+                    self.thinking_line.push_str(d);
+                    self.flush_thinking_lines();
+                    self.render_viewport();
+                }
+                StreamEvent::ThinkingEnd { .. } => {
+                    // Flush any remaining incomplete thinking line.
+                    if !self.thinking_line.is_empty() {
+                        let remaining = std::mem::take(&mut self.thinking_line);
+                        self.emit_line(Line::styled(
+                            remaining,
+                            Style::default().add_modifier(Modifier::DIM),
+                        ));
+                    }
+                    self.phase = Phase::Idle;
+                }
+
+                StreamEvent::TextStart => {
+                    self.text_buf.clear();
+                    self.phase = Phase::Responding;
+                    self.render_viewport();
+                }
+                StreamEvent::TextDelta(d) => {
+                    self.text_buf.push_str(d);
+                    self.render_viewport();
+                }
+                StreamEvent::TextEnd { .. } => {
+                    let text = std::mem::take(&mut self.text_buf);
+                    self.emit_markdown(&text);
+                    self.phase = Phase::Idle;
+                }
+
+                StreamEvent::ToolCallStart { name, .. } => {
+                    self.emit_line(Line::from(vec![
+                        Span::styled("tool: ", Style::default().fg(ratatui::style::Color::Yellow)),
+                        Span::raw(name.clone()),
+                    ]));
+                }
+
+                StreamEvent::Error(msg) => {
+                    self.emit_line(Line::styled(
+                        format!("error: {}", msg),
+                        Style::default().fg(ratatui::style::Color::Red),
+                    ));
+                }
+
+                StreamEvent::Usage(u) => {
+                    let usage_str = format!(
+                        "tokens: {} in / {} out / {} cached",
+                        u.input_tokens, u.output_tokens, u.cache_read_tokens
+                    );
+                    self.emit_line(Line::styled(
+                        usage_str,
+                        Style::default().add_modifier(Modifier::DIM),
+                    ));
+                }
+
+                _ => {}
+            },
+
+            AgentEvent::ToolStart { name, .. } => {
+                self.phase = Phase::Tool { name: name.clone() };
+                self.render_viewport();
+            }
+
+            AgentEvent::ToolEnd { output, is_error, .. } => {
+                if *is_error {
+                    self.emit_line(Line::styled(
+                        format!("tool error: {}", truncate(output, 200)),
+                        Style::default().fg(ratatui::style::Color::Red),
+                    ));
+                } else {
+                    self.emit_line(Line::styled(
+                        format!("result: {}", truncate(output, 200)),
+                        Style::default().add_modifier(Modifier::DIM),
+                    ));
+                }
+                self.phase = Phase::Idle;
+                self.render_viewport();
+            }
+
+            AgentEvent::Error(msg) => {
+                self.emit_line(Line::styled(
+                    format!("error: {}", msg),
+                    Style::default().fg(ratatui::style::Color::Red),
+                ));
+            }
+
+            AgentEvent::MessageComplete(_) => {}
+        }
+    }
+
+    /// Clear the viewport and restore normal terminal mode.
+    fn teardown(self) {
+        drop(self.terminal);
+        let _ = crossterm::terminal::disable_raw_mode();
+        // Newline so the next reedline prompt starts on a fresh line.
+        println!();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Prompt
+// ---------------------------------------------------------------------------
+
+struct RiPrompt;
+
+impl Prompt for RiPrompt {
+    fn render_prompt_left(&self) -> Cow<'_, str> {
+        Cow::Borrowed("ri")
+    }
+
+    fn render_prompt_right(&self) -> Cow<'_, str> {
+        Cow::Borrowed("")
+    }
+
+    fn render_prompt_indicator(&self, _mode: PromptEditMode) -> Cow<'_, str> {
+        Cow::Borrowed("> ")
+    }
+
+    fn render_prompt_multiline_indicator(&self) -> Cow<'_, str> {
+        Cow::Borrowed(".. ")
+    }
+
+    fn render_prompt_history_search_indicator(
+        &self,
+        history_search: PromptHistorySearch,
+    ) -> Cow<'_, str> {
+        let prefix = match history_search.status {
+            PromptHistorySearchStatus::Passing => "",
+            PromptHistorySearchStatus::Failing => "(failed) ",
+        };
+        Cow::Owned(format!("{}search: {} ", prefix, history_search.term))
+    }
+
+    fn get_prompt_color(&self) -> Color {
+        Color::Cyan
+    }
+
+    fn get_indicator_color(&self) -> Color {
+        Color::Cyan
+    }
 }
 
 // ---------------------------------------------------------------------------
