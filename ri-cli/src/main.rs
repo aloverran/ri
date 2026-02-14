@@ -100,10 +100,13 @@ async fn main() -> Result<()> {
         "rpc" => {
             rpc_mode::run(provider, model, system_prompt, tools, cwd_path, cli.prompt, thinking).await;
         }
-        "interactive" | _ => {
+        "interactive" => {
             eprintln!("ri - a Rust coding agent");
             eprintln!("Type /help for commands, /quit to exit.\n");
             interactive::run(provider, model, system_prompt, tools, cwd_path, cli.prompt, thinking).await?;
+        }
+        other => {
+            eyre::bail!("Unknown mode '{}'. Expected: interactive, print, json, rpc", other);
         }
     }
 
