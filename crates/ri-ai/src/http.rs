@@ -1,11 +1,8 @@
-use std::pin::Pin;
-use futures::Stream;
-
 use ri::ApiError;
 
-pub type ByteStream = Pin<Box<dyn Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Send>>;
-
-pub async fn send(builder: reqwest::RequestBuilder) -> Result<ByteStream, ApiError> {
+pub async fn send(
+    builder: reqwest::RequestBuilder,
+) -> Result<impl futures::Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Send, ApiError> {
     let response = builder.send().await.map_err(|e| ApiError::Http(e.to_string()))?;
     let status = response.status().as_u16();
 
@@ -14,7 +11,7 @@ pub async fn send(builder: reqwest::RequestBuilder) -> Result<ByteStream, ApiErr
         return Err(parse_http_error(status, &body));
     }
 
-    Ok(Box::pin(response.bytes_stream()))
+    Ok(response.bytes_stream())
 }
 
 fn parse_http_error(status: u16, body: &str) -> ApiError {

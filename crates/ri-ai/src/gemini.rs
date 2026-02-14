@@ -192,7 +192,7 @@ impl LlmProvider for GeminiProvider {
 
         let request = build_request(self.variant, &token, &project_id, &opts);
         let bytes = http::send(request).await?;
-        Ok(event_stream(bytes))
+        Ok(Box::pin(sse::drive_sse_stream(bytes, GeminiState::new())))
     }
 }
 
@@ -641,12 +641,6 @@ impl SseInterpreter for GeminiState {
         out
     }
 }
-
-fn event_stream(bytes: crate::http::ByteStream) -> EventStream {
-    sse::drive_sse_stream(bytes, GeminiState::new())
-}
-
-
 
 // -- System instructions --
 

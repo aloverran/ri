@@ -10,9 +10,8 @@
 // `drive_sse_stream` wires the parser to an interpreter, producing
 // an EventStream.
 
-use std::pin::Pin;
-use futures::{Stream, StreamExt};
-use ri::{ApiError, EventStream, StreamEvent};
+use futures::StreamExt;
+use ri::{ApiError, StreamEvent};
 
 pub struct SseEvent {
     pub event_type: String,
@@ -66,13 +65,14 @@ pub trait SseInterpreter: Send {
     fn finish(&mut self) -> Vec<Result<StreamEvent, ApiError>> { Vec::new() }
 }
 
-/// Convert a byte stream (from an HTTP response) into an EventStream
-/// by parsing SSE frames and interpreting them with the given interpreter.
+/// Convert a byte stream (from an HTTP response) into a stream of
+/// normalized StreamEvents by parsing SSE frames and interpreting
+/// them with the given interpreter.
 pub fn drive_sse_stream(
-    bytes: Pin<Box<dyn Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Send>>,
+    bytes: impl futures::Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Send + 'static,
     mut interpreter: impl SseInterpreter + 'static,
-) -> EventStream {
-    Box::pin(async_stream::stream! {
+) -> impl futures::Stream<Item = Result<StreamEvent, ApiError>> + Send {
+    async_stream::stream! {
         let mut parser = SseParser::new();
         tokio::pin!(bytes);
 
@@ -101,7 +101,7 @@ pub fn drive_sse_stream(
         for event in interpreter.finish() {
             yield event;
         }
-    })
+    }
 }
 
 fn parse_block(block: &str) -> Option<SseEvent> {

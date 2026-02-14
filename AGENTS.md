@@ -40,6 +40,7 @@ Solution: Use #[async_trait], which handles the boxing for you.
 * Write this code as if it is part of a widely used, high-end idiomatic library (like the Rust std), with a slightly more playful feeling. It must be thoughtful about namespace pollution, naming, modern idioms, and assume the reader does not have the IDE open.
 * Names must reflect intent, not just implementation.
 * Practice 'Strict Hygiene' with includes and imports. Use typedefs/using directives only to add semantic meaning, not just to save typing characters. If a type is complex, alias it to what it represents in the domain.
+* Files names should always stay in sync with the content within the file.
 
 ## Clean Code
 

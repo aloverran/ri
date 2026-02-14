@@ -212,7 +212,8 @@ impl LlmProvider for AnthropicProvider {
 
         let request = build_request(&api_key, &opts);
         let bytes = http::send(request).await?;
-        Ok(event_stream(bytes, &opts.tools, is_oauth))
+        let state = AnthropicState::new(is_oauth, opts.tools.to_vec());
+        Ok(Box::pin(sse::drive_sse_stream(bytes, state)))
     }
 }
 
@@ -616,10 +617,4 @@ impl SseInterpreter for AnthropicState {
     }
 }
 
-fn event_stream(
-    bytes: crate::http::ByteStream,
-    tools: &[ToolSchema],
-    is_oauth: bool,
-) -> EventStream {
-    sse::drive_sse_stream(bytes, AnthropicState::new(is_oauth, tools.to_vec()))
-}
+
