@@ -24,3 +24,4 @@ tracing-subscriber.workspace = true
 dirs.workspace = true
 glob.workspace = true
 tokio-util.workspace = true
+urlencoding.workspace = true

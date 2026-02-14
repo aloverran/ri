@@ -25,3 +25,4 @@ uuid.workspace = true
 async-trait.workspace = true
 async-stream.workspace = true
 dirs.workspace = true
+urlencoding.workspace = true

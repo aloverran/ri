@@ -238,7 +238,9 @@ async fn run_local_callback_login(
 
         for param in query.split('&') {
             if let Some((key, value)) = param.split_once('=') {
-                let value = ri_ai::url::decode(value);
+                let value = urlencoding::decode(value)
+                    .unwrap_or_else(|_| value.into())
+                    .into_owned();
                 match key {
                     "code" => auth_code = Some(value),
                     "error" => error = Some(value),

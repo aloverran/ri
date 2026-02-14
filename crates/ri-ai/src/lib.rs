@@ -1,7 +1,6 @@
 pub mod sse;
 pub mod http;
 pub mod creds;
-pub mod url;
 pub mod anthropic;
 pub mod gemini;
 pub mod pkce;

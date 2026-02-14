@@ -239,11 +239,11 @@ impl LlmProvider for GeminiProvider {
         let auth_url = format!(
             "{}?client_id={}&response_type=code&redirect_uri={}&scope={}&code_challenge={}&code_challenge_method=S256&state={}&access_type=offline&prompt=consent",
             AUTH_URL,
-            crate::url::encode(&cfg.client_id),
-            crate::url::encode(cfg.redirect_uri),
-            crate::url::encode(&scopes),
-            crate::url::encode(&challenge),
-            crate::url::encode(&login_state),
+            urlencoding::encode(&cfg.client_id),
+            urlencoding::encode(cfg.redirect_uri),
+            urlencoding::encode(&scopes),
+            urlencoding::encode(&challenge),
+            urlencoding::encode(&login_state),
         );
 
         let mut state = self.state.lock().await;
