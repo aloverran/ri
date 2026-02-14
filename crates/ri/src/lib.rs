@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::path::PathBuf;
 
 pub mod event;
 pub mod id;
@@ -22,9 +21,3 @@ pub use model::{Model, ModelCost, ThinkingLevel};
 pub use provider::{ApiError, AuthMethod, EventStream, LlmProvider, RequestOptions};
 pub use filing::{SessionStore, SessionHeader};
 pub use tool::{ToolDef, ToolFn, ToolOutput, ToolSchema};
-
-pub fn home_dir() -> eyre::Result<PathBuf> {
-    let home = dirs::home_dir()
-        .ok_or_else(|| eyre::eyre!("Could not determine home directory"))?;
-    Ok(home.join(".ri"))
-}

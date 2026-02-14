@@ -42,7 +42,9 @@ impl SessionStore {
     }
 
     pub fn default_dir() -> eyre::Result<PathBuf> {
-        Ok(crate::home_dir()?.join("sessions"))
+        let home = dirs::home_dir()
+            .ok_or_else(|| eyre::eyre!("Could not determine home directory"))?;
+        Ok(home.join(".ri").join("sessions"))
     }
 
     /// Create a new filing, load history, start a session, and write the system message.

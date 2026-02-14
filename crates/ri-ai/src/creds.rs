@@ -10,7 +10,9 @@ pub fn epoch_ms() -> u64 {
 }
 
 pub fn ri_dir() -> eyre::Result<PathBuf> {
-    ri::home_dir()
+    let home = dirs::home_dir()
+        .ok_or_else(|| eyre::eyre!("Could not determine home directory"))?;
+    Ok(home.join(".ri"))
 }
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
