@@ -5,8 +5,7 @@ use chrono::Utc;
 use serde::{Serialize, Deserialize};
 
 use crate::JsonMap;
-use crate::message::{ContentBlock, Message, MessagePool, Role};
-use crate::id::{gen_id, gen_session_prefix};
+use crate::message::{gen_id, gen_session_prefix, ContentBlock, Message, MessagePool, Role};
 
 /// Session header -- serialized as the first line of a .jsonl session file.
 #[derive(Debug, Clone, Serialize, Deserialize)]

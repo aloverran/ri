@@ -15,8 +15,6 @@ use ri::{
     RequestOptions, Role, StreamEvent, ThinkingLevel, ToolSchema, Usage,
 };
 use crate::sse::{self, SseEvent, SseInterpreter};
-use crate::http;
-
 use crate::creds::{self, Credentials};
 
 fn creds_path() -> eyre::Result<PathBuf> {
@@ -131,9 +129,9 @@ impl LlmProvider for AnthropicProvider {
     }
 
     async fn begin_login(&self) -> eyre::Result<Option<AuthMethod>> {
-        let verifier = crate::pkce::generate_verifier();
-        let challenge = crate::pkce::challenge(&verifier);
-        let login_state = crate::pkce::generate_verifier();
+        let verifier = crate::creds::generate_verifier();
+        let challenge = crate::creds::challenge(&verifier);
+        let login_state = crate::creds::generate_verifier();
 
         let mut url = reqwest::Url::parse(AUTHORIZE_URL)?;
         url.query_pairs_mut()
@@ -211,7 +209,7 @@ impl LlmProvider for AnthropicProvider {
             .map_err(|e| ApiError::Other(e.to_string()))?;
 
         let request = build_request(&api_key, &opts);
-        let bytes = http::send(request).await?;
+        let bytes = sse::send(request).await?;
         let state = AnthropicState::new(is_oauth, opts.tools.to_vec());
         Ok(Box::pin(sse::drive_sse_stream(bytes, state)))
     }

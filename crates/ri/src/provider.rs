@@ -1,16 +1,115 @@
-//! Provider trait -- the interface that LLM providers implement.
+//! Provider interface, model definitions, tools, and stream events.
 //!
 //! Defined in the core `ri` crate so the agent loop can call providers
-//! without depending on `ri-ai`.
+//! without depending on `ri-ai`. Contains everything needed to define
+//! and interact with LLM providers: model metadata, the streaming event
+//! protocol, tool definitions, and the LlmProvider trait itself.
 
+use std::path::PathBuf;
 use std::pin::Pin;
+use std::future::Future;
 use async_trait::async_trait;
 use futures::Stream;
+use serde::{Deserialize, Serialize};
 
-use crate::event::StreamEvent;
-use crate::tool::ToolSchema;
-use crate::model::{Model, ThinkingLevel};
-use crate::message::Message;
+use crate::message::{Message, Usage};
+
+// -- Model --
+
+/// An LLM model with its capabilities and pricing.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Model {
+    pub id: String,
+    pub name: String,
+    pub reasoning: bool,
+    pub context_window: usize,
+    pub max_tokens: usize,
+    pub cost: ModelCost,
+}
+
+/// Per-million-token pricing for a model.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelCost {
+    pub input: f64,
+    pub output: f64,
+    pub cache_read: f64,
+    pub cache_write: f64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ThinkingLevel {
+    Off,
+    Low,
+    Medium,
+    High,
+    #[serde(rename = "xhigh")]
+    XHigh,
+}
+
+// -- Stream events --
+
+/// Normalized stream events emitted by LLM providers during response streaming.
+/// The agent loop consumes these to accumulate content blocks and detect tool calls.
+#[derive(Debug, Clone)]
+pub enum StreamEvent {
+    TextStart,
+    TextDelta(String),
+    TextEnd { sig: Option<String> },
+    ThinkingStart,
+    ThinkingDelta(String),
+    ThinkingEnd { sig: Option<String> },
+    ToolCallStart { id: String, name: String },
+    ToolCallDelta { id: String, json_fragment: String },
+    ToolCallEnd { id: String, sig: Option<String> },
+    Usage(Usage),
+    Done,
+    Error(String),
+}
+
+// -- Tools --
+
+/// Tool schema sent to the LLM API so it knows what tools are available.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolSchema {
+    pub name: String,
+    pub description: String,
+    pub parameters: serde_json::Value,
+}
+
+/// Result of executing a tool. Text is returned to the LLM as a tool_result content block.
+pub struct ToolOutput {
+    pub text: String,
+    pub is_error: bool,
+}
+
+/// Function pointer type for tool implementations. Each tool is a plain fn that
+/// returns a boxed future (needed to store heterogeneous async fns in a Vec).
+pub type ToolFn = fn(
+    serde_json::Value,
+    PathBuf,
+    tokio_util::sync::CancellationToken,
+) -> Pin<Box<dyn Future<Output = ToolOutput> + Send>>;
+
+/// Static tool definition: schema for the LLM + implementation function.
+pub struct ToolDef {
+    pub name: &'static str,
+    pub description: &'static str,
+    pub parameters: serde_json::Value,
+    pub run: ToolFn,
+}
+
+impl ToolDef {
+    pub fn schema(&self) -> ToolSchema {
+        ToolSchema {
+            name: self.name.to_string(),
+            description: self.description.to_string(),
+            parameters: self.parameters.clone(),
+        }
+    }
+}
+
+// -- Provider --
 
 /// Provider-agnostic options for a single LLM request.
 pub struct RequestOptions {

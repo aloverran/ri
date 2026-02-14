@@ -16,7 +16,6 @@ use ri::{
     RequestOptions, Role, StreamEvent, ThinkingLevel, Usage,
 };
 use crate::sse::{self, SseEvent, SseInterpreter};
-use crate::http;
 use crate::gemini_auth;
 
 // -- Variant --
@@ -137,9 +136,9 @@ impl LlmProvider for GeminiProvider {
 
     async fn begin_login(&self) -> eyre::Result<Option<AuthMethod>> {
         let cfg = gemini_auth::config_for(self.variant);
-        let verifier = crate::pkce::generate_verifier();
-        let challenge = crate::pkce::challenge(&verifier);
-        let login_state = crate::pkce::generate_verifier();
+        let verifier = crate::creds::generate_verifier();
+        let challenge = crate::creds::challenge(&verifier);
+        let login_state = crate::creds::generate_verifier();
 
         let auth_url = gemini_auth::build_auth_url(self.variant, &challenge, &login_state);
 
@@ -191,7 +190,7 @@ impl LlmProvider for GeminiProvider {
             .map_err(|e| ApiError::Other(e.to_string()))?;
 
         let request = build_request(self.variant, &token, &project_id, &opts);
-        let bytes = http::send(request).await?;
+        let bytes = sse::send(request).await?;
         Ok(Box::pin(sse::drive_sse_stream(bytes, GeminiState::new())))
     }
 }

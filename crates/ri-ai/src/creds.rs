@@ -1,6 +1,9 @@
 // Shared credential storage for OAuth providers.
 
 use std::path::{Path, PathBuf};
+use base64::Engine;
+use rand::RngCore;
+use sha2::{Digest, Sha256};
 
 pub fn epoch_ms() -> u64 {
     std::time::SystemTime::now()
@@ -66,4 +69,17 @@ fn restrict_permissions(path: &Path) -> eyre::Result<()> {
 #[cfg(not(unix))]
 fn restrict_permissions(_path: &Path) -> eyre::Result<()> {
     Ok(())
+}
+
+// -- PKCE --
+
+pub fn generate_verifier() -> String {
+    let mut bytes = [0u8; 32];
+    rand::rng().fill_bytes(&mut bytes);
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
+}
+
+pub fn challenge(verifier: &str) -> String {
+    let hash = Sha256::digest(verifier.as_bytes());
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(hash)
 }
