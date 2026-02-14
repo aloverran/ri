@@ -453,18 +453,18 @@ fn convert_content(c: &ContentBlock) -> Value {
 // -- SSE interpretation --
 
 #[derive(Debug)]
-enum BlockKind {
+enum AnthropicBlock {
     Text,
     Thinking,
     ToolUse { id: String },
 }
 
-struct StreamState {
-    blocks: HashMap<usize, BlockKind>,
+struct AnthropicState {
+    blocks: HashMap<usize, AnthropicBlock>,
     usage: Usage,
 }
 
-impl StreamState {
+impl AnthropicState {
     fn new() -> Self {
         Self { blocks: HashMap::new(), usage: Usage::default() }
     }
@@ -486,17 +486,17 @@ impl StreamState {
 
                 match block_type {
                     "text" => {
-                        self.blocks.insert(index, BlockKind::Text);
+                        self.blocks.insert(index, AnthropicBlock::Text);
                         out.push(Ok(StreamEvent::TextStart));
                     }
                     "thinking" => {
-                        self.blocks.insert(index, BlockKind::Thinking);
+                        self.blocks.insert(index, AnthropicBlock::Thinking);
                         out.push(Ok(StreamEvent::ThinkingStart));
                     }
                     "tool_use" => {
                         let id = parsed["content_block"]["id"].as_str().unwrap_or("").to_string();
                         let name = parsed["content_block"]["name"].as_str().unwrap_or("").to_string();
-                        self.blocks.insert(index, BlockKind::ToolUse { id: id.clone() });
+                        self.blocks.insert(index, AnthropicBlock::ToolUse { id: id.clone() });
                         out.push(Ok(StreamEvent::ToolCallStart { id, name }));
                     }
                     other => { warn!("Unknown content block type: {}", other); }
@@ -525,7 +525,7 @@ impl StreamState {
                     }
                     "input_json_delta" => {
                         let partial = parsed["delta"]["partial_json"].as_str().unwrap_or("").to_string();
-                        if let Some(BlockKind::ToolUse { id }) = self.blocks.get(&index) {
+                        if let Some(AnthropicBlock::ToolUse { id }) = self.blocks.get(&index) {
                             out.push(Ok(StreamEvent::ToolCallDelta {
                                 id: id.clone(),
                                 json_fragment: partial,
@@ -548,9 +548,9 @@ impl StreamState {
                 let index = parsed["index"].as_u64().unwrap_or(0) as usize;
                 if let Some(block) = self.blocks.get(&index) {
                     match block {
-                        BlockKind::Text => out.push(Ok(StreamEvent::TextEnd { sig: None })),
-                        BlockKind::Thinking => out.push(Ok(StreamEvent::ThinkingEnd { sig: None })),
-                        BlockKind::ToolUse { id } => {
+                        AnthropicBlock::Text => out.push(Ok(StreamEvent::TextEnd { sig: None })),
+                        AnthropicBlock::Thinking => out.push(Ok(StreamEvent::ThinkingEnd { sig: None })),
+                        AnthropicBlock::ToolUse { id } => {
                             out.push(Ok(StreamEvent::ToolCallEnd { id: id.clone(), sig: None }));
                         }
                     }
@@ -633,7 +633,7 @@ fn event_stream(
     let original_tools = tools.to_vec();
     Box::pin(async_stream::stream! {
         let mut parser = SseParser::new();
-        let mut state = StreamState::new();
+        let mut state = AnthropicState::new();
         tokio::pin!(bytes);
 
         while let Some(chunk) = bytes.next().await {
