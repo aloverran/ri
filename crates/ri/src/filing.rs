@@ -1,10 +1,10 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
-use std::collections::HashMap;
 use chrono::Utc;
 use serde::{Serialize, Deserialize};
 
+use crate::JsonMap;
 use crate::message::{ContentBlock, Message, MessagePool, Role};
 use crate::id::{gen_id, gen_session_prefix};
 
@@ -16,7 +16,7 @@ pub struct SessionHeader {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
     #[serde(flatten)]
-    pub extra: HashMap<String, serde_json::Value>,
+    pub extra: JsonMap,
 }
 
 /// Manages the message pool and active session file. Loads history from

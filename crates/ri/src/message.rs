@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+use crate::JsonMap;
 use crate::id::gen_id;
 
 // -- Role --
@@ -21,26 +22,26 @@ pub enum ContentBlock {
     Text {
         text: String,
         #[serde(flatten)]
-        extra: HashMap<String, serde_json::Value>,
+        extra: JsonMap,
     },
     Thinking {
         thinking: String,
         #[serde(flatten)]
-        extra: HashMap<String, serde_json::Value>,
+        extra: JsonMap,
     },
     Image {
         #[serde(rename = "mediaType")]
         media_type: String,
         data: String,
         #[serde(flatten)]
-        extra: HashMap<String, serde_json::Value>,
+        extra: JsonMap,
     },
     ToolUse {
         id: String,
         name: String,
         input: serde_json::Value,
         #[serde(flatten)]
-        extra: HashMap<String, serde_json::Value>,
+        extra: JsonMap,
     },
     ToolResult {
         #[serde(rename = "toolUseId")]
@@ -49,7 +50,7 @@ pub enum ContentBlock {
         #[serde(default)]
         is_error: bool,
         #[serde(flatten)]
-        extra: HashMap<String, serde_json::Value>,
+        extra: JsonMap,
     },
     // Catch-all for unknown block types -- preserves round-trip.
     #[serde(untagged)]
@@ -58,19 +59,19 @@ pub enum ContentBlock {
 
 impl ContentBlock {
     pub fn text(s: impl Into<String>) -> Self {
-        ContentBlock::Text { text: s.into(), extra: HashMap::new() }
+        ContentBlock::Text { text: s.into(), extra: JsonMap::new() }
     }
 
     pub fn thinking(s: impl Into<String>) -> Self {
-        ContentBlock::Thinking { thinking: s.into(), extra: HashMap::new() }
+        ContentBlock::Thinking { thinking: s.into(), extra: JsonMap::new() }
     }
 
     pub fn tool_use(id: impl Into<String>, name: impl Into<String>, input: serde_json::Value) -> Self {
-        ContentBlock::ToolUse { id: id.into(), name: name.into(), input, extra: HashMap::new() }
+        ContentBlock::ToolUse { id: id.into(), name: name.into(), input, extra: JsonMap::new() }
     }
 
     pub fn tool_result(tool_use_id: impl Into<String>, content: Vec<ContentBlock>, is_error: bool) -> Self {
-        ContentBlock::ToolResult { tool_use_id: tool_use_id.into(), content, is_error, extra: HashMap::new() }
+        ContentBlock::ToolResult { tool_use_id: tool_use_id.into(), content, is_error, extra: JsonMap::new() }
     }
 
     pub fn tool_result_text(tool_use_id: impl Into<String>, text: impl Into<String>, is_error: bool) -> Self {
@@ -78,7 +79,7 @@ impl ContentBlock {
             tool_use_id: tool_use_id.into(),
             content: vec![ContentBlock::text(text)],
             is_error,
-            extra: HashMap::new(),
+            extra: JsonMap::new(),
         }
     }
 }
@@ -121,12 +122,12 @@ pub struct Message {
     pub meta: Option<serde_json::Value>,
     // Preserve unknown top-level fields for forward compat.
     #[serde(flatten)]
-    pub extra: HashMap<String, serde_json::Value>,
+    pub extra: JsonMap,
 }
 
 impl Message {
     pub fn new(id: String, role: Role, content: Vec<ContentBlock>) -> Self {
-        Message { id, role, content, provenance: None, meta: None, extra: HashMap::new() }
+        Message { id, role, content, provenance: None, meta: None, extra: JsonMap::new() }
     }
 
     pub fn user(text: impl Into<String>) -> Self {

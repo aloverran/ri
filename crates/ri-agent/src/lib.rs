@@ -10,8 +10,8 @@ use std::path::PathBuf;
 use futures::StreamExt;
 
 use ri::{
-    ContentBlock, LlmProvider, Message, MessagePool, Model, Provenance, RequestOptions, Role,
-    SessionFiling, StreamEvent, ThinkingLevel, ToolDef, ToolOutput, ToolSchema, Usage,
+    ContentBlock, JsonMap, LlmProvider, Message, MessagePool, Model, Provenance, RequestOptions,
+    Role, SessionFiling, StreamEvent, ThinkingLevel, ToolDef, ToolOutput, ToolSchema, Usage,
 };
 
 /// Events emitted by the agent loop for display, logging, or RPC output.
@@ -120,7 +120,7 @@ pub async fn run(
                         StreamEvent::TextDelta(d) => { text_buf.push_str(d); }
                         StreamEvent::TextEnd { sig } => {
                             if !text_buf.is_empty() {
-                                let mut extra = HashMap::new();
+                                let mut extra = JsonMap::new();
                                 if let Some(s) = sig {
                                     extra.insert("sig".to_string(), serde_json::Value::String(s.clone()));
                                 }
@@ -134,7 +134,7 @@ pub async fn run(
                         StreamEvent::ThinkingDelta(d) => { thinking_buf.push_str(d); }
                         StreamEvent::ThinkingEnd { sig } => {
                             if !thinking_buf.is_empty() {
-                                let mut extra = HashMap::new();
+                                let mut extra = JsonMap::new();
                                 if let Some(s) = sig {
                                     extra.insert("sig".to_string(), serde_json::Value::String(s.clone()));
                                 }
@@ -159,7 +159,7 @@ pub async fn run(
                                         "error": "Invalid JSON from model",
                                         "partial": json,
                                     }));
-                                let mut extra = HashMap::new();
+                                let mut extra = JsonMap::new();
                                 if let Some(s) = sig {
                                     extra.insert("sig".to_string(), serde_json::Value::String(s.clone()));
                                 }
@@ -213,7 +213,7 @@ pub async fn run(
                 usage,
             }),
             meta: None,
-            extra: HashMap::new(),
+            extra: JsonMap::new(),
         };
         filing.write_message(assistant_msg.clone())?;
         session_ids.push(assistant_id);

@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 pub mod event;
@@ -7,6 +8,9 @@ pub mod model;
 pub mod provider;
 pub mod filing;
 pub mod tool;
+
+/// Bag of extra JSON fields preserved for round-trip / forward-compat.
+pub type JsonMap = HashMap<String, serde_json::Value>;
 
 // Top-level re-exports for convenience.
 pub use event::StreamEvent;
