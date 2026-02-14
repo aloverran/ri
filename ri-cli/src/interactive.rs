@@ -357,9 +357,6 @@ pub async fn run(
     let mut editor = Reedline::create().with_history(history);
     let prompt = RiPrompt;
 
-    // State for paste-code login flows (Anthropic).
-    let mut awaiting_paste: Option<Box<dyn LlmProvider>> = None;
-
     loop {
         let sig = editor.read_line(&prompt);
 
@@ -367,24 +364,6 @@ pub async fn run(
             Ok(Signal::Success(buffer)) => {
                 let trimmed = buffer.trim();
                 if trimmed.is_empty() {
-                    continue;
-                }
-
-                // Handle paste-code completion.
-                if let Some(login_provider) = awaiting_paste.take() {
-                    match login_provider.complete_login(trimmed).await {
-                        Ok(()) => {
-                            match ri_ai::registry::resolve(&model.id).await {
-                                Ok((p, _)) => provider = p,
-                                Err(e) => {
-                                    println!("\x1b[31mresolve error: {}\x1b[0m", e);
-                                    continue;
-                                }
-                            }
-                            println!("\x1b[32mLogged in successfully.\x1b[0m");
-                        }
-                        Err(e) => println!("\x1b[31mlogin failed: {}\x1b[0m", e),
-                    }
                     continue;
                 }
 
@@ -398,8 +377,7 @@ pub async fn run(
                 }
 
                 if trimmed.starts_with("/login") {
-                    awaiting_paste =
-                        handle_login(trimmed, &model, &mut provider).await;
+                    handle_login(trimmed, &model, &mut provider, &mut editor, &prompt).await;
                     continue;
                 }
 
@@ -468,7 +446,9 @@ async fn handle_login(
     input: &str,
     model: &Model,
     provider: &mut Box<dyn LlmProvider>,
-) -> Option<Box<dyn LlmProvider>> {
+    editor: &mut Reedline,
+    prompt: &RiPrompt,
+) {
     let login_name = input.strip_prefix("/login").unwrap().trim();
 
     let login_provider = if login_name.is_empty() {
@@ -481,40 +461,56 @@ async fn handle_login(
 
     let Some(login_provider) = login_provider else {
         println!("\x1b[31mUnknown provider: {}\x1b[0m", login_name);
-        return None;
+        return;
     };
 
     match login_provider.begin_login().await {
         Ok(Some(AuthMethod::PasteCode { url })) => {
             println!("\n\x1b[33mVisit this URL to authorize:\x1b[0m");
             println!("\x1b[4m{}\x1b[0m\n", url);
-            println!("\x1b[33mPaste the code at the next prompt.\x1b[0m");
-            Some(login_provider)
+            println!("\x1b[33mPaste the code below:\x1b[0m");
+
+            // Read the paste code immediately -- no cross-iteration state.
+            let code = match editor.read_line(prompt) {
+                Ok(Signal::Success(buffer)) => buffer.trim().to_string(),
+                _ => {
+                    println!("\x1b[31mLogin cancelled.\x1b[0m");
+                    return;
+                }
+            };
+
+            match login_provider.complete_login(&code).await {
+                Ok(()) => {
+                    resolve_provider_after_login(model, provider).await;
+                }
+                Err(e) => println!("\x1b[31mlogin failed: {}\x1b[0m", e),
+            }
         }
         Ok(Some(AuthMethod::LocalCallback { url, port, path })) => {
             println!("\x1b[33mStarting OAuth login...\x1b[0m");
             match run_local_callback_login(login_provider, &url, port, &path).await {
                 Ok(()) => {
-                    match ri_ai::registry::resolve(&model.id).await {
-                        Ok((p, _)) => *provider = p,
-                        Err(e) => {
-                            println!("\x1b[31mresolve error: {}\x1b[0m", e);
-                        }
-                    }
-                    println!("\x1b[32mLogged in successfully.\x1b[0m");
+                    resolve_provider_after_login(model, provider).await;
                 }
                 Err(e) => println!("\x1b[31mlogin failed: {}\x1b[0m", e),
             }
-            None
         }
         Ok(None) => {
             println!("\x1b[33mNo login needed for this provider.\x1b[0m");
-            None
         }
         Err(e) => {
             println!("\x1b[31mlogin error: {}\x1b[0m", e);
-            None
         }
+    }
+}
+
+async fn resolve_provider_after_login(model: &Model, provider: &mut Box<dyn LlmProvider>) {
+    match ri_ai::registry::resolve(&model.id).await {
+        Ok((p, _)) => {
+            *provider = p;
+            println!("\x1b[32mLogged in successfully.\x1b[0m");
+        }
+        Err(e) => println!("\x1b[31mresolve error: {}\x1b[0m", e),
     }
 }
 
