@@ -1,26 +1,10 @@
-use ri_agent::{AgentCallback, AgentEvent};
+use crate::agent::AgentEvent;
 use ri::StreamEvent;
 use std::io::Write;
 
-pub struct TextCallback;
-
-impl AgentCallback for TextCallback {
-    fn on_event(&mut self, evt: AgentEvent) {
-        on_event_text(&evt);
-    }
-}
-
-pub struct JsonCallback;
-
-impl AgentCallback for JsonCallback {
-    fn on_event(&mut self, evt: AgentEvent) {
-        on_event_json(&evt);
-    }
-}
-
 pub fn on_event_text(evt: &AgentEvent) {
     match evt {
-        AgentEvent::StreamEvent(se) => match se {
+        AgentEvent::Stream(se) => match se {
             StreamEvent::TextDelta(d) => {
                 let stdout = std::io::stdout();
                 let mut out = stdout.lock();
@@ -56,10 +40,8 @@ pub fn on_event_json(evt: &AgentEvent) {
 pub fn event_to_json(evt: &AgentEvent) -> serde_json::Value {
     use serde_json::json;
     match evt {
-        AgentEvent::TurnStart => json!({"type": "turn_start"}),
-        AgentEvent::TurnEnd => json!({"type": "turn_end"}),
         AgentEvent::Error(msg) => json!({"type": "error", "message": msg}),
-        AgentEvent::StreamEvent(se) => match se {
+        AgentEvent::Stream(se) => match se {
             StreamEvent::TextStart => json!({"type": "text_start"}),
             StreamEvent::TextDelta(d) => json!({"type": "text_delta", "delta": d}),
             StreamEvent::TextEnd { .. } => json!({"type": "text_end"}),

@@ -1,14 +1,16 @@
-use ri_agent::{self as agent, AgentCallback, AgentEvent, RunConfig};
+use crate::agent::{self, AgentEvent};
+use crate::print_mode;
 use ri::{
-    ContentBlock, LlmProvider, Message, Model, Role, SessionStore, ThinkingLevel, Tool,
+    ContentBlock, LlmProvider, Message, Model, Role, SessionStore,
+    ThinkingLevel, Tool,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::io::Write;
 use std::path::PathBuf;
-use tokio::io::AsyncBufReadExt;
 
-use crate::print_mode;
+use futures::StreamExt;
+use tokio::io::AsyncBufReadExt;
 
 #[derive(Debug, Deserialize)]
 struct RpcCommand {
@@ -18,20 +20,16 @@ struct RpcCommand {
     data: Value,
 }
 
-struct RpcCallback;
-
-impl AgentCallback for RpcCallback {
-    fn on_event(&mut self, evt: AgentEvent) {
-        output_json(&print_mode::event_to_json(&evt));
-    }
-}
-
 fn output_json(value: &Value) {
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
     let _ = serde_json::to_writer(&mut out, value);
     let _ = out.write_all(b"\n");
     let _ = out.flush();
+}
+
+fn handle_event(evt: &AgentEvent) {
+    output_json(&print_mode::event_to_json(evt));
 }
 
 pub async fn run(
@@ -50,17 +48,6 @@ pub async fn run(
             return;
         }
     };
-    let mut cb = RpcCallback;
-
-    let config = RunConfig {
-        model,
-        system_prompt,
-        tools,
-        thinking,
-        max_tokens: None,
-        cwd,
-        strategy: agent::naive_strategy(),
-    };
 
     if let Some(prompt) = initial_prompt {
         let user_id = filing.next_id();
@@ -72,7 +59,14 @@ pub async fn run(
         session_ids.push(user_id);
 
         let cancel = tokio_util::sync::CancellationToken::new();
-        let _ = agent::run(provider.as_ref(), &config, &mut filing, &mut session_ids, &mut cb, cancel).await;
+        let events = agent::run(
+            provider.as_ref(), &model, &system_prompt, &tools,
+            &mut filing, &mut session_ids, &cwd, thinking, None, cancel,
+        );
+        tokio::pin!(events);
+        while let Some(evt) = events.next().await {
+            handle_event(&evt);
+        }
     }
 
     let stdin = tokio::io::stdin();
@@ -108,7 +102,14 @@ pub async fn run(
                 session_ids.push(user_id);
 
                 let cancel = tokio_util::sync::CancellationToken::new();
-                let _ = agent::run(provider.as_ref(), &config, &mut filing, &mut session_ids, &mut cb, cancel).await;
+                let events = agent::run(
+                    provider.as_ref(), &model, &system_prompt, &tools,
+                    &mut filing, &mut session_ids, &cwd, thinking, None, cancel,
+                );
+                tokio::pin!(events);
+                while let Some(evt) = events.next().await {
+                    handle_event(&evt);
+                }
 
                 output_json(&json!({"type": "response", "command": "prompt", "success": true}));
             }

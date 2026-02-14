@@ -119,32 +119,25 @@ Layer 0: Foundation (ri)
   - LlmProvider trait, RequestOptions, ApiError
   - Tool trait, ToolOutput
   - StreamEvent, ToolSchema
+  - StreamAccumulator (pure: StreamEvent -> ContentBlock)
 
-Layer 1: Provider (ri-ai)
-  - LLM API implementations (Anthropic, Gemini)
-  - Streaming SSE
-  - Provider-specific request formatting
-  - OAuth, API keys
-  - Takes Vec<Message>, returns streamed Response
+Layer 1: I/O (ri-ai, ri-tools)
+  - ri-ai: LLM API implementations (Anthropic, Gemini)
+    - Streaming SSE, OAuth, API keys
+    - Turn: call provider + accumulate response
+  - ri-tools: Built-in tool implementations (bash, read, write, edit)
 
-Layer 1: Tools (ri-tools)
-  - Built-in tool implementations (bash, read, write, edit)
-
-Layer 2: Agent / Strategy (ri-agent)
-  - The agent loop (compose messages, call LLM, execute tools, repeat)
-  - Context strategy (how to select and arrange messages for each LLM call)
-  - Tool execution
-  - Session tracking (linear chain of derived messages)
-
-Layer 3: Application (ri-cli)
+Layer 2: Application (ri-cli)
+  - Agent loop (compose messages, call LLM, execute tools, repeat)
   - CLI parsing, run modes (interactive, print, RPC)
   - TUI / display
-  - User interaction (input, output, commands)
-  - Config resolution (settings)
-  - Resource loading (context files, skills, prompts)
+  - Config, resource loading
 ```
 
-Each layer depends only on the layers below it.
+Each layer depends only on the layers above it. There is no agent loop crate --
+the loop is application-level composition of Turn, Tool, and SessionStore.
+Different applications compose these primitives differently (agent loop,
+pipeline, fan-out, evaluation harness).
 
 ## Crate structure
 
@@ -152,10 +145,9 @@ Each layer depends only on the layers below it.
 ri/
   crates/
     ri/             # Layer 0: Foundation -- types, pool, filing, traits
-    ri-ai/          # Layer 1: LLM providers (Anthropic, Gemini), streaming, auth
+    ri-ai/          # Layer 1: LLM providers (Anthropic, Gemini), Turn, auth
     ri-tools/       # Layer 1: Built-in tool implementations
-    ri-agent/       # Layer 2: Agent loop, context strategy
-  ri-cli/           # Layer 3: CLI entry point, modes, config, TUI
+  ri-cli/           # Layer 2: CLI entry point, agent loop, modes, TUI
 ```
 
 ### ri
@@ -171,20 +163,9 @@ The foundation crate. Everything the rest of the system depends on:
 - `Tool` trait, `ToolOutput` (tool interface and results)
 - `StreamEvent` (normalized stream events from any provider)
 - `ToolSchema` (tool definitions as seen by the LLM API)
+- `StreamAccumulator` (pure state machine: feeds on `StreamEvent`s, produces `Vec<ContentBlock>` + `Usage`)
 
-Does NOT handle: LLM API calls, tool execution, context strategy, agent loop logic.
-
-### ri-agent
-
-The agent loop. Handles:
-
-- The `run()` function: compose context -> call LLM -> execute tools -> repeat
-- RunConfig: everything the loop needs (provider, model, tools, strategy)
-- ContextStrategy: how to select messages from the MessagePool for each LLM call
-- AgentEvent system (broadcast events to observers: TUI, RPC, logging)
-- AgentCallback trait for event observation
-
-Depends on ri (for types, pool, filing, and provider trait).
+Does NOT handle: LLM API calls, tool execution, agent loop logic.
 
 ### ri-ai
 
@@ -192,6 +173,7 @@ LLM provider implementations. Handles:
 
 - Anthropic provider: SSE parsing, request body construction, OAuth tool name remapping
 - Gemini provider: Cloud Code Assist API, Antigravity variant
+- `Turn`: call a provider and accumulate the streamed response into content blocks. Thin wrapper over `LlmProvider::stream()` + `StreamAccumulator`. The fundamental "call the LLM once" building block.
 - Model catalog and registry (code-defined, no JSON config)
 - Provider resolution (auth store, env vars, token refresh)
 - Login flow registry (OAuth flows for each provider)
@@ -207,38 +189,37 @@ Built-in tool implementations: bash, read, write, edit. Each implements the `Too
 
 Application entry point. Wires everything together:
 
+- The agent loop: composes `Turn`, tool execution, and `SessionStore` into the standard "call LLM, execute tools, repeat" loop. Returns a stream of `AgentEvent`s -- no callback trait.
 - CLI argument parsing (clap)
 - Config resolution (settings.json)
 - Resource loading (context files, skills, prompts)
 - System prompt construction
-- Run modes: interactive (REPL), print (single-shot), RPC (JSON-RPC over stdio)
-- Display / TUI
+- Run modes: interactive (REPL with ratatui TUI), print (single-shot), RPC (JSON over stdio)
 - Session management (creating sessions, naming, listing)
 
 ri-cli is provider-agnostic. It receives a `Box<dyn LlmProvider>` and `Model` from ri-ai's registry and drives the agent loop without knowing which provider is behind the trait.
 
 ## The agent loop and the pool
 
-The agent loop is the coding agent's core behavior. It orchestrates the pool, the provider, and the tools:
+The agent loop is the coding agent's core behavior. It lives in ri-cli (application code, not infrastructure) and composes the foundation primitives:
 
 ```
-1. User provides input
-2. Strategy composes the next LLM call's input:
-   - Selects messages from the pool (system prompt, conversation history, tool results)
-   - May transform messages (summarize old ones, strip tool calls, inject context)
-   - Produces an ordered list of message IDs
-3. Any NEW messages (not yet in pool) are written to pool + active session file
-4. Provider is called with the resolved messages
-5. Response is streamed (events emitted for display)
-6. Response message is written to pool + active session file (with provenance)
+1. User provides input -> user message written to pool + session file
+2. Select messages from the pool for this LLM call (currently: all session messages)
+3. Start a Turn with the selected messages
+4. Stream events from the Turn (yielded to the caller for display)
+5. Turn finishes -> extract content blocks and usage
+6. Build assistant message with provenance, write to pool + session file
 7. If response contains tool calls:
-   a. Tools are executed
-   b. Tool results are written as new messages to pool + active session file
+   a. Execute each tool (tool.run())
+   b. Write tool results as a user message to pool + session file
    c. Go to step 2
 8. If no tool calls: done, wait for user input
 ```
 
-The strategy (step 2) is where all context management intelligence lives. It's a function that takes the pool and returns a list of message IDs. For a simple agent, it returns "all messages from this session in order." For an advanced agent, it might pull from multiple sessions, summarize old context, or inject dynamic information.
+The agent loop is ~80 lines of application code that returns `impl Stream<Item = AgentEvent>`. Each consumer (interactive REPL, print mode, RPC mode) iterates the stream and handles events differently. No callback trait is needed.
+
+The message selection in step 2 is where future context management intelligence will live. Currently it's trivial (include all session messages in order). A compacting strategy would summarize old messages, a cross-session strategy would pull from other sessions, etc. These are just different ways to select IDs from the pool.
 
 ## Context strategy examples
 

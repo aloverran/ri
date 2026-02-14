@@ -4,6 +4,8 @@ pub mod anthropic;
 pub mod gemini;
 mod gemini_auth;
 pub mod registry;
+pub mod turn;
 
 pub use anthropic::AnthropicProvider;
 pub use gemini::{GeminiProvider, GeminiVariant};
+pub use turn::Turn;

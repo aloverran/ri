@@ -1,7 +1,6 @@
 [workspace]
 members = [
     "crates/ri",
-    "crates/ri-agent",
     "crates/ri-ai",
     "crates/ri-tools",
     "ri-cli",
@@ -42,4 +41,4 @@ async-stream = "0.3"
 ri = { path = "crates/ri" }
 ri-ai = { path = "crates/ri-ai" }
 ri-tools = { path = "crates/ri-tools" }
-ri-agent = { path = "crates/ri-agent" }
+

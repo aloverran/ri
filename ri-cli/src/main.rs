@@ -1,8 +1,8 @@
 use clap::Parser;
 use color_eyre::eyre::Result;
-use ri_agent as agent;
 use ri::{ContentBlock, Message, Role, SessionStore, ThinkingLevel};
 
+mod agent;
 mod interactive;
 mod print_mode;
 mod resources;
@@ -66,6 +66,8 @@ async fn main() -> Result<()> {
 
     match cli.mode.as_str() {
         "print" | "json" => {
+            use futures::StreamExt;
+
             let prompt = cli.prompt
                 .ok_or_else(|| eyre::eyre!("Print mode requires --prompt (-p)"))?;
 
@@ -78,23 +80,20 @@ async fn main() -> Result<()> {
             filing.write_message(user_msg)?;
             session_ids.push(user_id);
 
-            let config = agent::RunConfig {
-                model,
-                system_prompt,
-                tools,
-                thinking,
-                max_tokens: None,
-                cwd: cwd_path,
-                strategy: agent::naive_strategy(),
+            let cancel = tokio_util::sync::CancellationToken::new();
+            let handler: fn(&agent::AgentEvent) = if is_json {
+                print_mode::on_event_json
+            } else {
+                print_mode::on_event_text
             };
 
-            let cancel = tokio_util::sync::CancellationToken::new();
-            if is_json {
-                let mut cb = print_mode::JsonCallback;
-                agent::run(provider.as_ref(), &config, &mut filing, &mut session_ids, &mut cb, cancel).await?;
-            } else {
-                let mut cb = print_mode::TextCallback;
-                agent::run(provider.as_ref(), &config, &mut filing, &mut session_ids, &mut cb, cancel).await?;
+            let events = agent::run(
+                provider.as_ref(), &model, &system_prompt, &tools,
+                &mut filing, &mut session_ids, &cwd_path, thinking, None, cancel,
+            );
+            tokio::pin!(events);
+            while let Some(evt) = events.next().await {
+                handler(&evt);
             }
             println!();
         }

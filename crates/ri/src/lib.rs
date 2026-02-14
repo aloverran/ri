@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 
+pub mod accumulator;
 pub mod message;
 pub mod types;
 pub mod store;
@@ -15,4 +16,5 @@ pub use types::{
     ApiError, AuthMethod, EventStream, LlmProvider, Model, ModelCost, RequestOptions,
     StreamEvent, ThinkingLevel, Tool, ToolOutput, ToolSchema,
 };
+pub use accumulator::StreamAccumulator;
 pub use store::{SessionStore, SessionHeader};
