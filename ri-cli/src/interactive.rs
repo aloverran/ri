@@ -27,7 +27,7 @@ pub async fn run(
     let session_name = session_name_from_prompt(initial_prompt.as_deref());
     let (mut filing, mut session_ids) = SessionStore::init(
         &session_name,
-        &cwd.display().to_string(),
+        &cwd,
         &system_prompt,
     )?;
 

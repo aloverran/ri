@@ -43,7 +43,7 @@ pub async fn run(
     initial_prompt: Option<String>,
     thinking: ThinkingLevel,
 ) {
-    let (mut filing, mut session_ids) = match SessionStore::init("rpc", &cwd.display().to_string(), &system_prompt) {
+    let (mut filing, mut session_ids) = match SessionStore::init("rpc", &cwd, &system_prompt) {
         Ok(v) => v,
         Err(e) => {
             output_json(&json!({"type": "error", "message": format!("Failed to init session: {}", e)}));

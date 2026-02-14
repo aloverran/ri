@@ -48,11 +48,13 @@ impl SessionStore {
 
     /// Create a new filing, load history, start a session, and write the system message.
     /// Returns (filing, session_ids) ready for the agent loop.
-    pub fn init(name: &str, cwd: &str, system_prompt: &str) -> eyre::Result<(Self, Vec<String>)> {
+    pub fn init(name: &str, cwd: &Path, system_prompt: &str) -> eyre::Result<(Self, Vec<String>)> {
+        let cwd_str = cwd.to_str()
+            .ok_or_else(|| eyre::eyre!("working directory contains non-UTF-8 characters"))?;
         let sessions_dir = Self::default_dir()?;
         let mut filing = Self::new(sessions_dir);
         filing.load_all()?;
-        filing.new_session(name, cwd)?;
+        filing.new_session(name, cwd_str)?;
 
         let sys_id = filing.next_id();
         let sys_msg = Message::new(
