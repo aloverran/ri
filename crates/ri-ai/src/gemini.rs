@@ -492,8 +492,7 @@ fn build_body(variant: GeminiVariant, project_id: &str, opts: &RequestOptions) -
     let mut generation_config = json!({ "maxOutputTokens": max_tokens });
 
     if opts.model.reasoning && opts.thinking != ThinkingLevel::Off {
-        let is_gemini3 = opts.model.id.contains("3-pro") || opts.model.id.contains("3-flash");
-        if is_gemini3 {
+        if is_gemini3(&opts.model.id) {
             if let Some(level_str) = thinking_level_string(opts.thinking, &opts.model.id) {
                 generation_config["thinkingConfig"] = json!({
                     "includeThoughts": true,
@@ -554,7 +553,7 @@ fn build_body(variant: GeminiVariant, project_id: &str, opts: &RequestOptions) -
 // -- Message conversion --
 
 fn build_contents(messages: &[Message], model_id: &str) -> Vec<Value> {
-    let is_gemini3 = model_id.contains("3-pro") || model_id.contains("3-flash");
+    let gemini3 = is_gemini3(model_id);
 
     let mut tool_names: HashMap<String, String> = HashMap::new();
     for msg in messages {
@@ -658,7 +657,7 @@ fn build_contents(messages: &[Message], model_id: &str) -> Vec<Value> {
                             continue;
                         }
                     }
-                    if is_gemini3 {
+                    if gemini3 {
                         let args_str = serde_json::to_string_pretty(input).unwrap_or_default();
                         parts.push(json!({
                             "text": format!(
@@ -684,6 +683,10 @@ fn build_contents(messages: &[Message], model_id: &str) -> Vec<Value> {
     }
 
     contents
+}
+
+fn is_gemini3(model_id: &str) -> bool {
+    model_id.contains("3-pro") || model_id.contains("3-flash")
 }
 
 fn thinking_level_string(level: ThinkingLevel, model_id: &str) -> Option<&'static str> {
