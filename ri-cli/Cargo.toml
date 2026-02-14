@@ -9,6 +9,7 @@ name = "ri"
 path = "src/main.rs"
 
 [dependencies]
+axum.workspace = true
 ri.workspace = true
 ri-agent.workspace = true
 ri-ai.workspace = true
