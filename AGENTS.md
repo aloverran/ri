@@ -41,6 +41,7 @@ Solution: Use #[async_trait], which handles the boxing for you.
 * Names must reflect intent, not just implementation.
 * Practice 'Strict Hygiene' with includes and imports. Use typedefs/using directives only to add semantic meaning, not just to save typing characters. If a type is complex, alias it to what it represents in the domain.
 * Files names should always stay in sync with the content within the file.
+* We prefer longer files (like c) over separating every comonent into a file. This follows from the principle of narrative readability. Many small files means you must jump around (losing the narrative of the code).
 
 ## Clean Code
 
