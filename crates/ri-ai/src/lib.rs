@@ -3,6 +3,7 @@ pub mod http;
 pub mod creds;
 pub mod anthropic;
 pub mod gemini;
+mod gemini_auth;
 pub mod pkce;
 pub mod registry;
 

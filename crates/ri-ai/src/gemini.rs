@@ -1,11 +1,12 @@
 // Google Gemini provider -- Cloud Code Assist API.
 //
-// Self-contained implementation supporting two variants:
+// Supports two variants:
 //   Cli:          standard Gemini models via cloudcode-pa.googleapis.com
 //   Antigravity:  Gemini 3 via daily-cloudcode-pa.sandbox.googleapis.com
+//
+// Auth, credential management, and project discovery are in gemini_auth.rs.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
 use async_trait::async_trait;
 use serde_json::{json, Value};
 use tokio::sync::Mutex;
@@ -16,6 +17,7 @@ use ri::{
 };
 use crate::sse::{self, SseEvent, SseInterpreter};
 use crate::http;
+use crate::gemini_auth;
 
 // -- Variant --
 
@@ -23,100 +25,6 @@ use crate::http;
 pub enum GeminiVariant {
     Cli,
     Antigravity,
-}
-
-use crate::creds::{self, Credentials};
-
-fn creds_path(variant: GeminiVariant) -> eyre::Result<PathBuf> {
-    let name = match variant {
-        GeminiVariant::Cli => "gemini_cli_auth.json",
-        GeminiVariant::Antigravity => "gemini_antigravity_auth.json",
-    };
-    Ok(creds::ri_dir()?.join(name))
-}
-
-fn load_creds(variant: GeminiVariant) -> Option<Credentials> {
-    creds::load(&creds_path(variant).ok()?)
-}
-
-fn save_creds(variant: GeminiVariant, creds: &Credentials) -> eyre::Result<()> {
-    creds::save(&creds_path(variant)?, creds)
-}
-
-// -- OAuth constants --
-
-fn decode_b64(s: &str) -> String {
-    let bytes = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, s)
-        .unwrap_or_default();
-    String::from_utf8(bytes).unwrap_or_default()
-}
-
-fn gemini_cli_client_id() -> String {
-    decode_b64("NjgxMjU1ODA5Mzk1LW9vOGZ0Mm9wcmRybnA5ZTNhcWY2YXYzaG1kaWIxMzVqLmFwcHMuZ29vZ2xldXNlcmNvbnRlbnQuY29t")
-}
-
-fn gemini_cli_client_secret() -> String {
-    decode_b64("R09DU1BYLTR1SGdNUG0tMW83U2stZ2VWNkN1NWNsWEZzeGw=")
-}
-
-fn antigravity_client_id() -> String {
-    decode_b64("MTA3MTAwNjA2MDU5MS10bWhzc2luMmgyMWxjcmUyMzV2dG9sb2poNGc0MDNlcC5hcHBzLmdvb2dsZXVzZXJjb250ZW50LmNvbQ==")
-}
-
-fn antigravity_client_secret() -> String {
-    decode_b64("R09DU1BYLUs1OEZXUjQ4NkxkTEoxbUxCOHNYQzR6NnFEQWY=")
-}
-
-const AUTH_URL: &str = "https://accounts.google.com/o/oauth2/v2/auth";
-const TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
-const GEMINI_CLI_REDIRECT: &str = "http://localhost:8085/oauth2callback";
-const ANTIGRAVITY_REDIRECT: &str = "http://localhost:51121/oauth-callback";
-const GEMINI_CLI_ENDPOINT: &str = "https://cloudcode-pa.googleapis.com";
-const ANTIGRAVITY_DAILY_ENDPOINT: &str = "https://daily-cloudcode-pa.sandbox.googleapis.com";
-const DEFAULT_PROJECT_ID: &str = "rising-fact-p41fc";
-
-const GEMINI_CLI_SCOPES: &[&str] = &[
-    "https://www.googleapis.com/auth/cloud-platform",
-    "https://www.googleapis.com/auth/userinfo.email",
-    "https://www.googleapis.com/auth/userinfo.profile",
-];
-
-const ANTIGRAVITY_SCOPES: &[&str] = &[
-    "https://www.googleapis.com/auth/cloud-platform",
-    "https://www.googleapis.com/auth/userinfo.email",
-    "https://www.googleapis.com/auth/userinfo.profile",
-    "https://www.googleapis.com/auth/cclog",
-    "https://www.googleapis.com/auth/experimentsandconfigs",
-];
-
-struct VariantConfig {
-    client_id: String,
-    client_secret: String,
-    redirect_uri: &'static str,
-    scopes: &'static [&'static str],
-    port: u16,
-    callback_path: &'static str,
-}
-
-fn config_for(variant: GeminiVariant) -> VariantConfig {
-    match variant {
-        GeminiVariant::Cli => VariantConfig {
-            client_id: gemini_cli_client_id(),
-            client_secret: gemini_cli_client_secret(),
-            redirect_uri: GEMINI_CLI_REDIRECT,
-            scopes: GEMINI_CLI_SCOPES,
-            port: 8085,
-            callback_path: "/oauth2callback",
-        },
-        GeminiVariant::Antigravity => VariantConfig {
-            client_id: antigravity_client_id(),
-            client_secret: antigravity_client_secret(),
-            redirect_uri: ANTIGRAVITY_REDIRECT,
-            scopes: ANTIGRAVITY_SCOPES,
-            port: 51121,
-            callback_path: "/oauth-callback",
-        },
-    }
 }
 
 // -- Provider struct --
@@ -136,7 +44,7 @@ struct ProviderState {
 
 impl GeminiProvider {
     pub fn new(variant: GeminiVariant) -> Self {
-        let (token, project_id) = if let Some(creds) = load_creds(variant) {
+        let (token, project_id) = if let Some(creds) = gemini_auth::load_creds(variant) {
             (creds.access_token, creds.project_id.unwrap_or_default())
         } else {
             (String::new(), String::new())
@@ -159,13 +67,13 @@ impl GeminiProvider {
             return Ok((String::new(), String::new()));
         }
 
-        if let Some(creds) = load_creds(self.variant) {
+        if let Some(creds) = gemini_auth::load_creds(self.variant) {
             if creds.is_expired() {
-                match refresh_token(&creds, self.variant).await {
+                match gemini_auth::refresh_token(&creds, self.variant).await {
                     Ok(refreshed) => {
                         state.token = refreshed.access_token.clone();
                         state.project_id = refreshed.project_id.clone().unwrap_or_default();
-                        let _ = save_creds(self.variant, &refreshed);
+                        let _ = gemini_auth::save_creds(self.variant, &refreshed);
                     }
                     Err(e) => {
                         tracing::warn!("Google token refresh failed: {}", e);
@@ -228,21 +136,12 @@ impl LlmProvider for GeminiProvider {
     }
 
     async fn begin_login(&self) -> eyre::Result<Option<AuthMethod>> {
-        let cfg = config_for(self.variant);
+        let cfg = gemini_auth::config_for(self.variant);
         let verifier = crate::pkce::generate_verifier();
         let challenge = crate::pkce::challenge(&verifier);
         let login_state = crate::pkce::generate_verifier();
 
-        let scopes = cfg.scopes.join(" ");
-        let auth_url = format!(
-            "{}?client_id={}&response_type=code&redirect_uri={}&scope={}&code_challenge={}&code_challenge_method=S256&state={}&access_type=offline&prompt=consent",
-            AUTH_URL,
-            urlencoding::encode(&cfg.client_id),
-            urlencoding::encode(cfg.redirect_uri),
-            urlencoding::encode(&scopes),
-            urlencoding::encode(&challenge),
-            urlencoding::encode(&login_state),
-        );
+        let auth_url = gemini_auth::build_auth_url(self.variant, &challenge, &login_state);
 
         let mut state = self.state.lock().await;
         state.login_verifier = Some(verifier);
@@ -266,8 +165,6 @@ impl LlmProvider for GeminiProvider {
             (v, s)
         };
 
-        // Parse code and state from the callback URL params.
-        // The CLI passes "code#state" format, or just the code.
         let (actual_code, returned_state) = match code.split_once('#') {
             Some((c, s)) => (c.to_string(), s.to_string()),
             None => (code.to_string(), login_state.clone()),
@@ -277,46 +174,13 @@ impl LlmProvider for GeminiProvider {
             return Err(eyre::eyre!("OAuth state mismatch"));
         }
 
-        let cfg = config_for(self.variant);
-        let client = reqwest::Client::new();
-        let token_response = client
-            .post(TOKEN_URL)
-            .form(&[
-                ("client_id", cfg.client_id.as_str()),
-                ("client_secret", cfg.client_secret.as_str()),
-                ("code", actual_code.as_str()),
-                ("grant_type", "authorization_code"),
-                ("redirect_uri", cfg.redirect_uri),
-                ("code_verifier", verifier.as_str()),
-            ])
-            .send()
-            .await?;
-
-        let status = token_response.status();
-        if !status.is_success() {
-            let body = token_response.text().await.unwrap_or_default();
-            return Err(eyre::eyre!("Token exchange failed ({}): {}", status, body));
-        }
-
-        let data: Value = token_response.json().await?;
-        let access = data["access_token"].as_str()
-            .ok_or_else(|| eyre::eyre!("Missing access_token"))?.to_string();
-        let refresh = data["refresh_token"].as_str()
-            .ok_or_else(|| eyre::eyre!("No refresh token"))?.to_string();
-        let expires_in = data["expires_in"].as_u64().unwrap_or(3600);
-        let expires = Credentials::compute_expiry(expires_in);
-
-        let email = get_user_email(&client, &access).await;
-        let project_id = discover_project(&client, &access, self.variant).await?;
-
-        let creds = Credentials {
-            refresh_token: refresh, access_token: access.clone(), expires,
-            project_id: Some(project_id.clone()), email,
-        };
-        save_creds(self.variant, &creds)?;
+        let creds = gemini_auth::exchange_code(self.variant, &actual_code, &verifier).await?;
+        let token = creds.access_token.clone();
+        let project_id = creds.project_id.clone().unwrap_or_default();
+        gemini_auth::save_creds(self.variant, &creds)?;
 
         let mut state = self.state.lock().await;
-        state.token = access;
+        state.token = token;
         state.project_id = project_id;
 
         Ok(())
@@ -332,115 +196,6 @@ impl LlmProvider for GeminiProvider {
     }
 }
 
-// -- Token refresh --
-
-async fn refresh_token(credentials: &Credentials, variant: GeminiVariant) -> eyre::Result<Credentials> {
-    let cfg = config_for(variant);
-    let client = reqwest::Client::new();
-
-    let response = client
-        .post(TOKEN_URL)
-        .form(&[
-            ("client_id", cfg.client_id.as_str()),
-            ("client_secret", cfg.client_secret.as_str()),
-            ("refresh_token", credentials.refresh_token.as_str()),
-            ("grant_type", "refresh_token"),
-        ])
-        .send()
-        .await?;
-
-    let status = response.status();
-    if !status.is_success() {
-        let body = response.text().await.unwrap_or_default();
-        return Err(eyre::eyre!("Google token refresh failed ({}): {}", status, body));
-    }
-
-    let data: Value = response.json().await?;
-    let access = data["access_token"].as_str()
-        .ok_or_else(|| eyre::eyre!("Missing access_token"))?.to_string();
-    let refresh = data["refresh_token"].as_str()
-        .unwrap_or(&credentials.refresh_token).to_string();
-    let expires_in = data["expires_in"].as_u64().unwrap_or(3600);
-    let expires = Credentials::compute_expiry(expires_in);
-
-    Ok(Credentials {
-        refresh_token: refresh, access_token: access, expires,
-        project_id: credentials.project_id.clone(),
-        email: credentials.email.clone(),
-    })
-}
-
-// -- Project discovery --
-
-async fn discover_project(
-    client: &reqwest::Client,
-    access_token: &str,
-    variant: GeminiVariant,
-) -> eyre::Result<String> {
-    if let Ok(id) = std::env::var("GOOGLE_CLOUD_PROJECT") { return Ok(id); }
-    if let Ok(id) = std::env::var("GOOGLE_CLOUD_PROJECT_ID") { return Ok(id); }
-
-    let endpoints = match variant {
-        GeminiVariant::Antigravity => vec![GEMINI_CLI_ENDPOINT, ANTIGRAVITY_DAILY_ENDPOINT],
-        GeminiVariant::Cli => vec![GEMINI_CLI_ENDPOINT],
-    };
-
-    for endpoint in &endpoints {
-        let url = format!("{}/v1internal:loadCodeAssist", endpoint);
-        let resp = client.post(&url)
-            .header("Authorization", format!("Bearer {}", access_token))
-            .header("Content-Type", "application/json")
-            .json(&json!({
-                "metadata": { "ideType": "IDE_UNSPECIFIED", "platform": "PLATFORM_UNSPECIFIED", "pluginType": "GEMINI" }
-            }))
-            .send().await;
-
-        let Ok(resp) = resp else { continue; };
-        if !resp.status().is_success() { continue; }
-        let Ok(data) = resp.json::<Value>().await else { continue; };
-
-        let project = data["cloudaicompanionProject"].as_str()
-            .filter(|s| !s.is_empty())
-            .or_else(|| data["cloudaicompanionProject"]["id"].as_str().filter(|s| !s.is_empty()));
-        if let Some(id) = project {
-            return Ok(id.to_string());
-        }
-    }
-
-    if variant == GeminiVariant::Antigravity {
-        return Ok(DEFAULT_PROJECT_ID.to_string());
-    }
-
-    let url = format!("{}/v1internal:onboardUser", GEMINI_CLI_ENDPOINT);
-    let resp = client.post(&url)
-        .header("Authorization", format!("Bearer {}", access_token))
-        .header("Content-Type", "application/json")
-        .json(&json!({
-            "tierId": "free-tier",
-            "metadata": { "ideType": "IDE_UNSPECIFIED", "platform": "PLATFORM_UNSPECIFIED", "pluginType": "GEMINI" }
-        }))
-        .send().await?;
-
-    if resp.status().is_success() {
-        let data: Value = resp.json().await?;
-        if let Some(id) = data["response"]["cloudaicompanionProject"]["id"].as_str() {
-            return Ok(id.to_string());
-        }
-    }
-
-    Err(eyre::eyre!("Could not discover Google Cloud project. Set GOOGLE_CLOUD_PROJECT env var."))
-}
-
-async fn get_user_email(client: &reqwest::Client, access_token: &str) -> Option<String> {
-    let resp = client.get("https://www.googleapis.com/oauth2/v1/userinfo?alt=json")
-        .header("Authorization", format!("Bearer {}", access_token))
-        .send().await.ok()?;
-    if resp.status().is_success() {
-        let data: Value = resp.json().await.ok()?;
-        data["email"].as_str().map(|s| s.to_string())
-    } else { None }
-}
-
 // -- Request building --
 
 fn build_request(
@@ -451,8 +206,8 @@ fn build_request(
 ) -> reqwest::RequestBuilder {
     let body = build_body(variant, project_id, opts);
     let endpoint = match variant {
-        GeminiVariant::Antigravity => ANTIGRAVITY_DAILY_ENDPOINT,
-        GeminiVariant::Cli => GEMINI_CLI_ENDPOINT,
+        GeminiVariant::Antigravity => gemini_auth::ANTIGRAVITY_DAILY_ENDPOINT,
+        GeminiVariant::Cli => gemini_auth::GEMINI_CLI_ENDPOINT,
     };
     let url = format!("{}/v1internal:streamGenerateContent?alt=sse", endpoint);
 
