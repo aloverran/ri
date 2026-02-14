@@ -1,37 +1,43 @@
 // Built-in tools for ri.
-//
-// Each tool is a function that returns a ToolDef.
-// No trait objects, no Arc, no dynamic dispatch.
 
 use std::path::{Path, PathBuf};
 
-use ri::{ToolDef, ToolOutput};
+use async_trait::async_trait;
+use ri::{Tool, ToolOutput};
 
-pub fn all_tools() -> Vec<ToolDef> {
-    vec![bash(), read(), write(), edit()]
+pub fn all_tools() -> Vec<Box<dyn Tool>> {
+    vec![Box::new(BashTool), Box::new(ReadTool), Box::new(WriteTool), Box::new(EditTool)]
 }
 
-pub fn bash() -> ToolDef {
-    ToolDef {
-        name: "bash",
-        description: "Execute a shell command",
-        parameters: serde_json::json!({
+struct BashTool;
+
+#[async_trait]
+impl Tool for BashTool {
+    fn name(&self) -> &str { "bash" }
+    fn description(&self) -> &str { "Execute a shell command" }
+    fn parameters(&self) -> serde_json::Value {
+        serde_json::json!({
             "type": "object",
             "properties": {
                 "command": { "type": "string", "description": "The shell command to execute" },
                 "timeout": { "type": "integer", "description": "Timeout in milliseconds" }
             },
             "required": ["command"]
-        }),
-        run: |input, cwd, cancel| Box::pin(run_bash(input, cwd, cancel)),
+        })
+    }
+    async fn run(&self, input: serde_json::Value, cwd: PathBuf, cancel: tokio_util::sync::CancellationToken) -> ToolOutput {
+        run_bash(input, cwd, cancel).await
     }
 }
 
-pub fn read() -> ToolDef {
-    ToolDef {
-        name: "read",
-        description: "Read a file's contents",
-        parameters: serde_json::json!({
+struct ReadTool;
+
+#[async_trait]
+impl Tool for ReadTool {
+    fn name(&self) -> &str { "read" }
+    fn description(&self) -> &str { "Read a file's contents" }
+    fn parameters(&self) -> serde_json::Value {
+        serde_json::json!({
             "type": "object",
             "properties": {
                 "path": { "type": "string", "description": "File path to read" },
@@ -39,32 +45,42 @@ pub fn read() -> ToolDef {
                 "limit": { "type": "integer", "description": "Number of lines to read" }
             },
             "required": ["path"]
-        }),
-        run: |input, cwd, _cancel| Box::pin(run_read(input, cwd)),
+        })
+    }
+    async fn run(&self, input: serde_json::Value, cwd: PathBuf, _cancel: tokio_util::sync::CancellationToken) -> ToolOutput {
+        run_read(input, cwd).await
     }
 }
 
-pub fn write() -> ToolDef {
-    ToolDef {
-        name: "write",
-        description: "Write content to a file",
-        parameters: serde_json::json!({
+struct WriteTool;
+
+#[async_trait]
+impl Tool for WriteTool {
+    fn name(&self) -> &str { "write" }
+    fn description(&self) -> &str { "Write content to a file" }
+    fn parameters(&self) -> serde_json::Value {
+        serde_json::json!({
             "type": "object",
             "properties": {
                 "path": { "type": "string", "description": "File path to write" },
                 "content": { "type": "string", "description": "Content to write" }
             },
             "required": ["path", "content"]
-        }),
-        run: |input, cwd, _cancel| Box::pin(run_write(input, cwd)),
+        })
+    }
+    async fn run(&self, input: serde_json::Value, cwd: PathBuf, _cancel: tokio_util::sync::CancellationToken) -> ToolOutput {
+        run_write(input, cwd).await
     }
 }
 
-pub fn edit() -> ToolDef {
-    ToolDef {
-        name: "edit",
-        description: "Replace text in a file (exact match)",
-        parameters: serde_json::json!({
+struct EditTool;
+
+#[async_trait]
+impl Tool for EditTool {
+    fn name(&self) -> &str { "edit" }
+    fn description(&self) -> &str { "Replace text in a file (exact match)" }
+    fn parameters(&self) -> serde_json::Value {
+        serde_json::json!({
             "type": "object",
             "properties": {
                 "path": { "type": "string" },
@@ -72,8 +88,10 @@ pub fn edit() -> ToolDef {
                 "new_text": { "type": "string", "description": "Replacement text" }
             },
             "required": ["path", "old_text", "new_text"]
-        }),
-        run: |input, cwd, _cancel| Box::pin(run_edit(input, cwd)),
+        })
+    }
+    async fn run(&self, input: serde_json::Value, cwd: PathBuf, _cancel: tokio_util::sync::CancellationToken) -> ToolOutput {
+        run_edit(input, cwd).await
     }
 }
 

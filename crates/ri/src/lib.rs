@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 
 pub mod message;
-pub mod provider;
-pub mod filing;
+pub mod types;
+pub mod store;
 
 /// Bag of extra JSON fields preserved for round-trip / forward-compat.
 pub type JsonMap = HashMap<String, serde_json::Value>;
@@ -11,8 +11,8 @@ pub type JsonMap = HashMap<String, serde_json::Value>;
 pub use message::{
     gen_id, ContentBlock, Message, MessagePool, Provenance, Role, Usage,
 };
-pub use provider::{
+pub use types::{
     ApiError, AuthMethod, EventStream, LlmProvider, Model, ModelCost, RequestOptions,
-    StreamEvent, ThinkingLevel, ToolDef, ToolFn, ToolOutput, ToolSchema,
+    StreamEvent, ThinkingLevel, Tool, ToolOutput, ToolSchema,
 };
-pub use filing::{SessionStore, SessionHeader};
+pub use store::{SessionStore, SessionHeader};

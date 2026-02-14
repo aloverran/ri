@@ -1,6 +1,6 @@
 use ri_agent::{self as agent, AgentCallback, AgentEvent, RunConfig};
 use ri::{
-    ContentBlock, LlmProvider, Message, Model, Role, SessionStore, ThinkingLevel, ToolDef,
+    ContentBlock, LlmProvider, Message, Model, Role, SessionStore, ThinkingLevel, Tool,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -38,7 +38,7 @@ pub async fn run(
     provider: Box<dyn LlmProvider>,
     model: Model,
     system_prompt: String,
-    tools: Vec<ToolDef>,
+    tools: Vec<Box<dyn Tool>>,
     cwd: PathBuf,
     initial_prompt: Option<String>,
     thinking: ThinkingLevel,

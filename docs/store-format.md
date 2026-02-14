@@ -304,7 +304,7 @@ impl MessagePool {
 ### Filing layer operations
 
 ```rust
-struct SessionFiling {
+struct SessionStore {
     pool: MessagePool,
     sessions_dir: PathBuf,
     active_session: Option<ActiveSession>,
@@ -316,7 +316,7 @@ struct ActiveSession {
     name: String,
 }
 
-impl SessionFiling {
+impl SessionStore {
     // Load all session files into the pool
     fn load_all(&mut self) -> Result<()>;
 

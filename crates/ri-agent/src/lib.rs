@@ -11,7 +11,7 @@ use futures::StreamExt;
 
 use ri::{
     ContentBlock, JsonMap, LlmProvider, Message, MessagePool, Model, Provenance, RequestOptions,
-    Role, SessionStore, StreamEvent, ThinkingLevel, ToolDef, ToolOutput, ToolSchema, Usage,
+    Role, SessionStore, StreamEvent, ThinkingLevel, Tool, ToolOutput, ToolSchema, Usage,
 };
 
 /// In-progress tool call being accumulated from streaming deltas.
@@ -46,7 +46,7 @@ pub fn naive_strategy() -> ContextStrategy {
 pub struct RunConfig {
     pub model: Model,
     pub system_prompt: String,
-    pub tools: Vec<ToolDef>,
+    pub tools: Vec<Box<dyn Tool>>,
     pub thinking: ThinkingLevel,
     pub max_tokens: Option<usize>,
     pub cwd: PathBuf,
@@ -70,8 +70,8 @@ pub async fn run(
     cancel: tokio_util::sync::CancellationToken,
 ) -> eyre::Result<()> {
     let tool_schemas: Vec<ToolSchema> = config.tools.iter().map(|t| t.schema()).collect();
-    let tool_map: HashMap<&str, &ToolDef> = config.tools.iter()
-        .map(|t| (t.name, t))
+    let tool_map: HashMap<&str, &dyn Tool> = config.tools.iter()
+        .map(|t| (t.name(), t.as_ref()))
         .collect();
 
     loop {
@@ -253,7 +253,7 @@ pub async fn run(
 
             let output = match tool_map.get(call_name.as_str()) {
                 Some(tool) => {
-                    (tool.run)(call_input.clone(), config.cwd.to_path_buf(), cancel.clone()).await
+                    tool.run(call_input.clone(), config.cwd.to_path_buf(), cancel.clone()).await
                 }
                 None => ToolOutput {
                     text: format!("Tool '{}' not found", call_name),

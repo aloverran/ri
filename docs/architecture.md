@@ -117,7 +117,7 @@ Layer 0: Foundation (ri)
   - Filing: per-session JSONL files
   - Model, ThinkingLevel, ModelCost
   - LlmProvider trait, RequestOptions, ApiError
-  - ToolDef, ToolFn, ToolOutput
+  - Tool trait, ToolOutput
   - StreamEvent, ToolSchema
 
 Layer 1: Provider (ri-ai)
@@ -163,12 +163,12 @@ ri/
 The foundation crate. Everything the rest of the system depends on:
 
 - Message types: `Message`, `Role`, `ContentBlock`, `Provenance`, `Usage`
-- `MessagePool`: in-memory store with insertion-order iteration
-- `SessionFiling`: per-session JSONL file read/write
+- `MessagePool`: in-memory store (HashMap; ordering is tracked externally by the caller)
+- `SessionStore`: per-session JSONL file read/write
 - Model types: `Model`, `ModelCost`, `ThinkingLevel`
 - `LlmProvider` trait and `RequestOptions`
 - `ApiError` types (Http, Api, ContextOverflow, RateLimited, StreamParse)
-- `ToolDef`, `ToolFn`, `ToolOutput` (tool definitions as function pointers)
+- `Tool` trait, `ToolOutput` (tool interface and results)
 - `StreamEvent` (normalized stream events from any provider)
 - `ToolSchema` (tool definitions as seen by the LLM API)
 
@@ -201,7 +201,7 @@ Does NOT handle: message storage, tool execution, agent loop.
 
 ### ri-tools
 
-Built-in tool implementations: bash, read, write, edit. Each uses the `ToolDef` type from ri. These are simple, mostly-finished modules.
+Built-in tool implementations: bash, read, write, edit. Each implements the `Tool` trait from ri. These are simple, mostly-finished modules.
 
 ### ri-cli
 

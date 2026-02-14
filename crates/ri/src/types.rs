@@ -1,13 +1,12 @@
-//! Provider interface, model definitions, tools, and stream events.
+//! Core types, traits, and protocols for ri.
 //!
-//! Defined in the core `ri` crate so the agent loop can call providers
-//! without depending on `ri-ai`. Contains everything needed to define
-//! and interact with LLM providers: model metadata, the streaming event
-//! protocol, tool definitions, and the LlmProvider trait itself.
+//! Defined in the foundation crate so higher layers can program against
+//! these abstractions without depending on specific implementations.
+//! Contains: model metadata, the LLM provider trait, the tool trait,
+//! the streaming event protocol, and error types.
 
 use std::path::PathBuf;
 use std::pin::Pin;
-use std::future::Future;
 use async_trait::async_trait;
 use futures::Stream;
 use serde::{Deserialize, Serialize};
@@ -77,34 +76,32 @@ pub struct ToolSchema {
     pub parameters: serde_json::Value,
 }
 
-/// Result of executing a tool. Text is returned to the LLM as a tool_result content block.
+/// Result of executing a tool.
 pub struct ToolOutput {
     pub text: String,
     pub is_error: bool,
 }
 
-/// Function pointer type for tool implementations. Each tool is a plain fn that
-/// returns a boxed future (needed to store heterogeneous async fns in a Vec).
-pub type ToolFn = fn(
-    serde_json::Value,
-    PathBuf,
-    tokio_util::sync::CancellationToken,
-) -> Pin<Box<dyn Future<Output = ToolOutput> + Send>>;
+/// A tool the agent can invoke. Provides schema (for the LLM API)
+/// and an async execution function.
+#[async_trait]
+pub trait Tool: Send + Sync {
+    fn name(&self) -> &str;
+    fn description(&self) -> &str;
+    fn parameters(&self) -> serde_json::Value;
 
-/// Static tool definition: schema for the LLM + implementation function.
-pub struct ToolDef {
-    pub name: &'static str,
-    pub description: &'static str,
-    pub parameters: serde_json::Value,
-    pub run: ToolFn,
-}
+    async fn run(
+        &self,
+        input: serde_json::Value,
+        cwd: PathBuf,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> ToolOutput;
 
-impl ToolDef {
-    pub fn schema(&self) -> ToolSchema {
+    fn schema(&self) -> ToolSchema {
         ToolSchema {
-            name: self.name.to_string(),
-            description: self.description.to_string(),
-            parameters: self.parameters.clone(),
+            name: self.name().to_string(),
+            description: self.description().to_string(),
+            parameters: self.parameters(),
         }
     }
 }

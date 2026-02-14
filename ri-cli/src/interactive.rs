@@ -1,7 +1,7 @@
 use ri_agent::{self as agent, AgentCallback, AgentEvent, RunConfig};
 use ri::{
     AuthMethod, ContentBlock, LlmProvider, Message, Model, Role, SessionStore, StreamEvent,
-    ThinkingLevel, ToolDef,
+    ThinkingLevel, Tool,
 };
 use std::io::Write;
 use std::path::PathBuf;
@@ -19,7 +19,7 @@ pub async fn run(
     mut provider: Box<dyn LlmProvider>,
     model: Model,
     system_prompt: String,
-    tools: Vec<ToolDef>,
+    tools: Vec<Box<dyn Tool>>,
     cwd: PathBuf,
     initial_prompt: Option<String>,
     thinking: ThinkingLevel,
