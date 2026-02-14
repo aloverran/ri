@@ -20,7 +20,6 @@ use reedline::{
     FileBackedHistory, Prompt, PromptEditMode, PromptHistorySearch,
     PromptHistorySearchStatus, Reedline, Signal,
 };
-use termimad::MadSkin;
 
 // ---------------------------------------------------------------------------
 // Prompt
@@ -66,26 +65,15 @@ impl Prompt for RiPrompt {
 }
 
 // ---------------------------------------------------------------------------
-// Markdown skin
-// ---------------------------------------------------------------------------
-
-fn make_skin() -> MadSkin {
-    let mut skin = MadSkin::default();
-    skin.set_headers_fg(crossterm::style::Color::Cyan);
-    skin.bold.set_fg(crossterm::style::Color::White);
-    skin.italic.set_fg(crossterm::style::Color::Yellow);
-    skin
-}
-
-// ---------------------------------------------------------------------------
 // TUI renderer -- drives the inline viewport during agent streaming
 // ---------------------------------------------------------------------------
 
-/// Height of the inline viewport in terminal rows.
-const VIEWPORT_HEIGHT: u16 = 8;
+/// Height of the inline viewport: 1 border line + 1 content line.
+const VIEWPORT_HEIGHT: u16 = 2;
 
-/// Phases the viewport cycles through for each assistant turn.
+/// Rendering phase for the status viewport.
 enum Phase {
+    Waiting,
     Thinking,
     Responding,
     Tool { name: String },
@@ -93,13 +81,16 @@ enum Phase {
 }
 
 /// Renders agent events into a ratatui inline viewport. Completed content
-/// is pushed above the viewport via `insert_before`.
+/// (thinking lines, rendered markdown, tool results) is pushed above the
+/// viewport via `insert_before` so it lives in terminal scrollback.
+/// The viewport itself is a small 2-line status bar showing current activity.
 struct TuiRenderer {
     terminal: Terminal<CrosstermBackend<io::Stdout>>,
-    skin: MadSkin,
     phase: Phase,
+    /// Accumulates response text during streaming; rendered as markdown on TextEnd.
     text_buf: String,
-    thinking_buf: String,
+    /// Accumulates the current incomplete thinking line for streaming to scrollback.
+    thinking_line: String,
     tick: usize,
 }
 
@@ -115,44 +106,82 @@ impl TuiRenderer {
             },
         )?;
 
-        Ok(Self {
+        let mut renderer = Self {
             terminal,
-            skin: make_skin(),
-            phase: Phase::Idle,
+            phase: Phase::Waiting,
             text_buf: String::new(),
-            thinking_buf: String::new(),
+            thinking_line: String::new(),
             tick: 0,
-        })
+        };
+
+        // Draw immediately so the viewport is never blank.
+        renderer.render_viewport();
+
+        Ok(renderer)
     }
 
+    /// Push a single styled line into terminal scrollback above the viewport.
     fn emit_line(&mut self, line: Line<'static>) {
         let _ = self.terminal.insert_before(1, |buf| {
-            let area = buf.area;
-            Paragraph::new(line).render(area, buf);
+            Paragraph::new(line).render(buf.area, buf);
         });
     }
 
+    /// Render markdown text and push it into scrollback above the viewport.
     fn emit_markdown(&mut self, md: &str) {
         if md.trim().is_empty() {
             return;
         }
-        let (width, _) = crossterm::terminal::size().unwrap_or((80, 24));
-        let formatted = self.skin.text(md, Some(width as usize));
-        let rendered = format!("{}", formatted);
-        for line_str in rendered.lines() {
-            self.emit_line(Line::raw(line_str.to_string()));
+        let text = tui_markdown::from_str(md);
+        if text.lines.is_empty() {
+            return;
+        }
+
+        let width = self.terminal.size().map(|s| s.width as usize).unwrap_or(80);
+
+        // Calculate total height accounting for line wrapping.
+        let total_height: usize = text.lines.iter().map(|line| {
+            let w = line.width();
+            if w == 0 || width == 0 { 1 } else { (w + width - 1) / width }
+        }).sum();
+
+        if total_height == 0 {
+            return;
+        }
+
+        let height = total_height.min(u16::MAX as usize) as u16;
+        let _ = self.terminal.insert_before(height, |buf| {
+            Paragraph::new(text)
+                .wrap(Wrap { trim: false })
+                .render(buf.area, buf);
+        });
+    }
+
+    /// Flush any complete thinking lines (ending with '\n') into scrollback as dim text.
+    fn flush_thinking_lines(&mut self) {
+        while let Some(pos) = self.thinking_line.find('\n') {
+            let line_text: String = self.thinking_line.drain(..=pos).collect();
+            let trimmed = line_text.trim_end();
+            if !trimmed.is_empty() {
+                self.emit_line(Line::styled(
+                    trimmed.to_string(),
+                    Style::default().add_modifier(Modifier::DIM),
+                ));
+            }
         }
     }
 
+    /// Draw the 2-line status viewport (border + content).
     fn render_viewport(&mut self) {
         self.tick += 1;
         let spinner = spinner_frame(self.tick);
 
         let (title, detail) = match &self.phase {
-            Phase::Thinking => ("thinking", tail_lines(&self.thinking_buf, 5)),
-            Phase::Responding => ("responding", tail_lines(&self.text_buf, 5)),
+            Phase::Waiting => ("waiting", "sending request...".to_string()),
+            Phase::Thinking => ("thinking", tail_line(&self.thinking_line)),
+            Phase::Responding => ("responding", tail_line(&self.text_buf)),
             Phase::Tool { name } => ("tool", format!("executing: {}", name)),
-            Phase::Idle => return,
+            Phase::Idle => ("idle", String::new()),
         };
 
         let title_str = format!(" {} {} ", spinner, title);
@@ -178,23 +207,24 @@ impl TuiRenderer {
         match evt {
             AgentEvent::Stream(se) => match se {
                 StreamEvent::ThinkingStart => {
-                    self.thinking_buf.clear();
+                    self.thinking_line.clear();
                     self.phase = Phase::Thinking;
                     self.render_viewport();
                 }
                 StreamEvent::ThinkingDelta(d) => {
-                    self.thinking_buf.push_str(d);
+                    self.thinking_line.push_str(d);
+                    self.flush_thinking_lines();
                     self.render_viewport();
                 }
                 StreamEvent::ThinkingEnd { .. } => {
-                    if !self.thinking_buf.is_empty() {
-                        let summary = thinking_summary(&self.thinking_buf);
+                    // Flush any remaining incomplete thinking line.
+                    if !self.thinking_line.is_empty() {
+                        let remaining = std::mem::take(&mut self.thinking_line);
                         self.emit_line(Line::styled(
-                            summary,
+                            remaining,
                             Style::default().add_modifier(Modifier::DIM),
                         ));
                     }
-                    self.thinking_buf.clear();
                     self.phase = Phase::Idle;
                 }
 
@@ -273,13 +303,11 @@ impl TuiRenderer {
         }
     }
 
-    /// Clear the viewport and disable raw mode. Content already pushed
-    /// via insert_before is preserved in scrollback.
+    /// Clear the viewport and restore normal terminal mode.
     fn teardown(self) {
-        // Dropping the terminal flushes and resets the viewport region.
         drop(self.terminal);
         let _ = crossterm::terminal::disable_raw_mode();
-        // Single newline so the next reedline prompt starts on a fresh line.
+        // Newline so the next reedline prompt starts on a fresh line.
         println!();
     }
 }
@@ -588,10 +616,8 @@ fn spinner_frame(tick: usize) -> &'static str {
     FRAMES[tick % FRAMES.len()]
 }
 
-fn tail_lines(s: &str, n: usize) -> String {
-    let lines: Vec<&str> = s.lines().collect();
-    let start = lines.len().saturating_sub(n);
-    lines[start..].join("\n")
+fn tail_line(s: &str) -> String {
+    s.lines().next_back().unwrap_or("").to_string()
 }
 
 fn truncate(s: &str, max: usize) -> String {
@@ -606,12 +632,6 @@ fn truncate(s: &str, max: usize) -> String {
             .unwrap_or(0);
         format!("{}... ({} bytes)", &s[..end], s.len())
     }
-}
-
-fn thinking_summary(thinking: &str) -> String {
-    let first = thinking.lines().next().unwrap_or("");
-    let truncated = truncate(first, 100);
-    format!("(thinking: {})", truncated)
 }
 
 fn session_name_from_prompt(prompt: Option<&str>) -> String {

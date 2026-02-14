@@ -31,4 +31,4 @@ async-stream.workspace = true
 ratatui = { version = "0.30", features = ["scrolling-regions"] }
 crossterm = "0.29"
 reedline = "0.45"
-termimad = "0.34"
+tui-markdown = "0.3"
