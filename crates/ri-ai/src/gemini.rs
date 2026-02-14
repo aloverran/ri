@@ -721,11 +721,12 @@ struct GeminiState {
     current_block: Option<GeminiBlock>,
     tool_call_counter: u64,
     usage: Usage,
+    done: bool,
 }
 
 impl GeminiState {
     fn new() -> Self {
-        Self { current_block: None, tool_call_counter: 0, usage: Usage::default() }
+        Self { current_block: None, tool_call_counter: 0, usage: Usage::default(), done: false }
     }
 
     fn emit_usage(&self, out: &mut Vec<Result<StreamEvent, ApiError>>) {
@@ -743,6 +744,7 @@ impl GeminiState {
             self.finish_block(&mut out);
             self.emit_usage(&mut out);
             out.push(Ok(StreamEvent::Done));
+            self.done = true;
             return out;
         }
 
@@ -761,6 +763,7 @@ impl GeminiState {
             self.finish_block(&mut out);
             out.push(Ok(StreamEvent::Error(message)));
             out.push(Ok(StreamEvent::Done));
+            self.done = true;
             return out;
         }
 
@@ -787,6 +790,7 @@ impl GeminiState {
         if let Some(reason) = candidate.get("finishReason").and_then(|r| r.as_str()) {
             self.finish_block(&mut out);
             self.emit_usage(&mut out);
+            self.done = true;
             match reason {
                 "STOP" | "MAX_TOKENS" => out.push(Ok(StreamEvent::Done)),
                 other => {
@@ -899,11 +903,14 @@ fn event_stream(
                 yield event;
             }
         }
-        let u = &state.usage;
-        if u.input_tokens > 0 || u.output_tokens > 0 {
-            yield Ok(StreamEvent::Usage(u.clone()));
+        // Only emit trailing Usage/Done if the state machine didn't already.
+        if !state.done {
+            let u = &state.usage;
+            if u.input_tokens > 0 || u.output_tokens > 0 {
+                yield Ok(StreamEvent::Usage(u.clone()));
+            }
+            yield Ok(StreamEvent::Done);
         }
-        yield Ok(StreamEvent::Done);
     })
 }
 
