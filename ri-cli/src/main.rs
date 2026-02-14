@@ -38,7 +38,12 @@ async fn main() -> Result<()> {
         .init();
 
     let cli = Cli::parse();
-    let cwd = cli.cwd.unwrap_or_else(|| std::env::current_dir().unwrap().display().to_string());
+    let cwd = cli.cwd.unwrap_or_else(|| {
+        std::env::current_dir()
+            .expect("could not determine current directory")
+            .display()
+            .to_string()
+    });
 
     tracing::info!("ri starting in {}", cwd);
 
