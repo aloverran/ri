@@ -138,7 +138,7 @@ struct ProviderState {
 impl GeminiProvider {
     pub fn new(variant: GeminiVariant) -> Self {
         let (token, project_id) = if let Some(creds) = load_creds(variant) {
-            (creds.access, creds.project_id.unwrap_or_default())
+            (creds.access_token, creds.project_id.unwrap_or_default())
         } else {
             (String::new(), String::new())
         };
@@ -164,7 +164,7 @@ impl GeminiProvider {
             if creds.is_expired() {
                 match refresh_token(&creds, self.variant).await {
                     Ok(refreshed) => {
-                        state.token = refreshed.access.clone();
+                        state.token = refreshed.access_token.clone();
                         state.project_id = refreshed.project_id.clone().unwrap_or_default();
                         let _ = save_creds(self.variant, &refreshed);
                     }
@@ -312,7 +312,7 @@ impl LlmProvider for GeminiProvider {
         let project_id = discover_project(&client, &access, self.variant).await?;
 
         let creds = Credentials {
-            refresh, access: access.clone(), expires,
+            refresh_token: refresh, access_token: access.clone(), expires,
             project_id: Some(project_id.clone()), email,
         };
         save_creds(self.variant, &creds)?;
@@ -345,7 +345,7 @@ async fn refresh_token(credentials: &Credentials, variant: GeminiVariant) -> eyr
         .form(&[
             ("client_id", cfg.client_id.as_str()),
             ("client_secret", cfg.client_secret.as_str()),
-            ("refresh_token", credentials.refresh.as_str()),
+            ("refresh_token", credentials.refresh_token.as_str()),
             ("grant_type", "refresh_token"),
         ])
         .send()
@@ -361,12 +361,12 @@ async fn refresh_token(credentials: &Credentials, variant: GeminiVariant) -> eyr
     let access = data["access_token"].as_str()
         .ok_or_else(|| eyre::eyre!("Missing access_token"))?.to_string();
     let refresh = data["refresh_token"].as_str()
-        .unwrap_or(&credentials.refresh).to_string();
+        .unwrap_or(&credentials.refresh_token).to_string();
     let expires_in = data["expires_in"].as_u64().unwrap_or(3600);
     let expires = Credentials::compute_expiry(expires_in);
 
     Ok(Credentials {
-        refresh, access, expires,
+        refresh_token: refresh, access_token: access, expires,
         project_id: credentials.project_id.clone(),
         email: credentials.email.clone(),
     })

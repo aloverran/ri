@@ -15,8 +15,8 @@ pub fn ri_dir() -> eyre::Result<PathBuf> {
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct Credentials {
-    pub access: String,
-    pub refresh: String,
+    pub access_token: String,
+    pub refresh_token: String,
     pub expires: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project_id: Option<String>,

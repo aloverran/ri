@@ -62,7 +62,7 @@ impl AnthropicProvider {
 
         if api_key.is_empty() {
             if let Some(creds) = load_creds() {
-                api_key = creds.access.clone();
+                api_key = creds.access_token.clone();
                 is_oauth = api_key.starts_with("sk-ant-oat");
             }
         } else {
@@ -91,7 +91,7 @@ impl AnthropicProvider {
                 if creds.is_expired() {
                     match refresh_token(&creds).await {
                         Ok(refreshed) => {
-                            state.api_key = refreshed.access.clone();
+                            state.api_key = refreshed.access_token.clone();
                             state.is_oauth = true;
                             let _ = save_creds(&refreshed);
                         }
@@ -199,7 +199,7 @@ impl LlmProvider for AnthropicProvider {
 
         let body: Value = response.json().await?;
         let creds = parse_token_response(&body)?;
-        let key = creds.access.clone();
+        let key = creds.access_token.clone();
         save_creds(&creds)?;
 
         let mut state = self.state.lock().await;
@@ -228,7 +228,7 @@ async fn refresh_token(credentials: &Credentials) -> eyre::Result<Credentials> {
         .json(&json!({
             "grant_type": "refresh_token",
             "client_id": CLIENT_ID,
-            "refresh_token": credentials.refresh,
+            "refresh_token": credentials.refresh_token,
         }))
         .send()
         .await?;
@@ -241,7 +241,7 @@ async fn refresh_token(credentials: &Credentials) -> eyre::Result<Credentials> {
 
     let body: Value = response.json().await?;
     let refresh = body["refresh_token"].as_str()
-        .unwrap_or(&credentials.refresh)
+        .unwrap_or(&credentials.refresh_token)
         .to_string();
 
     let mut access = body["access_token"].as_str()
@@ -255,7 +255,7 @@ async fn refresh_token(credentials: &Credentials) -> eyre::Result<Credentials> {
     let expires_in = body["expires_in"].as_u64().unwrap_or(3600);
     let expires = Credentials::compute_expiry(expires_in);
 
-    Ok(Credentials { access, refresh, expires, project_id: None, email: None })
+    Ok(Credentials { access_token: access, refresh_token: refresh, expires, project_id: None, email: None })
 }
 
 fn parse_token_response(body: &Value) -> eyre::Result<Credentials> {
@@ -274,7 +274,7 @@ fn parse_token_response(body: &Value) -> eyre::Result<Credentials> {
     let expires_in = body["expires_in"].as_u64().unwrap_or(3600);
     let expires = Credentials::compute_expiry(expires_in);
 
-    Ok(Credentials { access, refresh, expires, project_id: None, email: None })
+    Ok(Credentials { access_token: access, refresh_token: refresh, expires, project_id: None, email: None })
 }
 
 // -- Tool name mapping for OAuth (Claude Code compatibility) --
