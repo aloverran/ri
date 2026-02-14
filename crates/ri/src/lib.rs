@@ -20,7 +20,7 @@ pub use message::{
 };
 pub use model::{Model, ModelCost, ThinkingLevel};
 pub use provider::{ApiError, AuthMethod, EventStream, LlmProvider, RequestOptions};
-pub use filing::{SessionFiling, SessionHeader};
+pub use filing::{SessionStore, SessionHeader};
 pub use tool::{ToolDef, ToolFn, ToolOutput, ToolSchema};
 
 pub fn home_dir() -> eyre::Result<PathBuf> {

@@ -1,6 +1,6 @@
 use ri_agent::{self as agent, AgentCallback, AgentEvent, RunConfig};
 use ri::{
-    AuthMethod, ContentBlock, LlmProvider, Message, Model, Role, SessionFiling, StreamEvent,
+    AuthMethod, ContentBlock, LlmProvider, Message, Model, Role, SessionStore, StreamEvent,
     ThinkingLevel, ToolDef,
 };
 use std::io::Write;
@@ -25,7 +25,7 @@ pub async fn run(
     thinking: ThinkingLevel,
 ) -> eyre::Result<()> {
     let session_name = session_name_from_prompt(initial_prompt.as_deref());
-    let (mut filing, mut session_ids) = SessionFiling::init(
+    let (mut filing, mut session_ids) = SessionStore::init(
         &session_name,
         &cwd.display().to_string(),
         &system_prompt,

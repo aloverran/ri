@@ -1,6 +1,6 @@
 //! Agent loop -- MessagePool-aware.
 //!
-//! The loop operates on the MessagePool (via SessionFiling) rather than a bare Vec.
+//! The loop operates on the MessagePool (via SessionStore) rather than a bare Vec.
 //! A ContextStrategy selects which messages from the pool to send each turn.
 //! New messages (assistant responses, tool results) are written through filing
 //! (which puts them in the pool AND appends to the active session file).
@@ -11,7 +11,7 @@ use futures::StreamExt;
 
 use ri::{
     ContentBlock, JsonMap, LlmProvider, Message, MessagePool, Model, Provenance, RequestOptions,
-    Role, SessionFiling, StreamEvent, ThinkingLevel, ToolDef, ToolOutput, ToolSchema, Usage,
+    Role, SessionStore, StreamEvent, ThinkingLevel, ToolDef, ToolOutput, ToolSchema, Usage,
 };
 
 /// In-progress tool call being accumulated from streaming deltas.
@@ -64,7 +64,7 @@ pub trait AgentCallback {
 pub async fn run(
     provider: &dyn LlmProvider,
     config: &RunConfig,
-    filing: &mut SessionFiling,
+    filing: &mut SessionStore,
     session_ids: &mut Vec<String>,
     cb: &mut dyn AgentCallback,
     cancel: tokio_util::sync::CancellationToken,

@@ -21,7 +21,7 @@ pub struct SessionHeader {
 
 /// Manages the message pool and active session file. Loads history from
 /// existing .jsonl files and writes new messages to the active session.
-pub struct SessionFiling {
+pub struct SessionStore {
     pub pool: MessagePool,
     sessions_dir: PathBuf,
     active: Option<File>,
@@ -30,9 +30,9 @@ pub struct SessionFiling {
     active_counter: u64,
 }
 
-impl SessionFiling {
+impl SessionStore {
     pub fn new(sessions_dir: PathBuf) -> Self {
-        SessionFiling {
+        SessionStore {
             pool: MessagePool::new(),
             sessions_dir,
             active: None,

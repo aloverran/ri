@@ -1,7 +1,7 @@
 use clap::Parser;
 use color_eyre::eyre::Result;
 use ri_agent as agent;
-use ri::{ContentBlock, Message, Role, SessionFiling, ThinkingLevel};
+use ri::{ContentBlock, Message, Role, SessionStore, ThinkingLevel};
 
 mod interactive;
 mod print_mode;
@@ -71,7 +71,7 @@ async fn main() -> Result<()> {
 
             let is_json = cli.mode == "json" || cli.output == "json";
 
-            let (mut filing, mut session_ids) = SessionFiling::init("print", &cwd, &system_prompt)?;
+            let (mut filing, mut session_ids) = SessionStore::init("print", &cwd, &system_prompt)?;
 
             let user_id = filing.next_id();
             let user_msg = Message::new(user_id.clone(), Role::User, vec![ContentBlock::text(&prompt)]);

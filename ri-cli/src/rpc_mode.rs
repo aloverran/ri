@@ -1,6 +1,6 @@
 use ri_agent::{self as agent, AgentCallback, AgentEvent, RunConfig};
 use ri::{
-    ContentBlock, LlmProvider, Message, Model, Role, SessionFiling, ThinkingLevel, ToolDef,
+    ContentBlock, LlmProvider, Message, Model, Role, SessionStore, ThinkingLevel, ToolDef,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -43,7 +43,7 @@ pub async fn run(
     initial_prompt: Option<String>,
     thinking: ThinkingLevel,
 ) {
-    let (mut filing, mut session_ids) = match SessionFiling::init("rpc", &cwd.display().to_string(), &system_prompt) {
+    let (mut filing, mut session_ids) = match SessionStore::init("rpc", &cwd.display().to_string(), &system_prompt) {
         Ok(v) => v,
         Err(e) => {
             output_json(&json!({"type": "error", "message": format!("Failed to init session: {}", e)}));
