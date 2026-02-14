@@ -24,15 +24,18 @@ pub struct Credentials {
     pub email: Option<String>,
 }
 
+/// Buffer subtracted from expiry so we refresh before the token actually expires.
+const EXPIRY_BUFFER_MS: u64 = 5 * 60 * 1000;
+
 impl Credentials {
     pub fn is_expired(&self) -> bool {
-        epoch_ms() >= self.expires.saturating_sub(60_000)
+        epoch_ms() >= self.expires
     }
 
-    // Compute an expiry timestamp from an expires_in duration in seconds.
-    // Subtracts a 5-minute buffer to ensure we refresh before actual expiry.
+    /// Compute an expiry timestamp from an expires_in duration in seconds.
+    /// Subtracts a 5-minute buffer to ensure we refresh before actual expiry.
     pub fn compute_expiry(expires_in_seconds: u64) -> u64 {
-        epoch_ms() + (expires_in_seconds * 1000).saturating_sub(300_000)
+        epoch_ms() + (expires_in_seconds * 1000).saturating_sub(EXPIRY_BUFFER_MS)
     }
 }
 
