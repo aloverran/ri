@@ -1,12 +1,18 @@
-// Shared SSE (Server-Sent Events) parser.
+// Shared SSE (Server-Sent Events) parser and event stream driver.
 //
 // Both Anthropic and Gemini use standard SSE framing:
 //   event: <type>\n      (optional -- Gemini omits this)
 //   data: <payload>\n
 //   \n                   (blank line = event boundary)
 //
-// This parser handles the wire format. Each provider interprets
-// the payloads independently.
+// This module handles the wire format. Each provider implements
+// `SseInterpreter` to translate payloads into normalized StreamEvents.
+// `drive_sse_stream` wires the parser to an interpreter, producing
+// an EventStream.
+
+use std::pin::Pin;
+use futures::{Stream, StreamExt};
+use ri::{ApiError, EventStream, StreamEvent};
 
 pub struct SseEvent {
     pub event_type: String,
@@ -49,6 +55,53 @@ impl SseParser {
             None => Vec::new(),
         }
     }
+}
+
+/// Trait for SSE payload interpreters. Each provider implements this
+/// to translate raw SSE events into normalized StreamEvents.
+pub trait SseInterpreter: Send {
+    fn interpret(&mut self, sse: &SseEvent) -> Vec<Result<StreamEvent, ApiError>>;
+    /// Called after all SSE data has been consumed. Emit trailing events
+    /// (e.g. usage/done if the stream ended without an explicit stop signal).
+    fn finish(&mut self) -> Vec<Result<StreamEvent, ApiError>> { Vec::new() }
+}
+
+/// Convert a byte stream (from an HTTP response) into an EventStream
+/// by parsing SSE frames and interpreting them with the given interpreter.
+pub fn drive_sse_stream(
+    bytes: Pin<Box<dyn Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Send>>,
+    mut interpreter: impl SseInterpreter + 'static,
+) -> EventStream {
+    Box::pin(async_stream::stream! {
+        let mut parser = SseParser::new();
+        tokio::pin!(bytes);
+
+        while let Some(chunk) = bytes.next().await {
+            match chunk {
+                Ok(data) => {
+                    let text = String::from_utf8_lossy(&data);
+                    for sse in parser.feed(&text) {
+                        for event in interpreter.interpret(&sse) {
+                            yield event;
+                        }
+                    }
+                }
+                Err(e) => {
+                    yield Err(ApiError::Http(e.to_string()));
+                    return;
+                }
+            }
+        }
+
+        for sse in parser.flush() {
+            for event in interpreter.interpret(&sse) {
+                yield event;
+            }
+        }
+        for event in interpreter.finish() {
+            yield event;
+        }
+    })
 }
 
 fn parse_block(block: &str) -> Option<SseEvent> {

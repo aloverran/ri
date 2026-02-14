@@ -6,9 +6,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::pin::Pin;
 use async_trait::async_trait;
-use futures::{Stream, StreamExt};
 use serde_json::{json, Value};
 use tokio::sync::Mutex;
 
@@ -16,7 +14,7 @@ use ri::{
     ApiError, AuthMethod, ContentBlock, EventStream, LlmProvider, Message, Model, ModelCost,
     RequestOptions, Role, StreamEvent, ThinkingLevel, Usage,
 };
-use crate::sse::{SseEvent, SseParser};
+use crate::sse::{self, SseEvent, SseInterpreter};
 use crate::http;
 
 // -- Variant --
@@ -740,7 +738,7 @@ impl GeminiState {
         }
     }
 
-    fn interpret(&mut self, sse: &SseEvent) -> Vec<Result<StreamEvent, ApiError>> {
+    fn interpret_sse(&mut self, sse: &SseEvent) -> Vec<Result<StreamEvent, ApiError>> {
         let mut out = Vec::new();
 
         if sse.data.is_empty() { return out; }
@@ -875,47 +873,22 @@ impl GeminiState {
     }
 }
 
-// -- Event stream --
+impl SseInterpreter for GeminiState {
+    fn interpret(&mut self, sse: &SseEvent) -> Vec<Result<StreamEvent, ApiError>> {
+        self.interpret_sse(sse)
+    }
 
-fn event_stream(
-    bytes: Pin<Box<dyn Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Send>>,
-) -> EventStream {
-    Box::pin(async_stream::stream! {
-        let mut parser = SseParser::new();
-        let mut state = GeminiState::new();
-        tokio::pin!(bytes);
+    fn finish(&mut self) -> Vec<Result<StreamEvent, ApiError>> {
+        if self.done { return Vec::new(); }
+        let mut out = Vec::new();
+        self.emit_usage(&mut out);
+        out.push(Ok(StreamEvent::Done));
+        out
+    }
+}
 
-        while let Some(chunk) = bytes.next().await {
-            match chunk {
-                Ok(data) => {
-                    let text = String::from_utf8_lossy(&data);
-                    for sse in parser.feed(&text) {
-                        for event in state.interpret(&sse) {
-                            yield event;
-                        }
-                    }
-                }
-                Err(e) => {
-                    yield Err(ApiError::Http(e.to_string()));
-                    return;
-                }
-            }
-        }
-
-        for sse in parser.flush() {
-            for event in state.interpret(&sse) {
-                yield event;
-            }
-        }
-        // Only emit trailing Usage/Done if the state machine didn't already.
-        if !state.done {
-            let u = &state.usage;
-            if u.input_tokens > 0 || u.output_tokens > 0 {
-                yield Ok(StreamEvent::Usage(u.clone()));
-            }
-            yield Ok(StreamEvent::Done);
-        }
-    })
+fn event_stream(bytes: crate::http::ByteStream) -> EventStream {
+    sse::drive_sse_stream(bytes, GeminiState::new())
 }
 
 

@@ -5,9 +5,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::pin::Pin;
 use async_trait::async_trait;
-use futures::{Stream, StreamExt};
 use serde_json::{json, Value};
 use tokio::sync::Mutex;
 use tracing::warn;
@@ -16,7 +14,7 @@ use ri::{
     ApiError, AuthMethod, ContentBlock, EventStream, LlmProvider, Message, Model, ModelCost,
     RequestOptions, Role, StreamEvent, ThinkingLevel, ToolSchema, Usage,
 };
-use crate::sse::{SseEvent, SseParser};
+use crate::sse::{self, SseEvent, SseInterpreter};
 use crate::http;
 
 use crate::creds::{self, Credentials};
@@ -461,13 +459,23 @@ enum AnthropicBlock {
 struct AnthropicState {
     blocks: HashMap<usize, AnthropicBlock>,
     usage: Usage,
+    is_oauth: bool,
+    original_tools: Vec<ToolSchema>,
 }
 
 impl AnthropicState {
-    fn new() -> Self {
-        Self { blocks: HashMap::new(), usage: Usage::default() }
+    fn new(is_oauth: bool, original_tools: Vec<ToolSchema>) -> Self {
+        Self { blocks: HashMap::new(), usage: Usage::default(), is_oauth, original_tools }
     }
 
+    /// Remap Claude Code tool names back to our original names when using OAuth.
+    fn remap_tool_name(&self, name: String) -> String {
+        if !self.is_oauth { return name; }
+        from_claude_code_name(&name, &self.original_tools)
+    }
+}
+
+impl SseInterpreter for AnthropicState {
     fn interpret(&mut self, sse: &SseEvent) -> Vec<Result<StreamEvent, ApiError>> {
         let mut out = Vec::new();
 
@@ -494,7 +502,8 @@ impl AnthropicState {
                     }
                     "tool_use" => {
                         let id = parsed["content_block"]["id"].as_str().unwrap_or("").to_string();
-                        let name = parsed["content_block"]["name"].as_str().unwrap_or("").to_string();
+                        let raw_name = parsed["content_block"]["name"].as_str().unwrap_or("").to_string();
+                        let name = self.remap_tool_name(raw_name);
                         self.blocks.insert(index, AnthropicBlock::ToolUse { id: id.clone() });
                         out.push(Ok(StreamEvent::ToolCallStart { id, name }));
                     }
@@ -607,55 +616,10 @@ impl AnthropicState {
     }
 }
 
-// -- Event stream --
-
-fn remap_tool_event(
-    event: Result<StreamEvent, ApiError>,
-    is_oauth: bool,
-    original_tools: &[ToolSchema],
-) -> Result<StreamEvent, ApiError> {
-    if !is_oauth { return event; }
-    event.map(|evt| match evt {
-        StreamEvent::ToolCallStart { id, name } => {
-            let original = from_claude_code_name(&name, original_tools);
-            StreamEvent::ToolCallStart { id, name: original }
-        }
-        other => other,
-    })
-}
-
 fn event_stream(
-    bytes: Pin<Box<dyn Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Send>>,
+    bytes: crate::http::ByteStream,
     tools: &[ToolSchema],
     is_oauth: bool,
 ) -> EventStream {
-    let original_tools = tools.to_vec();
-    Box::pin(async_stream::stream! {
-        let mut parser = SseParser::new();
-        let mut state = AnthropicState::new();
-        tokio::pin!(bytes);
-
-        while let Some(chunk) = bytes.next().await {
-            match chunk {
-                Ok(data) => {
-                    let text = String::from_utf8_lossy(&data);
-                    for sse in parser.feed(&text) {
-                        for event in state.interpret(&sse) {
-                            yield remap_tool_event(event, is_oauth, &original_tools);
-                        }
-                    }
-                }
-                Err(e) => {
-                    yield Err(ApiError::Http(e.to_string()));
-                    return;
-                }
-            }
-        }
-
-        for sse in parser.flush() {
-            for event in state.interpret(&sse) {
-                yield remap_tool_event(event, is_oauth, &original_tools);
-            }
-        }
-    })
+    sse::drive_sse_stream(bytes, AnthropicState::new(is_oauth, tools.to_vec()))
 }
