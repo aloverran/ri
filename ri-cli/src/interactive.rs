@@ -124,7 +124,7 @@ pub async fn run(
                 continue;
             };
 
-            match login_provider.begin_login() {
+            match login_provider.begin_login().await {
                 Ok(Some(AuthMethod::PasteCode { url })) => {
                     eprintln!("\n\x1b[33mVisit this URL to authorize:\x1b[0m");
                     eprintln!("\x1b[4m{}\x1b[0m\n", url);

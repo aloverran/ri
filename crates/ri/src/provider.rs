@@ -65,7 +65,7 @@ pub trait LlmProvider: Send + Sync {
 
     /// Start a login flow. Returns an AuthMethod describing what
     /// the user needs to do, or None if login is not supported.
-    fn begin_login(&self) -> eyre::Result<Option<AuthMethod>>;
+    async fn begin_login(&self) -> eyre::Result<Option<AuthMethod>>;
 
     /// Complete a login flow with the code/callback from the user.
     async fn complete_login(&self, response: &str) -> eyre::Result<()>;

@@ -229,7 +229,7 @@ impl LlmProvider for GeminiProvider {
         self.state.try_lock().map(|s| !s.token.is_empty()).unwrap_or(false)
     }
 
-    fn begin_login(&self) -> eyre::Result<Option<AuthMethod>> {
+    async fn begin_login(&self) -> eyre::Result<Option<AuthMethod>> {
         let cfg = config_for(self.variant);
         let verifier = crate::pkce::generate_verifier();
         let challenge = crate::pkce::challenge(&verifier);
@@ -246,8 +246,7 @@ impl LlmProvider for GeminiProvider {
             crate::url::encode(&login_state),
         );
 
-        let mut state = self.state.try_lock()
-            .map_err(|_| eyre::eyre!("Provider state locked during login"))?;
+        let mut state = self.state.lock().await;
         state.login_verifier = Some(verifier);
         state.login_state = Some(login_state);
         drop(state);

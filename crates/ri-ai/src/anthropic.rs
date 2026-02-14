@@ -132,7 +132,7 @@ impl LlmProvider for AnthropicProvider {
         self.state.try_lock().map(|s| !s.api_key.is_empty()).unwrap_or(false)
     }
 
-    fn begin_login(&self) -> eyre::Result<Option<AuthMethod>> {
+    async fn begin_login(&self) -> eyre::Result<Option<AuthMethod>> {
         let verifier = crate::pkce::generate_verifier();
         let challenge = crate::pkce::challenge(&verifier);
         let login_state = crate::pkce::generate_verifier();
@@ -147,8 +147,7 @@ impl LlmProvider for AnthropicProvider {
             .append_pair("code_challenge_method", "S256")
             .append_pair("state", &login_state);
 
-        let mut state = self.state.try_lock()
-            .map_err(|_| eyre::eyre!("Provider state locked during login"))?;
+        let mut state = self.state.lock().await;
         state.login_verifier = Some(verifier);
         state.login_state = Some(login_state);
         drop(state);
