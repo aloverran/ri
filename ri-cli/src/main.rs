@@ -1,6 +1,6 @@
 use clap::Parser;
 use color_eyre::eyre::Result;
-use ri::{ContentBlock, Message, Role, SessionStore, ThinkingLevel};
+use ri::{SessionStore, ThinkingLevel};
 
 mod agent;
 mod interactive;
@@ -75,11 +75,6 @@ async fn main() -> Result<()> {
 
             let (mut store, mut message_ids) = SessionStore::init("print", &cwd_path, &system_prompt)?;
 
-            let user_id = store.next_id();
-            let user_msg = Message::new(user_id.clone(), Role::User, vec![ContentBlock::text(&prompt)]);
-            store.write_message(user_msg)?;
-            message_ids.push(user_id);
-
             let cancel = tokio_util::sync::CancellationToken::new();
             let handler: fn(&agent::AgentEvent) = if is_json {
                 print_mode::on_event_json
@@ -87,10 +82,10 @@ async fn main() -> Result<()> {
                 print_mode::on_event_text
             };
 
-            let events = agent::run(
-                provider.as_ref(), &model, &system_prompt, &tools,
-                &mut store, &mut message_ids, &cwd_path, thinking, None, cancel,
-            );
+            let events = agent::submit(
+                &prompt, provider.as_ref(), &model, &system_prompt, &tools,
+                &mut store, &mut message_ids, &cwd_path, thinking, cancel,
+            )?;
             tokio::pin!(events);
             while let Some(evt) = events.next().await {
                 handler(&evt);

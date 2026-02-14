@@ -32,12 +32,35 @@ pub enum AgentEvent {
     Error(String),
 }
 
+/// Persist a user message and start the agent loop. This is the standard
+/// entry point -- it creates the user message, writes it to the store,
+/// then delegates to `run`.
+pub fn submit<'a>(
+    text: &str,
+    provider: &'a dyn LlmProvider,
+    model: &'a Model,
+    system_prompt: &'a str,
+    tools: &'a [Box<dyn Tool>],
+    store: &'a mut SessionStore,
+    message_ids: &'a mut Vec<String>,
+    cwd: &'a Path,
+    thinking: ThinkingLevel,
+    cancel: tokio_util::sync::CancellationToken,
+) -> eyre::Result<impl Stream<Item = AgentEvent> + 'a> {
+    let user_id = store.next_id();
+    let user_msg = Message::new(user_id.clone(), Role::User, vec![ContentBlock::text(text)]);
+    store.write_message(user_msg)?;
+    message_ids.push(user_id);
+
+    Ok(run(provider, model, system_prompt, tools, store, message_ids, cwd, thinking, None, cancel))
+}
+
 /// Run the agent loop: stream LLM response, execute tool calls, persist
 /// everything, repeat until the model stops issuing tool calls.
 ///
 /// Yields `AgentEvent`s for the caller to observe. Fatal errors stop the
 /// stream after yielding an `AgentEvent::Error`.
-pub fn run<'a>(
+fn run<'a>(
     provider: &'a dyn LlmProvider,
     model: &'a Model,
     system_prompt: &'a str,

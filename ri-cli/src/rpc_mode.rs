@@ -1,8 +1,7 @@
 use crate::agent::{self, AgentEvent};
 use crate::print_mode;
 use ri::{
-    ContentBlock, LlmProvider, Message, Model, Role, SessionStore,
-    ThinkingLevel, Tool,
+    LlmProvider, Model, SessionStore, ThinkingLevel, Tool,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -50,19 +49,17 @@ pub async fn run(
     };
 
     if let Some(prompt) = initial_prompt {
-        let user_id = store.next_id();
-        let user_msg = Message::new(user_id.clone(), Role::User, vec![ContentBlock::text(&prompt)]);
-        if let Err(e) = store.write_message(user_msg) {
-            output_json(&json!({"type": "error", "message": format!("Failed to write message: {}", e)}));
-            return;
-        }
-        message_ids.push(user_id);
-
         let cancel = tokio_util::sync::CancellationToken::new();
-        let events = agent::run(
-            provider.as_ref(), &model, &system_prompt, &tools,
-            &mut store, &mut message_ids, &cwd, thinking, None, cancel,
-        );
+        let events = match agent::submit(
+            &prompt, provider.as_ref(), &model, &system_prompt, &tools,
+            &mut store, &mut message_ids, &cwd, thinking, cancel,
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                output_json(&json!({"type": "error", "message": format!("Failed to submit: {}", e)}));
+                return;
+            }
+        };
         tokio::pin!(events);
         while let Some(evt) = events.next().await {
             handle_event(&evt);
@@ -93,19 +90,17 @@ pub async fn run(
                     continue;
                 }
 
-                let user_id = store.next_id();
-                let user_msg = Message::new(user_id.clone(), Role::User, vec![ContentBlock::text(message)]);
-                if let Err(e) = store.write_message(user_msg) {
-                    output_json(&json!({"type": "error", "message": format!("Failed to write message: {}", e)}));
-                    continue;
-                }
-                message_ids.push(user_id);
-
                 let cancel = tokio_util::sync::CancellationToken::new();
-                let events = agent::run(
-                    provider.as_ref(), &model, &system_prompt, &tools,
-                    &mut store, &mut message_ids, &cwd, thinking, None, cancel,
-                );
+                let events = match agent::submit(
+                    message, provider.as_ref(), &model, &system_prompt, &tools,
+                    &mut store, &mut message_ids, &cwd, thinking, cancel,
+                ) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        output_json(&json!({"type": "error", "message": format!("Failed to submit: {}", e)}));
+                        continue;
+                    }
+                };
                 tokio::pin!(events);
                 while let Some(evt) = events.next().await {
                     handle_event(&evt);

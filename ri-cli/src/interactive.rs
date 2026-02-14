@@ -1,6 +1,6 @@
 use crate::agent::{self, AgentEvent};
 use ri::{
-    AuthMethod, ContentBlock, LlmProvider, Message, Model, Role, SessionStore,
+    AuthMethod, LlmProvider, Model, SessionStore,
     StreamEvent, ThinkingLevel, Tool,
 };
 use std::borrow::Cow;
@@ -444,22 +444,13 @@ async fn submit_prompt(
     cwd: &PathBuf,
     thinking: ThinkingLevel,
 ) -> eyre::Result<()> {
-    let user_id = store.next_id();
-    let user_msg = Message::new(
-        user_id.clone(),
-        Role::User,
-        vec![ContentBlock::text(text)],
-    );
-    store.write_message(user_msg)?;
-    message_ids.push(user_id);
-
     let mut tui = TuiRenderer::new()?;
     let cancel = tokio_util::sync::CancellationToken::new();
 
-    let events = agent::run(
-        provider, model, system_prompt, tools,
-        store, message_ids, cwd, thinking, None, cancel,
-    );
+    let events = agent::submit(
+        text, provider, model, system_prompt, tools,
+        store, message_ids, cwd, thinking, cancel,
+    )?;
     tokio::pin!(events);
     while let Some(evt) = events.next().await {
         tui.handle(&evt);
