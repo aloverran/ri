@@ -41,7 +41,7 @@ Solution: Use #[async_trait], which handles the boxing for you.
 * Names must reflect intent, not just implementation.
 * Practice 'Strict Hygiene' with includes and imports. Use typedefs/using directives only to add semantic meaning, not just to save typing characters. If a type is complex, alias it to what it represents in the domain.
 * Files names should always stay in sync with the content within the file.
-* We prefer longer files (like c) over separating every comonent into a file. This follows from the principle of narrative readability. Many small files means you must jump around (losing the narrative of the code).
+* We prefer longer files (like c) over separating every component into a file. This follows from the principle of narrative readability. Many small files means you must jump around (losing the narrative of the code).
 * Type comments should speak as describing the thing they are above (ie. singular not plural)
 
 ## Clean Code
@@ -65,7 +65,7 @@ On documentation and commenting, the more fundamental (used) or public something
 On API-design: A well-designed API has the property that any ordering of function calls to it forms a valid system state. These APIs form almost a language for expressing what you want out of them, and they are robust because changes to the way it is used do not create hidden bugs or put the system in an invalid state. Great APIs are often expressive: they are flexible, made of simple building blocks but with the ability to form various more-complex shapes.
 
 * Primitives types are useful for data storage, but not as useful for domain modeling. Where it's not excessive, use domain specific types rather than primitives.
-* We don't mind pulling in 'fundamental' crates in the Rust ecosystem as long as they are small and focused. It makes code easier to on-board when we use apis that other projects use.
+* We don't mind pulling in 'fundamental' crates in the Rust ecosystem as long as they are intentional. It makes code easier to on-board when we use apis that other projects use, and keeps overall code bloat low. 
 
 # Composability
 So what makes a system composable? I see two major properties:
