@@ -326,7 +326,7 @@ pub async fn run(
     thinking: ThinkingLevel,
 ) -> eyre::Result<()> {
     let session_name = session_name_from_prompt(initial_prompt.as_deref());
-    let (mut filing, mut session_ids) = SessionStore::init(
+    let (mut store, mut message_ids) = SessionStore::init(
         &session_name,
         &cwd,
         &system_prompt,
@@ -337,7 +337,7 @@ pub async fn run(
         println!("ri> {}", prompt);
         submit_prompt(
             &prompt, provider.as_ref(), &model, &system_prompt,
-            &tools, &mut filing, &mut session_ids, &cwd, thinking,
+            &tools, &mut store, &mut message_ids, &cwd, thinking,
         ).await?;
     }
 
@@ -406,7 +406,7 @@ pub async fn run(
                 // Normal prompt.
                 submit_prompt(
                     trimmed, provider.as_ref(), &model, &system_prompt,
-                    &tools, &mut filing, &mut session_ids, &cwd, thinking,
+                    &tools, &mut store, &mut message_ids, &cwd, thinking,
                 ).await?;
             }
 
@@ -439,26 +439,26 @@ async fn submit_prompt(
     model: &Model,
     system_prompt: &str,
     tools: &[Box<dyn Tool>],
-    filing: &mut SessionStore,
-    session_ids: &mut Vec<String>,
+    store: &mut SessionStore,
+    message_ids: &mut Vec<String>,
     cwd: &PathBuf,
     thinking: ThinkingLevel,
 ) -> eyre::Result<()> {
-    let user_id = filing.next_id();
+    let user_id = store.next_id();
     let user_msg = Message::new(
         user_id.clone(),
         Role::User,
         vec![ContentBlock::text(text)],
     );
-    filing.write_message(user_msg)?;
-    session_ids.push(user_id);
+    store.write_message(user_msg)?;
+    message_ids.push(user_id);
 
     let mut tui = TuiRenderer::new()?;
     let cancel = tokio_util::sync::CancellationToken::new();
 
     let events = agent::run(
         provider, model, system_prompt, tools,
-        filing, session_ids, cwd, thinking, None, cancel,
+        store, message_ids, cwd, thinking, None, cancel,
     );
     tokio::pin!(events);
     while let Some(evt) = events.next().await {

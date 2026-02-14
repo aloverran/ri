@@ -73,12 +73,12 @@ async fn main() -> Result<()> {
 
             let is_json = cli.mode == "json" || cli.output == "json";
 
-            let (mut filing, mut session_ids) = SessionStore::init("print", &cwd_path, &system_prompt)?;
+            let (mut store, mut message_ids) = SessionStore::init("print", &cwd_path, &system_prompt)?;
 
-            let user_id = filing.next_id();
+            let user_id = store.next_id();
             let user_msg = Message::new(user_id.clone(), Role::User, vec![ContentBlock::text(&prompt)]);
-            filing.write_message(user_msg)?;
-            session_ids.push(user_id);
+            store.write_message(user_msg)?;
+            message_ids.push(user_id);
 
             let cancel = tokio_util::sync::CancellationToken::new();
             let handler: fn(&agent::AgentEvent) = if is_json {
@@ -89,7 +89,7 @@ async fn main() -> Result<()> {
 
             let events = agent::run(
                 provider.as_ref(), &model, &system_prompt, &tools,
-                &mut filing, &mut session_ids, &cwd_path, thinking, None, cancel,
+                &mut store, &mut message_ids, &cwd_path, thinking, None, cancel,
             );
             tokio::pin!(events);
             while let Some(evt) = events.next().await {

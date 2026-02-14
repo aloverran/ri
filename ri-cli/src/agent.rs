@@ -42,8 +42,8 @@ pub fn run<'a>(
     model: &'a Model,
     system_prompt: &'a str,
     tools: &'a [Box<dyn Tool>],
-    filing: &'a mut SessionStore,
-    session_ids: &'a mut Vec<String>,
+    store: &'a mut SessionStore,
+    message_ids: &'a mut Vec<String>,
     cwd: &'a Path,
     thinking: ThinkingLevel,
     max_tokens: Option<usize>,
@@ -59,8 +59,8 @@ pub fn run<'a>(
             if cancel.is_cancelled() { break; }
 
             // Resolve messages from the pool for this turn.
-            let input_ids: Vec<String> = session_ids.clone();
-            let messages: Vec<Message> = filing.pool.resolve_existing(&input_ids)
+            let input_ids: Vec<String> = message_ids.clone();
+            let messages: Vec<Message> = store.pool.resolve_existing(&input_ids)
                 .into_iter()
                 .cloned()
                 .collect();
@@ -98,7 +98,7 @@ pub fn run<'a>(
             let (content, usage) = turn.finish();
 
             // Build and persist the assistant message.
-            let assistant_id = filing.next_id();
+            let assistant_id = store.next_id();
             let assistant_msg = Message {
                 id: assistant_id.clone(),
                 role: Role::Assistant,
@@ -112,11 +112,11 @@ pub fn run<'a>(
                 meta: None,
                 extra: JsonMap::new(),
             };
-            if let Err(e) = filing.write_message(assistant_msg.clone()) {
+            if let Err(e) = store.write_message(assistant_msg.clone()) {
                 yield AgentEvent::Error(e.to_string());
                 break;
             }
-            session_ids.push(assistant_id);
+            message_ids.push(assistant_id);
             yield AgentEvent::MessageComplete(assistant_msg);
 
             // Extract tool calls.
@@ -160,13 +160,13 @@ pub fn run<'a>(
             }
 
             // Persist tool results.
-            let tool_id = filing.next_id();
+            let tool_id = store.next_id();
             let tool_msg = Message::new(tool_id.clone(), Role::User, results);
-            if let Err(e) = filing.write_message(tool_msg.clone()) {
+            if let Err(e) = store.write_message(tool_msg.clone()) {
                 yield AgentEvent::Error(e.to_string());
                 break;
             }
-            session_ids.push(tool_id);
+            message_ids.push(tool_id);
             yield AgentEvent::MessageComplete(tool_msg);
         }
     }

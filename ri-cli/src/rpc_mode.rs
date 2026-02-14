@@ -41,7 +41,7 @@ pub async fn run(
     initial_prompt: Option<String>,
     thinking: ThinkingLevel,
 ) {
-    let (mut filing, mut session_ids) = match SessionStore::init("rpc", &cwd, &system_prompt) {
+    let (mut store, mut message_ids) = match SessionStore::init("rpc", &cwd, &system_prompt) {
         Ok(v) => v,
         Err(e) => {
             output_json(&json!({"type": "error", "message": format!("Failed to init session: {}", e)}));
@@ -50,18 +50,18 @@ pub async fn run(
     };
 
     if let Some(prompt) = initial_prompt {
-        let user_id = filing.next_id();
+        let user_id = store.next_id();
         let user_msg = Message::new(user_id.clone(), Role::User, vec![ContentBlock::text(&prompt)]);
-        if let Err(e) = filing.write_message(user_msg) {
+        if let Err(e) = store.write_message(user_msg) {
             output_json(&json!({"type": "error", "message": format!("Failed to write message: {}", e)}));
             return;
         }
-        session_ids.push(user_id);
+        message_ids.push(user_id);
 
         let cancel = tokio_util::sync::CancellationToken::new();
         let events = agent::run(
             provider.as_ref(), &model, &system_prompt, &tools,
-            &mut filing, &mut session_ids, &cwd, thinking, None, cancel,
+            &mut store, &mut message_ids, &cwd, thinking, None, cancel,
         );
         tokio::pin!(events);
         while let Some(evt) = events.next().await {
@@ -93,18 +93,18 @@ pub async fn run(
                     continue;
                 }
 
-                let user_id = filing.next_id();
+                let user_id = store.next_id();
                 let user_msg = Message::new(user_id.clone(), Role::User, vec![ContentBlock::text(message)]);
-                if let Err(e) = filing.write_message(user_msg) {
+                if let Err(e) = store.write_message(user_msg) {
                     output_json(&json!({"type": "error", "message": format!("Failed to write message: {}", e)}));
                     continue;
                 }
-                session_ids.push(user_id);
+                message_ids.push(user_id);
 
                 let cancel = tokio_util::sync::CancellationToken::new();
                 let events = agent::run(
                     provider.as_ref(), &model, &system_prompt, &tools,
-                    &mut filing, &mut session_ids, &cwd, thinking, None, cancel,
+                    &mut store, &mut message_ids, &cwd, thinking, None, cancel,
                 );
                 tokio::pin!(events);
                 while let Some(evt) = events.next().await {
