@@ -176,7 +176,7 @@ impl MessagePool {
         self.messages.values()
             .filter(|m| {
                 m.provenance.as_ref()
-                    .map_or(false, |p| p.input.iter().any(|i| i == id))
+                    .is_some_and(|p| p.input.iter().any(|i| i == id))
             })
             .collect()
     }

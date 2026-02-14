@@ -74,7 +74,7 @@ impl SessionFiling {
             .filter_map(|e| e.ok())
             .filter(|e| {
                 e.path().extension()
-                    .map_or(false, |ext| ext == "jsonl")
+                    .is_some_and(|ext| ext == "jsonl")
             })
             .collect();
 
