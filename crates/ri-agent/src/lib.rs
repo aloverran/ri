@@ -14,6 +14,12 @@ use ri::{
     Role, SessionFiling, StreamEvent, ThinkingLevel, ToolDef, ToolOutput, ToolSchema, Usage,
 };
 
+/// In-progress tool call being accumulated from streaming deltas.
+struct PendingToolCall {
+    name: String,
+    json_buf: String,
+}
+
 /// Events emitted by the agent loop for display, logging, or RPC output.
 #[derive(Debug, Clone)]
 pub enum AgentEvent {
@@ -104,7 +110,7 @@ pub async fn run(
         // Accumulate the response.
         let mut text_buf = String::new();
         let mut thinking_buf = String::new();
-        let mut tool_calls: HashMap<String, (String, String)> = HashMap::new();
+        let mut tool_calls: HashMap<String, PendingToolCall> = HashMap::new();
         let mut content_blocks: Vec<ContentBlock> = Vec::new();
         let mut usage: Option<Usage> = None;
 
@@ -145,19 +151,22 @@ pub async fn run(
                             }
                         }
                         StreamEvent::ToolCallStart { id, name } => {
-                            tool_calls.insert(id.clone(), (name.clone(), String::new()));
+                            tool_calls.insert(id.clone(), PendingToolCall {
+                                name: name.clone(),
+                                json_buf: String::new(),
+                            });
                         }
                         StreamEvent::ToolCallDelta { id, json_fragment } => {
-                            if let Some((_, json)) = tool_calls.get_mut(id) {
-                                json.push_str(json_fragment);
+                            if let Some(tc) = tool_calls.get_mut(id) {
+                                tc.json_buf.push_str(json_fragment);
                             }
                         }
                         StreamEvent::ToolCallEnd { id, sig } => {
-                            if let Some((name, json)) = tool_calls.remove(id) {
-                                let input: serde_json::Value = serde_json::from_str(&json)
+                            if let Some(tc) = tool_calls.remove(id) {
+                                let input: serde_json::Value = serde_json::from_str(&tc.json_buf)
                                     .unwrap_or_else(|_| serde_json::json!({
                                         "error": "Invalid JSON from model",
-                                        "partial": json,
+                                        "partial": tc.json_buf,
                                     }));
                                 let mut extra = JsonMap::new();
                                 if let Some(s) = sig {
@@ -165,7 +174,7 @@ pub async fn run(
                                 }
                                 content_blocks.push(ContentBlock::ToolUse {
                                     id: id.clone(),
-                                    name,
+                                    name: tc.name,
                                     input,
                                     extra,
                                 });
@@ -193,10 +202,10 @@ pub async fn run(
         if !thinking_buf.is_empty() {
             content_blocks.push(ContentBlock::thinking(thinking_buf));
         }
-        for (id, (name, json)) in tool_calls {
-            let input = serde_json::from_str(&json)
-                .unwrap_or_else(|_| serde_json::json!({ "error": "Interrupted", "partial": json }));
-            content_blocks.push(ContentBlock::tool_use(id, name, input));
+        for (id, tc) in tool_calls {
+            let input = serde_json::from_str(&tc.json_buf)
+                .unwrap_or_else(|_| serde_json::json!({ "error": "Interrupted", "partial": tc.json_buf }));
+            content_blocks.push(ContentBlock::tool_use(id, tc.name, input));
         }
 
         // Build assistant message with provenance.
