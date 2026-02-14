@@ -137,23 +137,17 @@ impl TuiRenderer {
             return;
         }
 
-        let width = self.terminal.size().map(|s| s.width as usize).unwrap_or(80);
+        let width = self.terminal.size().map(|s| s.width).unwrap_or(80);
+        let para = Paragraph::new(text).wrap(Wrap { trim: false });
+        let height = para.line_count(width);
 
-        // Calculate total height accounting for line wrapping.
-        let total_height: usize = text.lines.iter().map(|line| {
-            let w = line.width();
-            if w == 0 || width == 0 { 1 } else { (w + width - 1) / width }
-        }).sum();
-
-        if total_height == 0 {
+        if height == 0 {
             return;
         }
 
-        let height = total_height.min(u16::MAX as usize) as u16;
+        let height = height.min(u16::MAX as usize) as u16;
         let _ = self.terminal.insert_before(height, |buf| {
-            Paragraph::new(text)
-                .wrap(Wrap { trim: false })
-                .render(buf.area, buf);
+            (&para).render(buf.area, buf);
         });
     }
 
