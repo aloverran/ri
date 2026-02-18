@@ -66,7 +66,10 @@ impl Phase {
 struct TuiState {
     phase: Phase,
     text_buf: String,
+    text_emitted: usize,
+    in_code_fence: bool,
     thinking_buf: String,
+    thinking_emitted: usize,
     textarea: TextArea<'static>,
     total_usage: Usage,
     model_name: String,
@@ -101,7 +104,10 @@ impl Tui {
             state: TuiState {
                 phase: Phase::Input,
                 text_buf: String::new(),
+                text_emitted: 0,
+                in_code_fence: false,
                 thinking_buf: String::new(),
+                thinking_emitted: 0,
                 textarea: new_textarea(),
                 total_usage: Usage::default(),
                 model_name,
@@ -149,6 +155,119 @@ impl Tui {
         self.draw()
     }
 
+    // -- Progressive emission --
+
+    /// Emit completed paragraphs from text_buf to scrollback.
+    /// A "safe boundary" is a \n\n that's outside an unclosed code fence.
+    fn try_emit_text(&mut self) -> io::Result<()> {
+        let (emit_str, new_offset, new_fence) = {
+            let buf = &self.state.text_buf;
+            let from = self.state.text_emitted;
+            let bytes = buf.as_bytes();
+            let mut pos = from;
+            let mut last_safe = from;
+            let mut in_fence = self.state.in_code_fence;
+
+            while pos < bytes.len() {
+                if (pos == 0 || bytes[pos - 1] == b'\n')
+                    && pos + 3 <= bytes.len()
+                    && &bytes[pos..pos + 3] == b"```"
+                {
+                    in_fence = !in_fence;
+                }
+                if !in_fence
+                    && pos + 1 < bytes.len()
+                    && bytes[pos] == b'\n'
+                    && bytes[pos + 1] == b'\n'
+                {
+                    last_safe = pos + 2;
+                }
+                pos += 1;
+            }
+
+            if last_safe > from {
+                (Some(buf[from..last_safe].to_string()), last_safe, in_fence)
+            } else {
+                (None, from, in_fence)
+            }
+        };
+
+        self.state.in_code_fence = new_fence;
+        self.state.text_emitted = new_offset;
+
+        if let Some(text) = emit_str {
+            let md = tui_markdown::from_str(&text);
+            let lines: Vec<Line<'static>> = md.lines.into_iter().map(own_line).collect();
+            self.emit_and_draw(lines)
+        } else {
+            self.draw()
+        }
+    }
+
+    /// Emit completed lines from thinking_buf to scrollback.
+    fn try_emit_thinking(&mut self) -> io::Result<()> {
+        let emit_str = {
+            let buf = &self.state.thinking_buf;
+            let from = self.state.thinking_emitted;
+            buf[from..].rfind('\n').map(|i| {
+                let boundary = from + i + 1;
+                (buf[from..boundary].to_string(), boundary)
+            })
+        };
+
+        if let Some((text, new_offset)) = emit_str {
+            self.state.thinking_emitted = new_offset;
+            let lines: Vec<Line<'static>> = text
+                .lines()
+                .map(|l| {
+                    Line::styled(
+                        l.to_string(),
+                        Style::default().add_modifier(Modifier::DIM),
+                    )
+                })
+                .collect();
+            self.emit_and_draw(lines)
+        } else {
+            self.draw()
+        }
+    }
+
+    /// Flush all remaining text_buf content to scrollback.
+    fn flush_text(&mut self) -> io::Result<()> {
+        let remaining = self.state.text_buf[self.state.text_emitted..].to_string();
+        self.state.text_buf.clear();
+        self.state.text_emitted = 0;
+        self.state.in_code_fence = false;
+        if !remaining.is_empty() {
+            let md = tui_markdown::from_str(&remaining);
+            let lines: Vec<Line<'static>> = md.lines.into_iter().map(own_line).collect();
+            self.emit_and_draw(lines)
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Flush all remaining thinking_buf content to scrollback.
+    fn flush_thinking(&mut self) -> io::Result<()> {
+        let remaining = self.state.thinking_buf[self.state.thinking_emitted..].to_string();
+        self.state.thinking_buf.clear();
+        self.state.thinking_emitted = 0;
+        if !remaining.is_empty() {
+            let lines: Vec<Line<'static>> = remaining
+                .lines()
+                .map(|l| {
+                    Line::styled(
+                        l.to_string(),
+                        Style::default().add_modifier(Modifier::DIM),
+                    )
+                })
+                .collect();
+            self.emit_and_draw(lines)
+        } else {
+            Ok(())
+        }
+    }
+
     // -- Agent events --
 
     fn handle_agent_event(&mut self, evt: &AgentEvent) -> io::Result<()> {
@@ -186,75 +305,60 @@ impl Tui {
     }
 
     fn handle_stream_event(&mut self, se: &StreamEvent) -> io::Result<()> {
-        let mut to_emit: Vec<Line<'static>> = Vec::new();
-
         match se {
             StreamEvent::ThinkingStart => {
                 self.state.thinking_buf.clear();
+                self.state.thinking_emitted = 0;
                 self.state.phase = Phase::Thinking;
+                self.draw()
             }
             StreamEvent::ThinkingDelta(d) => {
                 self.state.thinking_buf.push_str(d);
+                self.try_emit_thinking()
             }
             StreamEvent::ThinkingEnd { .. } => {
-                let text = std::mem::take(&mut self.state.thinking_buf);
-                if !text.is_empty() {
-                    to_emit = text
-                        .lines()
-                        .map(|l| {
-                            Line::styled(
-                                l.to_string(),
-                                Style::default().add_modifier(Modifier::DIM),
-                            )
-                        })
-                        .collect();
-                }
+                self.flush_thinking()?;
                 self.state.phase = Phase::Waiting;
+                self.draw()
             }
             StreamEvent::TextStart => {
                 self.state.text_buf.clear();
+                self.state.text_emitted = 0;
+                self.state.in_code_fence = false;
                 self.state.phase = Phase::Responding;
+                self.draw()
             }
             StreamEvent::TextDelta(d) => {
                 self.state.text_buf.push_str(d);
+                self.try_emit_text()
             }
             StreamEvent::TextEnd { .. } => {
-                let text = std::mem::take(&mut self.state.text_buf);
-                if !text.is_empty() {
-                    let md = tui_markdown::from_str(&text);
-                    to_emit = md.lines.into_iter().map(own_line).collect();
-                }
+                self.flush_text()?;
                 self.state.phase = Phase::Waiting;
+                self.draw()
             }
             StreamEvent::ToolCallStart { name, .. } => {
                 self.state.phase = Phase::Tool(name.clone());
+                self.draw()
             }
             StreamEvent::Usage(u) => {
                 self.state.total_usage.input_tokens += u.input_tokens;
                 self.state.total_usage.output_tokens += u.output_tokens;
                 self.state.total_usage.cache_read_tokens += u.cache_read_tokens;
                 self.state.total_usage.cache_write_tokens += u.cache_write_tokens;
-                to_emit = vec![Line::styled(
+                self.emit_and_draw(vec![Line::styled(
                     format!(
                         "tokens: {} in / {} out / {} cached",
                         u.input_tokens, u.output_tokens, u.cache_read_tokens
                     ),
                     Style::default().add_modifier(Modifier::DIM),
-                )];
+                )])
             }
-            StreamEvent::Error(msg) => {
-                to_emit = vec![Line::styled(
-                    format!("error: {}", msg),
-                    Style::default().fg(Color::Red),
-                )];
-            }
-            _ => {}
-        }
-
-        if to_emit.is_empty() {
-            self.draw()
-        } else {
-            self.emit_and_draw(to_emit)
+            StreamEvent::Error(msg) => self.emit_and_draw(vec![Line::styled(
+                format!("error: {}", msg),
+                Style::default().fg(Color::Red),
+            )]),
+            _ => self.draw(),
         }
     }
 }
@@ -301,14 +405,33 @@ fn render_preview(frame: &mut Frame, state: &TuiState, area: Rect) {
     }
 
     let lines: Vec<Line<'static>> = match &state.phase {
-        Phase::Thinking if !state.thinking_buf.is_empty() => state
-            .thinking_buf
-            .lines()
-            .map(|l| Line::styled(l.to_string(), Style::default().add_modifier(Modifier::DIM)))
-            .collect(),
-        Phase::Responding if !state.text_buf.is_empty() => {
-            let text = tui_markdown::from_str(&state.text_buf);
-            text.lines.into_iter().map(own_line).collect()
+        Phase::Thinking => {
+            let pending = &state.thinking_buf[state.thinking_emitted..];
+            if pending.is_empty() {
+                vec![Line::styled(
+                    "thinking...",
+                    Style::default().add_modifier(Modifier::DIM),
+                )]
+            } else {
+                pending
+                    .lines()
+                    .map(|l| {
+                        Line::styled(
+                            l.to_string(),
+                            Style::default().add_modifier(Modifier::DIM),
+                        )
+                    })
+                    .collect()
+            }
+        }
+        Phase::Responding => {
+            let pending = &state.text_buf[state.text_emitted..];
+            if pending.is_empty() {
+                vec![]
+            } else {
+                let text = tui_markdown::from_str(pending);
+                text.lines.into_iter().map(own_line).collect()
+            }
         }
         _ => vec![Line::styled(
             state.phase.detail(),
@@ -544,24 +667,12 @@ async fn run_prompt(
         }
     }
 
-    // Flush any remaining streaming content to scrollback.
-    let mut final_lines: Vec<Line<'static>> = Vec::new();
+    // Flush any remaining streaming content to scrollback (e.g. after cancellation).
     if !tui.state.text_buf.is_empty() {
-        let text = std::mem::take(&mut tui.state.text_buf);
-        let md = tui_markdown::from_str(&text);
-        final_lines.extend(md.lines.into_iter().map(own_line));
+        tui.flush_text()?;
     }
     if !tui.state.thinking_buf.is_empty() {
-        let text = std::mem::take(&mut tui.state.thinking_buf);
-        final_lines.extend(text.lines().map(|l| {
-            Line::styled(
-                l.to_string(),
-                Style::default().add_modifier(Modifier::DIM),
-            )
-        }));
-    }
-    if !final_lines.is_empty() {
-        tui.emit_and_draw(final_lines)?;
+        tui.flush_thinking()?;
     }
 
     tui.state.phase = Phase::Input;
