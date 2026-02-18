@@ -29,6 +29,6 @@ tokio-util.workspace = true
 urlencoding.workspace = true
 async-stream.workspace = true
 ratatui = { version = "0.30", features = ["scrolling-regions", "unstable-rendered-line-info"] }
-crossterm = "0.29"
-reedline = "0.45"
+crossterm = { version = "0.29", features = ["event-stream"] }
+tui-textarea = { git = "https://github.com/phsym/tui-textarea", default-features = false, features = ["crossterm"] }
 tui-markdown = "0.3"

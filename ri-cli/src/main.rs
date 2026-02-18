@@ -96,8 +96,6 @@ async fn main() -> Result<()> {
             rpc_mode::run(provider, model, system_prompt, tools, cwd_path, cli.prompt, thinking).await;
         }
         "interactive" => {
-            eprintln!("ri - a Rust coding agent");
-            eprintln!("Type /help for commands, /quit to exit.\n");
             interactive::run(provider, model, system_prompt, tools, cwd_path, cli.prompt, thinking).await?;
         }
         other => {

@@ -1,28 +1,409 @@
+//! Interactive TUI for agent sessions.
+//!
+//! Uses a small ratatui Viewport::Inline pinned to the bottom of the terminal.
+//! Completed content is pushed to normal terminal scrollback via insert_before.
+//! The viewport only handles live concerns: streaming preview, input, and status.
+
 use crate::agent::{self, AgentEvent};
-use ri::{
-    AuthMethod, LlmProvider, Model, SessionStore,
-    StreamEvent, ThinkingLevel, Tool,
-};
-use std::borrow::Cow;
-use std::io;
+use ri::{AuthMethod, LlmProvider, Model, SessionStore, StreamEvent, ThinkingLevel, Tool, Usage};
+
+use std::io::{self, Write};
 use std::path::PathBuf;
 
-use crossterm::style::Color;
+use crossterm::event::{Event, EventStream, KeyCode, KeyModifiers};
 use futures::StreamExt;
 use ratatui::{
     backend::CrosstermBackend,
-    style::{Modifier, Style},
-    text::{Line, Span},
+    layout::{Constraint, Layout, Rect},
+    style::{Color, Modifier, Style},
+    text::{Line, Span, Text},
     widgets::{Block, Borders, Paragraph, Widget, Wrap},
-    Terminal, TerminalOptions, Viewport,
+    Frame, Terminal, TerminalOptions, Viewport,
 };
-use reedline::{
-    FileBackedHistory, Prompt, PromptEditMode, PromptHistorySearch,
-    PromptHistorySearchStatus, Reedline, Signal,
-};
+use tui_textarea::TextArea;
+
+/// Fixed height of the inline viewport at the bottom of the terminal.
+const VIEWPORT_HEIGHT: u16 = 8;
 
 // ---------------------------------------------------------------------------
-// Main interactive loop
+// Phase
+// ---------------------------------------------------------------------------
+
+enum Phase {
+    Input,
+    Waiting,
+    Thinking,
+    Responding,
+    Tool(String),
+}
+
+impl Phase {
+    fn label(&self) -> &str {
+        match self {
+            Phase::Input => "input",
+            Phase::Waiting => "waiting",
+            Phase::Thinking => "thinking",
+            Phase::Responding => "responding",
+            Phase::Tool(_) => "tool",
+        }
+    }
+
+    fn detail(&self) -> String {
+        match self {
+            Phase::Input => String::new(),
+            Phase::Waiting => "sending request...".into(),
+            Phase::Thinking => "reasoning...".into(),
+            Phase::Responding => "writing...".into(),
+            Phase::Tool(name) => format!("executing: {}", name),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// TUI state (separated from Terminal to avoid borrow conflicts in draw)
+// ---------------------------------------------------------------------------
+
+struct TuiState {
+    phase: Phase,
+    text_buf: String,
+    thinking_buf: String,
+    textarea: TextArea<'static>,
+    total_usage: Usage,
+    model_name: String,
+    tick: usize,
+}
+
+// ---------------------------------------------------------------------------
+// TUI handle
+// ---------------------------------------------------------------------------
+
+struct Tui {
+    terminal: Terminal<CrosstermBackend<io::Stdout>>,
+    state: TuiState,
+}
+
+impl Tui {
+    fn new(model_name: String) -> eyre::Result<Self> {
+        crossterm::terminal::enable_raw_mode()?;
+        let (_, term_height) = crossterm::terminal::size()?;
+        let height = VIEWPORT_HEIGHT.min(term_height);
+
+        let backend = CrosstermBackend::new(io::stdout());
+        let terminal = Terminal::with_options(
+            backend,
+            TerminalOptions {
+                viewport: Viewport::Inline(height),
+            },
+        )?;
+
+        let mut tui = Self {
+            terminal,
+            state: TuiState {
+                phase: Phase::Input,
+                text_buf: String::new(),
+                thinking_buf: String::new(),
+                textarea: new_textarea(),
+                total_usage: Usage::default(),
+                model_name,
+                tick: 0,
+            },
+        };
+        tui.draw()?;
+        Ok(tui)
+    }
+
+    /// Push styled lines to scrollback above the viewport, then redraw.
+    /// The emit and redraw are wrapped in synchronized output so the
+    /// terminal displays the result atomically.
+    fn emit_and_draw(&mut self, lines: Vec<Line<'static>>) -> io::Result<()> {
+        if !lines.is_empty() {
+            let width = self.terminal.size().map(|s| s.width).unwrap_or(80);
+            let height = wrapped_height(&lines, width);
+            if height > 0 {
+                sync_start()?;
+                self.terminal.insert_before(height, |buf| {
+                    Paragraph::new(Text::from(lines))
+                        .wrap(Wrap { trim: false })
+                        .render(buf.area, buf);
+                })?;
+                self.draw_inner()?;
+                sync_end()?;
+                return Ok(());
+            }
+        }
+        self.draw()
+    }
+
+    fn draw(&mut self) -> io::Result<()> {
+        self.draw_inner()
+    }
+
+    fn draw_inner(&mut self) -> io::Result<()> {
+        self.state.tick += 1;
+        self.terminal
+            .draw(|frame| render_viewport(frame, &self.state))?;
+        Ok(())
+    }
+
+    fn handle_resize(&mut self) -> io::Result<()> {
+        self.draw()
+    }
+
+    // -- Agent events --
+
+    fn handle_agent_event(&mut self, evt: &AgentEvent) -> io::Result<()> {
+        match evt {
+            AgentEvent::Stream(se) => self.handle_stream_event(se),
+            AgentEvent::ToolStart { name, .. } => {
+                self.state.phase = Phase::Tool(name.clone());
+                self.emit_and_draw(vec![Line::from(vec![
+                    Span::styled("tool: ", Style::default().fg(Color::Yellow)),
+                    Span::raw(name.clone()),
+                ])])
+            }
+            AgentEvent::ToolEnd {
+                output, is_error, ..
+            } => {
+                let style = if *is_error {
+                    Style::default().fg(Color::Red)
+                } else {
+                    Style::default().add_modifier(Modifier::DIM)
+                };
+                let display = truncate(output, 50_000);
+                let lines: Vec<Line<'static>> = display
+                    .lines()
+                    .map(|l| Line::styled(l.to_string(), style))
+                    .collect();
+                self.state.phase = Phase::Waiting;
+                self.emit_and_draw(lines)
+            }
+            AgentEvent::MessageComplete(_) => Ok(()),
+            AgentEvent::Error(msg) => self.emit_and_draw(vec![Line::styled(
+                format!("error: {}", msg),
+                Style::default().fg(Color::Red),
+            )]),
+        }
+    }
+
+    fn handle_stream_event(&mut self, se: &StreamEvent) -> io::Result<()> {
+        let mut to_emit: Vec<Line<'static>> = Vec::new();
+
+        match se {
+            StreamEvent::ThinkingStart => {
+                self.state.thinking_buf.clear();
+                self.state.phase = Phase::Thinking;
+            }
+            StreamEvent::ThinkingDelta(d) => {
+                self.state.thinking_buf.push_str(d);
+            }
+            StreamEvent::ThinkingEnd { .. } => {
+                let text = std::mem::take(&mut self.state.thinking_buf);
+                if !text.is_empty() {
+                    to_emit = text
+                        .lines()
+                        .map(|l| {
+                            Line::styled(
+                                l.to_string(),
+                                Style::default().add_modifier(Modifier::DIM),
+                            )
+                        })
+                        .collect();
+                }
+                self.state.phase = Phase::Waiting;
+            }
+            StreamEvent::TextStart => {
+                self.state.text_buf.clear();
+                self.state.phase = Phase::Responding;
+            }
+            StreamEvent::TextDelta(d) => {
+                self.state.text_buf.push_str(d);
+            }
+            StreamEvent::TextEnd { .. } => {
+                let text = std::mem::take(&mut self.state.text_buf);
+                if !text.is_empty() {
+                    let md = tui_markdown::from_str(&text);
+                    to_emit = md.lines.into_iter().map(own_line).collect();
+                }
+                self.state.phase = Phase::Waiting;
+            }
+            StreamEvent::ToolCallStart { name, .. } => {
+                self.state.phase = Phase::Tool(name.clone());
+            }
+            StreamEvent::Usage(u) => {
+                self.state.total_usage.input_tokens += u.input_tokens;
+                self.state.total_usage.output_tokens += u.output_tokens;
+                self.state.total_usage.cache_read_tokens += u.cache_read_tokens;
+                self.state.total_usage.cache_write_tokens += u.cache_write_tokens;
+                to_emit = vec![Line::styled(
+                    format!(
+                        "tokens: {} in / {} out / {} cached",
+                        u.input_tokens, u.output_tokens, u.cache_read_tokens
+                    ),
+                    Style::default().add_modifier(Modifier::DIM),
+                )];
+            }
+            StreamEvent::Error(msg) => {
+                to_emit = vec![Line::styled(
+                    format!("error: {}", msg),
+                    Style::default().fg(Color::Red),
+                )];
+            }
+            _ => {}
+        }
+
+        if to_emit.is_empty() {
+            self.draw()
+        } else {
+            self.emit_and_draw(to_emit)
+        }
+    }
+}
+
+impl Drop for Tui {
+    fn drop(&mut self) {
+        // Clear the viewport so stale content doesn't linger after exit.
+        let _ = self.terminal.draw(|frame| {
+            frame.render_widget(Paragraph::new(""), frame.area());
+        });
+        let _ = crossterm::terminal::disable_raw_mode();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Viewport rendering
+// ---------------------------------------------------------------------------
+
+fn render_viewport(frame: &mut Frame, state: &TuiState) {
+    let area = frame.area();
+
+    let chunks = Layout::vertical([
+        Constraint::Min(0),    // main: preview or input
+        Constraint::Length(1), // status bar
+    ])
+    .split(area);
+
+    let main_area = chunks[0];
+    let status_area = chunks[1];
+
+    if matches!(state.phase, Phase::Input) {
+        frame.render_widget(&state.textarea, main_area);
+    } else {
+        render_preview(frame, state, main_area);
+    }
+
+    render_status_bar(frame, state, status_area);
+}
+
+/// Render a live preview of in-progress streaming content.
+fn render_preview(frame: &mut Frame, state: &TuiState, area: Rect) {
+    if area.height == 0 || area.width == 0 {
+        return;
+    }
+
+    let lines: Vec<Line<'static>> = match &state.phase {
+        Phase::Thinking if !state.thinking_buf.is_empty() => state
+            .thinking_buf
+            .lines()
+            .map(|l| Line::styled(l.to_string(), Style::default().add_modifier(Modifier::DIM)))
+            .collect(),
+        Phase::Responding if !state.text_buf.is_empty() => {
+            let text = tui_markdown::from_str(&state.text_buf);
+            text.lines.into_iter().map(own_line).collect()
+        }
+        _ => vec![Line::styled(
+            state.phase.detail(),
+            Style::default().add_modifier(Modifier::DIM),
+        )],
+    };
+
+    // Scroll to tail so we always show the most recent content.
+    let para = Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false });
+    let total = para.line_count(area.width) as u16;
+    let scroll = total.saturating_sub(area.height);
+    frame.render_widget(para.scroll((scroll, 0)), area);
+}
+
+fn render_status_bar(frame: &mut Frame, state: &TuiState, area: Rect) {
+    let spinner = spinner_frame(state.tick);
+
+    let left = format!(" {} {} | {} ", spinner, state.phase.label(), state.model_name);
+    let right = format!(
+        " {}in/{}out/{}cache ",
+        state.total_usage.input_tokens,
+        state.total_usage.output_tokens,
+        state.total_usage.cache_read_tokens,
+    );
+
+    let bar_width = area.width as usize;
+    let content_len = left.len() + right.len();
+    let padding = if bar_width > content_len {
+        " ".repeat(bar_width - content_len)
+    } else {
+        String::new()
+    };
+
+    let bar = Line::from(vec![Span::raw(left), Span::raw(padding), Span::raw(right)])
+        .style(Style::default().bg(Color::DarkGray).fg(Color::White));
+
+    frame.render_widget(Paragraph::new(bar), area);
+}
+
+// ---------------------------------------------------------------------------
+// Input
+// ---------------------------------------------------------------------------
+
+fn new_textarea() -> TextArea<'static> {
+    let mut ta = TextArea::default();
+    ta.set_block(
+        Block::default()
+            .borders(Borders::TOP)
+            .title(" ri> ")
+            .style(Style::default().fg(Color::Cyan)),
+    );
+    ta.set_cursor_line_style(Style::default());
+    ta
+}
+
+enum InputResult {
+    Submit(String),
+    Quit,
+}
+
+async fn read_input(tui: &mut Tui, events: &mut EventStream) -> io::Result<InputResult> {
+    loop {
+        let event = events.next().await;
+        match event {
+            Some(Ok(Event::Key(key))) => {
+                if key.code == KeyCode::Char('d')
+                    && key.modifiers.contains(KeyModifiers::CONTROL)
+                {
+                    return Ok(InputResult::Quit);
+                }
+                if key.code == KeyCode::Char('c')
+                    && key.modifiers.contains(KeyModifiers::CONTROL)
+                {
+                    return Ok(InputResult::Quit);
+                }
+                if key.code == KeyCode::Enter && !key.modifiers.contains(KeyModifiers::SHIFT) {
+                    let text = tui.state.textarea.lines().join("\n");
+                    tui.state.textarea = new_textarea();
+                    return Ok(InputResult::Submit(text));
+                }
+                tui.state.textarea.input(key);
+                tui.draw()?;
+            }
+            Some(Ok(Event::Resize(_, _))) => {
+                tui.handle_resize()?;
+            }
+            Some(Ok(_)) => {}
+            Some(Err(e)) => return Err(io::Error::new(io::ErrorKind::Other, e)),
+            None => return Ok(InputResult::Quit),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Main loop
 // ---------------------------------------------------------------------------
 
 pub async fn run(
@@ -35,93 +416,82 @@ pub async fn run(
     thinking: ThinkingLevel,
 ) -> eyre::Result<()> {
     let session_name = session_name_from_prompt(initial_prompt.as_deref());
-    let (mut store, mut message_ids) = SessionStore::init(
-        &session_name,
-        &cwd,
-        &system_prompt,
-    )?;
+    let (mut store, mut message_ids) = SessionStore::init(&session_name, &cwd, &system_prompt)?;
 
-    // Handle an initial prompt passed via CLI --prompt.
+    let mut tui = Tui::new(model.name.clone())?;
+    let mut events = EventStream::new();
+
     if let Some(prompt) = initial_prompt {
-        println!("ri> {}", prompt);
-        submit_prompt(
-            &prompt, provider.as_ref(), &model, &system_prompt,
-            &tools, &mut store, &mut message_ids, &cwd, thinking,
-        ).await?;
+        run_prompt(
+            &prompt,
+            &mut tui,
+            provider.as_ref(),
+            &model,
+            &system_prompt,
+            &tools,
+            &mut store,
+            &mut message_ids,
+            &cwd,
+            thinking,
+            &mut events,
+        )
+        .await?;
     }
-
-    // Set up reedline with persistent history.
-    let history_path = dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".ri")
-        .join("history.txt");
-    if let Some(parent) = history_path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-
-    let history = Box::new(
-        FileBackedHistory::with_file(10_000, history_path.clone())
-            .unwrap_or_else(|_| FileBackedHistory::new(10_000).expect("history init")),
-    );
-    let mut editor = Reedline::create().with_history(history);
-    let prompt = RiPrompt;
 
     loop {
-        let sig = editor.read_line(&prompt);
+        tui.state.phase = Phase::Input;
+        tui.draw()?;
 
-        match sig {
-            Ok(Signal::Success(buffer)) => {
-                let trimmed = buffer.trim();
+        match read_input(&mut tui, &mut events).await? {
+            InputResult::Submit(text) => {
+                let trimmed = text.trim().to_string();
                 if trimmed.is_empty() {
                     continue;
                 }
-
                 if trimmed == "/quit" || trimmed == "/exit" {
                     break;
                 }
-
                 if trimmed == "/help" {
-                    print_help();
+                    let help = help_text();
+                    let md = tui_markdown::from_str(&help);
+                    let lines = md.lines.into_iter().map(own_line).collect();
+                    tui.emit_and_draw(lines)?;
                     continue;
                 }
-
                 if trimmed.starts_with("/login") {
-                    handle_login(trimmed, &model, &mut provider, &mut editor, &prompt).await;
+                    handle_login(&trimmed, &model, &mut provider, &mut tui).await;
                     continue;
                 }
-
-                // Normal prompt.
-                submit_prompt(
-                    trimmed, provider.as_ref(), &model, &system_prompt,
-                    &tools, &mut store, &mut message_ids, &cwd, thinking,
-                ).await?;
+                run_prompt(
+                    &trimmed,
+                    &mut tui,
+                    provider.as_ref(),
+                    &model,
+                    &system_prompt,
+                    &tools,
+                    &mut store,
+                    &mut message_ids,
+                    &cwd,
+                    thinking,
+                    &mut events,
+                )
+                .await?;
             }
-
-            Ok(Signal::CtrlC) => {
-                continue;
-            }
-
-            Ok(Signal::CtrlD) => {
-                break;
-            }
-
-            Err(e) => {
-                println!("input error: {}", e);
-                break;
-            }
+            InputResult::Quit => break,
         }
     }
 
-    println!();
+    drop(tui);
     Ok(())
 }
 
 // ---------------------------------------------------------------------------
-// Submit a user prompt through the agent loop with TUI output
+// Prompt submission + agent streaming
 // ---------------------------------------------------------------------------
 
-async fn submit_prompt(
+async fn run_prompt(
     text: &str,
+    tui: &mut Tui,
     provider: &dyn LlmProvider,
     model: &Model,
     system_prompt: &str,
@@ -130,33 +500,84 @@ async fn submit_prompt(
     message_ids: &mut Vec<String>,
     cwd: &PathBuf,
     thinking: ThinkingLevel,
+    term_events: &mut EventStream,
 ) -> eyre::Result<()> {
-    let mut tui = TuiRenderer::new()?;
-    let cancel = tokio_util::sync::CancellationToken::new();
+    tui.emit_and_draw(vec![Line::from(vec![
+        Span::styled("ri> ", Style::default().fg(Color::Cyan)),
+        Span::raw(text.to_string()),
+    ])])?;
 
-    let events = agent::submit(
-        text, provider, model, system_prompt, tools,
-        store, message_ids, cwd, thinking, cancel,
+    tui.state.phase = Phase::Waiting;
+    tui.draw()?;
+
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let agent_stream = agent::submit(
+        text, provider, model, system_prompt, tools, store, message_ids, cwd, thinking,
+        cancel.clone(),
     )?;
-    tokio::pin!(events);
-    while let Some(evt) = events.next().await {
-        tui.handle(&evt);
+    tokio::pin!(agent_stream);
+
+    loop {
+        tokio::select! {
+            agent_evt = agent_stream.next() => {
+                match agent_evt {
+                    Some(evt) => { tui.handle_agent_event(&evt)?; }
+                    None => break,
+                }
+            }
+            term_evt = term_events.next() => {
+                match term_evt {
+                    Some(Ok(Event::Key(key))) => {
+                        if (key.code == KeyCode::Char('c')
+                            && key.modifiers.contains(KeyModifiers::CONTROL))
+                            || key.code == KeyCode::Esc
+                        {
+                            cancel.cancel();
+                        }
+                    }
+                    Some(Ok(Event::Resize(_, _))) => {
+                        tui.handle_resize()?;
+                    }
+                    _ => {}
+                }
+            }
+        }
     }
 
-    tui.teardown();
+    // Flush any remaining streaming content to scrollback.
+    let mut final_lines: Vec<Line<'static>> = Vec::new();
+    if !tui.state.text_buf.is_empty() {
+        let text = std::mem::take(&mut tui.state.text_buf);
+        let md = tui_markdown::from_str(&text);
+        final_lines.extend(md.lines.into_iter().map(own_line));
+    }
+    if !tui.state.thinking_buf.is_empty() {
+        let text = std::mem::take(&mut tui.state.thinking_buf);
+        final_lines.extend(text.lines().map(|l| {
+            Line::styled(
+                l.to_string(),
+                Style::default().add_modifier(Modifier::DIM),
+            )
+        }));
+    }
+    if !final_lines.is_empty() {
+        tui.emit_and_draw(final_lines)?;
+    }
+
+    tui.state.phase = Phase::Input;
+    tui.draw()?;
     Ok(())
 }
 
 // ---------------------------------------------------------------------------
-// Login handling
+// Login
 // ---------------------------------------------------------------------------
 
 async fn handle_login(
     input: &str,
     model: &Model,
     provider: &mut Box<dyn LlmProvider>,
-    editor: &mut Reedline,
-    prompt: &RiPrompt,
+    tui: &mut Tui,
 ) {
     let login_name = input.strip_prefix("/login").unwrap().trim();
 
@@ -169,75 +590,78 @@ async fn handle_login(
     };
 
     let Some(login_provider) = login_provider else {
-        println!("\x1b[31mUnknown provider: {}\x1b[0m", login_name);
+        let _ = tui.emit_and_draw(vec![Line::styled(
+            format!("Unknown provider: {}", login_name),
+            Style::default().fg(Color::Red),
+        )]);
         return;
     };
 
     match login_provider.begin_login().await {
         Ok(Some(AuthMethod::PasteCode { url })) => {
-            println!("\n\x1b[33mVisit this URL to authorize:\x1b[0m");
-            println!("\x1b[4m{}\x1b[0m\n", url);
-            println!("\x1b[33mPaste the code below:\x1b[0m");
-
-            // Read the paste code immediately -- no cross-iteration state.
-            let code = match editor.read_line(prompt) {
-                Ok(Signal::Success(buffer)) => buffer.trim().to_string(),
-                _ => {
-                    println!("\x1b[31mLogin cancelled.\x1b[0m");
-                    return;
-                }
-            };
-
-            match login_provider.complete_login(&code).await {
-                Ok(()) => {
-                    resolve_provider_after_login(model, provider).await;
-                }
-                Err(e) => println!("\x1b[31mlogin failed: {}\x1b[0m", e),
-            }
+            let msg = format!(
+                "Visit this URL to authorize:\n{}\n\nPaste-code login not yet supported in TUI. Use --mode print.",
+                url
+            );
+            let md = tui_markdown::from_str(&msg);
+            let _ = tui.emit_and_draw(md.lines.into_iter().map(own_line).collect());
         }
         Ok(Some(AuthMethod::LocalCallback { url, port, path })) => {
-            println!("\x1b[33mStarting OAuth login...\x1b[0m");
+            let msg = format!("Starting OAuth login...\nVisit: {}", url);
+            let md = tui_markdown::from_str(&msg);
+            let _ = tui.emit_and_draw(md.lines.into_iter().map(own_line).collect());
+
+            #[cfg(target_os = "macos")]
+            {
+                let _ = std::process::Command::new("open").arg(&url).spawn();
+            }
+
             match run_local_callback_login(login_provider, &url, port, &path).await {
-                Ok(()) => {
-                    resolve_provider_after_login(model, provider).await;
+                Ok(()) => match ri_ai::registry::resolve(&model.id).await {
+                    Ok((p, _)) => {
+                        *provider = p;
+                        let _ = tui.emit_and_draw(vec![Line::styled(
+                            "Logged in successfully.",
+                            Style::default().fg(Color::Green),
+                        )]);
+                    }
+                    Err(e) => {
+                        let _ = tui.emit_and_draw(vec![Line::styled(
+                            format!("resolve error: {}", e),
+                            Style::default().fg(Color::Red),
+                        )]);
+                    }
+                },
+                Err(e) => {
+                    let _ = tui.emit_and_draw(vec![Line::styled(
+                        format!("login failed: {}", e),
+                        Style::default().fg(Color::Red),
+                    )]);
                 }
-                Err(e) => println!("\x1b[31mlogin failed: {}\x1b[0m", e),
             }
         }
         Ok(None) => {
-            println!("\x1b[33mNo login needed for this provider.\x1b[0m");
+            let _ = tui.emit_and_draw(vec![Line::raw(
+                "No login needed for this provider.",
+            )]);
         }
         Err(e) => {
-            println!("\x1b[31mlogin error: {}\x1b[0m", e);
+            let _ = tui.emit_and_draw(vec![Line::styled(
+                format!("login error: {}", e),
+                Style::default().fg(Color::Red),
+            )]);
         }
-    }
-}
-
-async fn resolve_provider_after_login(model: &Model, provider: &mut Box<dyn LlmProvider>) {
-    match ri_ai::registry::resolve(&model.id).await {
-        Ok((p, _)) => {
-            *provider = p;
-            println!("\x1b[32mLogged in successfully.\x1b[0m");
-        }
-        Err(e) => println!("\x1b[31mresolve error: {}\x1b[0m", e),
     }
 }
 
 async fn run_local_callback_login(
     provider: Box<dyn LlmProvider>,
-    auth_url: &str,
+    _auth_url: &str,
     port: u16,
     expected_path: &str,
 ) -> eyre::Result<()> {
     use axum::{extract::Query, response::Html, routing::get, Router};
     use std::collections::HashMap;
-
-    println!("\n\x1b[33mVisit this URL to authorize:\x1b[0m");
-    println!("\x1b[4m{}\x1b[0m\n", auth_url);
-    #[cfg(target_os = "macos")]
-    {
-        let _ = std::process::Command::new("open").arg(auth_url).spawn();
-    }
 
     let (tx, rx) = tokio::sync::oneshot::channel::<Result<String, String>>();
     let tx = std::sync::Arc::new(tokio::sync::Mutex::new(Some(tx)));
@@ -256,12 +680,10 @@ async fn run_local_callback_login(
                     if let Some(code) = params.get("code") {
                         let _ = tx.send(Ok(code.clone()));
                         return Html(
-                            "<h1>Success</h1><p>You can close this window.</p>"
-                                .to_string(),
+                            "<h1>Success</h1><p>You can close this window.</p>".to_string(),
                         );
                     }
-                    let _ =
-                        tx.send(Err("No authorization code in callback".into()));
+                    let _ = tx.send(Err("No authorization code in callback".into()));
                 }
                 Html("<h1>Unexpected request</h1>".to_string())
             }
@@ -269,12 +691,9 @@ async fn run_local_callback_login(
     };
 
     let app = Router::new().route(expected_path, get(handler));
-    let listener =
-        tokio::net::TcpListener::bind(format!("127.0.0.1:{}", port))
-            .await
-            .map_err(|e| {
-                eyre::eyre!("Failed to bind OAuth callback on port {}: {}", port, e)
-            })?;
+    let listener = tokio::net::TcpListener::bind(format!("127.0.0.1:{}", port))
+        .await
+        .map_err(|e| eyre::eyre!("Failed to bind OAuth callback on port {}: {}", port, e))?;
 
     let code = tokio::select! {
         result = axum::serve(listener, app) => {
@@ -296,309 +715,37 @@ async fn run_local_callback_login(
 }
 
 // ---------------------------------------------------------------------------
-// TUI renderer -- drives the inline viewport during agent streaming
+// Synchronized output (DEC 2026)
 // ---------------------------------------------------------------------------
 
-/// Height of the inline viewport: 1 border line + 1 content line.
-const VIEWPORT_HEIGHT: u16 = 2;
-
-/// Rendering phase for the status viewport.
-enum Phase {
-    Waiting,
-    Thinking,
-    Responding,
-    Tool { name: String },
-    Idle,
+fn sync_start() -> io::Result<()> {
+    let mut out = io::stdout().lock();
+    write!(out, "\x1b[?2026h")?;
+    out.flush()
 }
 
-/// Renders agent events into a ratatui inline viewport. Completed content
-/// (thinking lines, rendered markdown, tool results) is pushed above the
-/// viewport via `insert_before` so it lives in terminal scrollback.
-/// The viewport itself is a small 2-line status bar showing current activity.
-struct TuiRenderer {
-    terminal: Terminal<CrosstermBackend<io::Stdout>>,
-    phase: Phase,
-    /// Accumulates response text during streaming; rendered as markdown on TextEnd.
-    text_buf: String,
-    /// Accumulates the current incomplete thinking line for streaming to scrollback.
-    thinking_line: String,
-    tick: usize,
-}
-
-impl TuiRenderer {
-    fn new() -> eyre::Result<Self> {
-        crossterm::terminal::enable_raw_mode()?;
-
-        let backend = CrosstermBackend::new(io::stdout());
-        let terminal = Terminal::with_options(
-            backend,
-            TerminalOptions {
-                viewport: Viewport::Inline(VIEWPORT_HEIGHT),
-            },
-        )?;
-
-        let mut renderer = Self {
-            terminal,
-            phase: Phase::Waiting,
-            text_buf: String::new(),
-            thinking_line: String::new(),
-            tick: 0,
-        };
-
-        // Draw immediately so the viewport is never blank.
-        renderer.render_viewport();
-
-        Ok(renderer)
-    }
-
-    /// Push a single styled line into terminal scrollback above the viewport.
-    fn emit_line(&mut self, line: Line<'static>) {
-        let _ = self.terminal.insert_before(1, |buf| {
-            Paragraph::new(line).render(buf.area, buf);
-        });
-    }
-
-    /// Render markdown text and push it into scrollback above the viewport.
-    fn emit_markdown(&mut self, md: &str) {
-        if md.trim().is_empty() {
-            return;
-        }
-        let text = tui_markdown::from_str(md);
-        if text.lines.is_empty() {
-            return;
-        }
-
-        let width = self.terminal.size().map(|s| s.width).unwrap_or(80);
-        let para = Paragraph::new(text).wrap(Wrap { trim: false });
-        let height = para.line_count(width);
-
-        if height == 0 {
-            return;
-        }
-
-        let height = height.min(u16::MAX as usize) as u16;
-        let _ = self.terminal.insert_before(height, |buf| {
-            (&para).render(buf.area, buf);
-        });
-    }
-
-    /// Flush any complete thinking lines (ending with '\n') into scrollback as dim text.
-    fn flush_thinking_lines(&mut self) {
-        while let Some(pos) = self.thinking_line.find('\n') {
-            let line_text: String = self.thinking_line.drain(..=pos).collect();
-            let trimmed = line_text.trim_end();
-            if !trimmed.is_empty() {
-                self.emit_line(Line::styled(
-                    trimmed.to_string(),
-                    Style::default().add_modifier(Modifier::DIM),
-                ));
-            }
-        }
-    }
-
-    /// Draw the 2-line status viewport (border + content).
-    fn render_viewport(&mut self) {
-        self.tick += 1;
-        let spinner = spinner_frame(self.tick);
-
-        let (title, detail) = match &self.phase {
-            Phase::Waiting => ("waiting", "sending request...".to_string()),
-            Phase::Thinking => ("thinking", tail_line(&self.thinking_line)),
-            Phase::Responding => ("responding", tail_line(&self.text_buf)),
-            Phase::Tool { name } => ("tool", format!("executing: {}", name)),
-            Phase::Idle => ("idle", String::new()),
-        };
-
-        let title_str = format!(" {} {} ", spinner, title);
-
-        let _ = self.terminal.draw(|frame| {
-            let area = frame.area();
-            let block = Block::default()
-                .borders(Borders::TOP)
-                .title(title_str)
-                .style(Style::default().add_modifier(Modifier::DIM));
-
-            let inner = block.inner(area);
-            frame.render_widget(block, area);
-
-            let para = Paragraph::new(detail)
-                .style(Style::default().add_modifier(Modifier::DIM))
-                .wrap(Wrap { trim: false });
-            frame.render_widget(para, inner);
-        });
-    }
-
-    fn handle(&mut self, evt: &AgentEvent) {
-        match evt {
-            AgentEvent::Stream(se) => match se {
-                StreamEvent::ThinkingStart => {
-                    self.thinking_line.clear();
-                    self.phase = Phase::Thinking;
-                    self.render_viewport();
-                }
-                StreamEvent::ThinkingDelta(d) => {
-                    self.thinking_line.push_str(d);
-                    self.flush_thinking_lines();
-                    self.render_viewport();
-                }
-                StreamEvent::ThinkingEnd { .. } => {
-                    // Flush any remaining incomplete thinking line.
-                    if !self.thinking_line.is_empty() {
-                        let remaining = std::mem::take(&mut self.thinking_line);
-                        self.emit_line(Line::styled(
-                            remaining,
-                            Style::default().add_modifier(Modifier::DIM),
-                        ));
-                    }
-                    self.phase = Phase::Idle;
-                }
-
-                StreamEvent::TextStart => {
-                    self.text_buf.clear();
-                    self.phase = Phase::Responding;
-                    self.render_viewport();
-                }
-                StreamEvent::TextDelta(d) => {
-                    self.text_buf.push_str(d);
-                    self.render_viewport();
-                }
-                StreamEvent::TextEnd { .. } => {
-                    let text = std::mem::take(&mut self.text_buf);
-                    self.emit_markdown(&text);
-                    self.phase = Phase::Idle;
-                }
-
-                StreamEvent::ToolCallStart { name, .. } => {
-                    self.emit_line(Line::from(vec![
-                        Span::styled("tool: ", Style::default().fg(ratatui::style::Color::Yellow)),
-                        Span::raw(name.clone()),
-                    ]));
-                }
-
-                StreamEvent::Error(msg) => {
-                    self.emit_line(Line::styled(
-                        format!("error: {}", msg),
-                        Style::default().fg(ratatui::style::Color::Red),
-                    ));
-                }
-
-                StreamEvent::Usage(u) => {
-                    let usage_str = format!(
-                        "tokens: {} in / {} out / {} cached",
-                        u.input_tokens, u.output_tokens, u.cache_read_tokens
-                    );
-                    self.emit_line(Line::styled(
-                        usage_str,
-                        Style::default().add_modifier(Modifier::DIM),
-                    ));
-                }
-
-                _ => {}
-            },
-
-            AgentEvent::ToolStart { name, .. } => {
-                self.phase = Phase::Tool { name: name.clone() };
-                self.render_viewport();
-            }
-
-            AgentEvent::ToolEnd { output, is_error, .. } => {
-                if *is_error {
-                    self.emit_line(Line::styled(
-                        format!("tool error: {}", truncate(output, 200)),
-                        Style::default().fg(ratatui::style::Color::Red),
-                    ));
-                } else {
-                    self.emit_line(Line::styled(
-                        format!("result: {}", truncate(output, 200)),
-                        Style::default().add_modifier(Modifier::DIM),
-                    ));
-                }
-                self.phase = Phase::Idle;
-                self.render_viewport();
-            }
-
-            AgentEvent::Error(msg) => {
-                self.emit_line(Line::styled(
-                    format!("error: {}", msg),
-                    Style::default().fg(ratatui::style::Color::Red),
-                ));
-            }
-
-            AgentEvent::MessageComplete(_) => {}
-        }
-    }
-
-    /// Clear the viewport and restore normal terminal mode.
-    fn teardown(self) {
-        drop(self.terminal);
-        let _ = crossterm::terminal::disable_raw_mode();
-        // Newline so the next reedline prompt starts on a fresh line.
-        println!();
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Prompt
-// ---------------------------------------------------------------------------
-
-struct RiPrompt;
-
-impl Prompt for RiPrompt {
-    fn render_prompt_left(&self) -> Cow<'_, str> {
-        Cow::Borrowed("ri")
-    }
-
-    fn render_prompt_right(&self) -> Cow<'_, str> {
-        Cow::Borrowed("")
-    }
-
-    fn render_prompt_indicator(&self, _mode: PromptEditMode) -> Cow<'_, str> {
-        Cow::Borrowed("> ")
-    }
-
-    fn render_prompt_multiline_indicator(&self) -> Cow<'_, str> {
-        Cow::Borrowed(".. ")
-    }
-
-    fn render_prompt_history_search_indicator(
-        &self,
-        history_search: PromptHistorySearch,
-    ) -> Cow<'_, str> {
-        let prefix = match history_search.status {
-            PromptHistorySearchStatus::Passing => "",
-            PromptHistorySearchStatus::Failing => "(failed) ",
-        };
-        Cow::Owned(format!("{}search: {} ", prefix, history_search.term))
-    }
-
-    fn get_prompt_color(&self) -> Color {
-        Color::Cyan
-    }
-
-    fn get_indicator_color(&self) -> Color {
-        Color::Cyan
-    }
+fn sync_end() -> io::Result<()> {
+    let mut out = io::stdout().lock();
+    write!(out, "\x1b[?2026l")?;
+    out.flush()
 }
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn print_help() {
-    println!("\x1b[33mCommands:\x1b[0m");
-    for p in ri_ai::registry::all_providers() {
-        println!("  /login {:<20} - {}", p.id(), p.name());
-    }
-    println!("  /quit, /exit              - Exit ri");
+fn own_line(line: Line<'_>) -> Line<'static> {
+    let spans: Vec<Span<'static>> = line
+        .spans
+        .into_iter()
+        .map(|s| Span::styled(s.content.into_owned(), s.style))
+        .collect();
+    Line::from(spans).style(line.style)
 }
 
 fn spinner_frame(tick: usize) -> &'static str {
     const FRAMES: &[&str] = &["*", "o", "O", "o"];
     FRAMES[tick % FRAMES.len()]
-}
-
-fn tail_line(s: &str) -> String {
-    s.lines().next_back().unwrap_or("").to_string()
 }
 
 fn truncate(s: &str, max: usize) -> String {
@@ -611,18 +758,30 @@ fn truncate(s: &str, max: usize) -> String {
             .take_while(|&i| i <= max)
             .last()
             .unwrap_or(0);
-        format!("{}... ({} bytes)", &s[..end], s.len())
+        format!("{}...", &s[..end])
     }
+}
+
+fn wrapped_height(lines: &[Line<'_>], width: u16) -> u16 {
+    let text = Text::from(lines.to_vec());
+    let para = Paragraph::new(text).wrap(Wrap { trim: false });
+    para.line_count(width).min(u16::MAX as usize) as u16
+}
+
+fn help_text() -> String {
+    let mut text = String::from("**Commands:**\n");
+    for p in ri_ai::registry::all_providers() {
+        text.push_str(&format!("- `/login {}` - {}\n", p.id(), p.name()));
+    }
+    text.push_str("- `/quit`, `/exit` - Exit ri\n");
+    text.push_str("- `Ctrl+C` - Cancel running agent\n");
+    text
 }
 
 fn session_name_from_prompt(prompt: Option<&str>) -> String {
     match prompt {
         Some(p) => {
-            let words: String = p
-                .split_whitespace()
-                .take(5)
-                .collect::<Vec<_>>()
-                .join("-");
+            let words: String = p.split_whitespace().take(5).collect::<Vec<_>>().join("-");
             if words.is_empty() {
                 "session".to_string()
             } else {
