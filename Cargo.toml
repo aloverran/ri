@@ -3,8 +3,6 @@ members = [
     "crates/ri",
     "crates/ri-ai",
     "crates/ri-tools",
-    "ri-cli",
-    "ri-web",
 ]
 resolver = "2"
 
@@ -14,25 +12,20 @@ edition = "2024"
 license = "MIT"
 
 [workspace.dependencies]
-axum = "0.8"
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 futures = "0.3"
 reqwest = { version = "0.12", features = ["json", "stream"] }
 eyre = "0.6"
-color-eyre = "0.6"
 thiserror = "2"
-clap = { version = "4", features = ["derive"] }
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 sha2 = "0.10"
 rand = "0.9"
 base64 = "0.22"
 uuid = { version = "1", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 dirs = "6"
-glob = "0.3"
 tokio-stream = "0.1"
 bytes = "1"
 tokio-util = { version = "0.7", features = ["rt"] }
