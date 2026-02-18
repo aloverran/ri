@@ -12,6 +12,8 @@ use std::path::PathBuf;
 
 use crossterm::event::{Event, EventStream, KeyCode, KeyModifiers};
 use futures::StreamExt;
+use tokio::signal::unix::{signal, SignalKind};
+use tokio::time::{interval, Duration};
 use ratatui::{
     backend::CrosstermBackend,
     buffer::Buffer,
@@ -91,6 +93,7 @@ struct TuiState {
     total_usage: Usage,
     model_name: String,
     tick: usize,
+    last_size: (u16, u16),
 }
 
 // ---------------------------------------------------------------------------
@@ -105,8 +108,8 @@ struct Tui {
 impl Tui {
     fn new(model_name: String) -> eyre::Result<Self> {
         crossterm::terminal::enable_raw_mode()?;
-        let (_, term_height) = crossterm::terminal::size()?;
-        let height = VIEWPORT_HEIGHT.min(term_height);
+        let size = crossterm::terminal::size()?;
+        let height = VIEWPORT_HEIGHT.min(size.1);
 
         let backend = CrosstermBackend::new(io::stdout());
         let terminal = Terminal::with_options(
@@ -127,6 +130,7 @@ impl Tui {
                 total_usage: Usage::default(),
                 model_name,
                 tick: 0,
+                last_size: size,
             },
         };
         tui.draw()?;
@@ -166,8 +170,52 @@ impl Tui {
         Ok(())
     }
 
+    /// Check if terminal size changed and re-render if so.
+    fn check_resize(&mut self) -> io::Result<()> {
+        let size = crossterm::terminal::size()?;
+        if size != self.state.last_size {
+            self.state.last_size = size;
+            self.handle_resize()?;
+        }
+        Ok(())
+    }
+
     fn handle_resize(&mut self) -> io::Result<()> {
-        self.draw()
+        let (width, term_height) = self.state.last_size;
+
+        // Clear scrollback + screen + cursor home.
+        {
+            let mut out = io::stdout().lock();
+            write!(out, "\x1b[3J\x1b[2J\x1b[H")?;
+            out.flush()?;
+        }
+
+        // Brief pause so the terminal processes the clear before we query
+        // cursor position during Viewport::Inline initialization.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        // Recreate terminal at the (possibly new) size.
+        let height = VIEWPORT_HEIGHT.min(term_height);
+        self.terminal = Terminal::with_options(
+            CrosstermBackend::new(io::stdout()),
+            TerminalOptions {
+                viewport: Viewport::Inline(height),
+            },
+        )?;
+
+        // Re-render all blocks at the new width.
+        for block in &self.state.blocks {
+            let lines = render_block_content(block);
+            let h = block_render_height(&block.kind, width, &lines);
+            if h > 0 {
+                let kind = &block.kind;
+                self.terminal.insert_before(h, |buf| {
+                    render_block_widget(kind, &lines, buf);
+                })?;
+            }
+        }
+
+        self.draw_inner()
     }
 
     // -- Block management --
@@ -497,34 +545,46 @@ enum InputResult {
 }
 
 async fn read_input(tui: &mut Tui, events: &mut EventStream) -> io::Result<InputResult> {
+    let mut sigwinch = signal(SignalKind::window_change())
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+    let mut size_poll = interval(Duration::from_millis(500));
     loop {
-        let event = events.next().await;
-        match event {
-            Some(Ok(Event::Key(key))) => {
-                if key.code == KeyCode::Char('d')
-                    && key.modifiers.contains(KeyModifiers::CONTROL)
-                {
-                    return Ok(InputResult::Quit);
+        tokio::select! {
+            event = events.next() => {
+                match event {
+                    Some(Ok(Event::Key(key))) => {
+                        if key.code == KeyCode::Char('d')
+                            && key.modifiers.contains(KeyModifiers::CONTROL)
+                        {
+                            return Ok(InputResult::Quit);
+                        }
+                        if key.code == KeyCode::Char('c')
+                            && key.modifiers.contains(KeyModifiers::CONTROL)
+                        {
+                            return Ok(InputResult::Quit);
+                        }
+                        if key.code == KeyCode::Enter && !key.modifiers.contains(KeyModifiers::SHIFT) {
+                            let text = tui.state.textarea.lines().join("\n");
+                            tui.state.textarea = new_textarea();
+                            return Ok(InputResult::Submit(text));
+                        }
+                        tui.state.textarea.input(key);
+                        tui.draw()?;
+                    }
+                    Some(Ok(Event::Resize(_, _))) => {
+                        tui.handle_resize()?;
+                    }
+                    Some(Ok(_)) => {}
+                    Some(Err(e)) => return Err(io::Error::new(io::ErrorKind::Other, e)),
+                    None => return Ok(InputResult::Quit),
                 }
-                if key.code == KeyCode::Char('c')
-                    && key.modifiers.contains(KeyModifiers::CONTROL)
-                {
-                    return Ok(InputResult::Quit);
-                }
-                if key.code == KeyCode::Enter && !key.modifiers.contains(KeyModifiers::SHIFT) {
-                    let text = tui.state.textarea.lines().join("\n");
-                    tui.state.textarea = new_textarea();
-                    return Ok(InputResult::Submit(text));
-                }
-                tui.state.textarea.input(key);
-                tui.draw()?;
             }
-            Some(Ok(Event::Resize(_, _))) => {
-                tui.handle_resize()?;
+            _ = sigwinch.recv() => {
+                tui.check_resize()?;
             }
-            Some(Ok(_)) => {}
-            Some(Err(e)) => return Err(io::Error::new(io::ErrorKind::Other, e)),
-            None => return Ok(InputResult::Quit),
+            _ = size_poll.tick() => {
+                tui.check_resize()?;
+            }
         }
     }
 }
@@ -644,6 +704,10 @@ async fn run_prompt(
     )?;
     tokio::pin!(agent_stream);
 
+    let mut sigwinch = signal(SignalKind::window_change())
+        .map_err(|e| eyre::eyre!("signal setup: {}", e))?;
+    let mut size_poll = interval(Duration::from_millis(500));
+
     loop {
         tokio::select! {
             agent_evt = agent_stream.next() => {
@@ -667,6 +731,12 @@ async fn run_prompt(
                     }
                     _ => {}
                 }
+            }
+            _ = sigwinch.recv() => {
+                tui.check_resize()?;
+            }
+            _ = size_poll.tick() => {
+                tui.check_resize()?;
             }
         }
     }
