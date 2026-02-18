@@ -14,10 +14,11 @@ use crossterm::event::{Event, EventStream, KeyCode, KeyModifiers};
 use futures::StreamExt;
 use ratatui::{
     backend::CrosstermBackend,
+    buffer::Buffer,
     layout::{Constraint, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
-    widgets::{Block, Borders, Paragraph, Widget, Wrap},
+    widgets::{Block, BorderType, Borders, Paragraph, Widget, Wrap},
     Frame, Terminal, TerminalOptions, Viewport,
 };
 use tui_textarea::TextArea;
@@ -60,16 +61,32 @@ impl Phase {
 }
 
 // ---------------------------------------------------------------------------
+// Content blocks — the conversation history rendered to scrollback
+// ---------------------------------------------------------------------------
+
+enum BlockKind {
+    User,
+    Assistant,
+    Thinking,
+    Tool { name: String, is_error: bool },
+    Info,
+    Error,
+}
+
+struct ContentBlock {
+    kind: BlockKind,
+    body: String,
+}
+
+// ---------------------------------------------------------------------------
 // TUI state (separated from Terminal to avoid borrow conflicts in draw)
 // ---------------------------------------------------------------------------
 
 struct TuiState {
     phase: Phase,
+    blocks: Vec<ContentBlock>,
     text_buf: String,
-    text_emitted: usize,
-    in_code_fence: bool,
     thinking_buf: String,
-    thinking_emitted: usize,
     textarea: TextArea<'static>,
     total_usage: Usage,
     model_name: String,
@@ -103,11 +120,9 @@ impl Tui {
             terminal,
             state: TuiState {
                 phase: Phase::Input,
+                blocks: Vec::new(),
                 text_buf: String::new(),
-                text_emitted: 0,
-                in_code_fence: false,
                 thinking_buf: String::new(),
-                thinking_emitted: 0,
                 textarea: new_textarea(),
                 total_usage: Usage::default(),
                 model_name,
@@ -155,117 +170,25 @@ impl Tui {
         self.draw()
     }
 
-    // -- Progressive emission --
+    // -- Block management --
 
-    /// Emit completed paragraphs from text_buf to scrollback.
-    /// A "safe boundary" is a \n\n that's outside an unclosed code fence.
-    fn try_emit_text(&mut self) -> io::Result<()> {
-        let (emit_str, new_offset, new_fence) = {
-            let buf = &self.state.text_buf;
-            let from = self.state.text_emitted;
-            let bytes = buf.as_bytes();
-            let mut pos = from;
-            let mut last_safe = from;
-            let mut in_fence = self.state.in_code_fence;
-
-            while pos < bytes.len() {
-                if (pos == 0 || bytes[pos - 1] == b'\n')
-                    && pos + 3 <= bytes.len()
-                    && &bytes[pos..pos + 3] == b"```"
-                {
-                    in_fence = !in_fence;
-                }
-                if !in_fence
-                    && pos + 1 < bytes.len()
-                    && bytes[pos] == b'\n'
-                    && bytes[pos + 1] == b'\n'
-                {
-                    last_safe = pos + 2;
-                }
-                pos += 1;
-            }
-
-            if last_safe > from {
-                (Some(buf[from..last_safe].to_string()), last_safe, in_fence)
-            } else {
-                (None, from, in_fence)
-            }
-        };
-
-        self.state.in_code_fence = new_fence;
-        self.state.text_emitted = new_offset;
-
-        if let Some(text) = emit_str {
-            let md = tui_markdown::from_str(&text);
-            let lines: Vec<Line<'static>> = md.lines.into_iter().map(own_line).collect();
-            self.emit_and_draw(lines)
-        } else {
-            self.draw()
+    /// Render a completed block as a fancy widget and push to scrollback.
+    /// The block is also stored for potential future re-rendering.
+    fn emit_block(&mut self, block: ContentBlock) -> io::Result<()> {
+        let width = self.terminal.size().map(|s| s.width).unwrap_or(80);
+        let lines = render_block_content(&block);
+        let h = block_render_height(&block.kind, width, &lines);
+        if h > 0 {
+            sync_start()?;
+            let kind = &block.kind;
+            self.terminal.insert_before(h, |buf| {
+                render_block_widget(kind, &lines, buf);
+            })?;
+            self.draw_inner()?;
+            sync_end()?;
         }
-    }
-
-    /// Emit completed lines from thinking_buf to scrollback.
-    fn try_emit_thinking(&mut self) -> io::Result<()> {
-        let emit_str = {
-            let buf = &self.state.thinking_buf;
-            let from = self.state.thinking_emitted;
-            buf[from..].rfind('\n').map(|i| {
-                let boundary = from + i + 1;
-                (buf[from..boundary].to_string(), boundary)
-            })
-        };
-
-        if let Some((text, new_offset)) = emit_str {
-            self.state.thinking_emitted = new_offset;
-            let lines: Vec<Line<'static>> = text
-                .lines()
-                .map(|l| {
-                    Line::styled(
-                        l.to_string(),
-                        Style::default().add_modifier(Modifier::DIM),
-                    )
-                })
-                .collect();
-            self.emit_and_draw(lines)
-        } else {
-            self.draw()
-        }
-    }
-
-    /// Flush all remaining text_buf content to scrollback.
-    fn flush_text(&mut self) -> io::Result<()> {
-        let remaining = self.state.text_buf[self.state.text_emitted..].to_string();
-        self.state.text_buf.clear();
-        self.state.text_emitted = 0;
-        self.state.in_code_fence = false;
-        if !remaining.is_empty() {
-            let md = tui_markdown::from_str(&remaining);
-            let lines: Vec<Line<'static>> = md.lines.into_iter().map(own_line).collect();
-            self.emit_and_draw(lines)
-        } else {
-            Ok(())
-        }
-    }
-
-    /// Flush all remaining thinking_buf content to scrollback.
-    fn flush_thinking(&mut self) -> io::Result<()> {
-        let remaining = self.state.thinking_buf[self.state.thinking_emitted..].to_string();
-        self.state.thinking_buf.clear();
-        self.state.thinking_emitted = 0;
-        if !remaining.is_empty() {
-            let lines: Vec<Line<'static>> = remaining
-                .lines()
-                .map(|l| {
-                    Line::styled(
-                        l.to_string(),
-                        Style::default().add_modifier(Modifier::DIM),
-                    )
-                })
-                .collect();
-            self.emit_and_draw(lines)
-        } else {
-            Ok(())
-        }
+        self.state.blocks.push(block);
+        Ok(())
     }
 
     // -- Agent events --
@@ -275,32 +198,29 @@ impl Tui {
             AgentEvent::Stream(se) => self.handle_stream_event(se),
             AgentEvent::ToolStart { name, .. } => {
                 self.state.phase = Phase::Tool(name.clone());
-                self.emit_and_draw(vec![Line::from(vec![
-                    Span::styled("tool: ", Style::default().fg(Color::Yellow)),
-                    Span::raw(name.clone()),
-                ])])
+                self.draw()
             }
             AgentEvent::ToolEnd {
                 output, is_error, ..
             } => {
-                let style = if *is_error {
-                    Style::default().fg(Color::Red)
-                } else {
-                    Style::default().add_modifier(Modifier::DIM)
+                let name = match &self.state.phase {
+                    Phase::Tool(n) => n.clone(),
+                    _ => "tool".into(),
                 };
-                let display = truncate(output, 50_000);
-                let lines: Vec<Line<'static>> = display
-                    .lines()
-                    .map(|l| Line::styled(l.to_string(), style))
-                    .collect();
                 self.state.phase = Phase::Waiting;
-                self.emit_and_draw(lines)
+                self.emit_block(ContentBlock {
+                    kind: BlockKind::Tool {
+                        name,
+                        is_error: *is_error,
+                    },
+                    body: truncate(output, 50_000),
+                })
             }
             AgentEvent::MessageComplete(_) => Ok(()),
-            AgentEvent::Error(msg) => self.emit_and_draw(vec![Line::styled(
-                format!("error: {}", msg),
-                Style::default().fg(Color::Red),
-            )]),
+            AgentEvent::Error(msg) => self.emit_block(ContentBlock {
+                kind: BlockKind::Error,
+                body: msg.clone(),
+            }),
         }
     }
 
@@ -308,34 +228,45 @@ impl Tui {
         match se {
             StreamEvent::ThinkingStart => {
                 self.state.thinking_buf.clear();
-                self.state.thinking_emitted = 0;
                 self.state.phase = Phase::Thinking;
                 self.draw()
             }
             StreamEvent::ThinkingDelta(d) => {
                 self.state.thinking_buf.push_str(d);
-                self.try_emit_thinking()
+                self.draw()
             }
             StreamEvent::ThinkingEnd { .. } => {
-                self.flush_thinking()?;
+                let body = std::mem::take(&mut self.state.thinking_buf);
                 self.state.phase = Phase::Waiting;
-                self.draw()
+                if !body.is_empty() {
+                    self.emit_block(ContentBlock {
+                        kind: BlockKind::Thinking,
+                        body,
+                    })
+                } else {
+                    self.draw()
+                }
             }
             StreamEvent::TextStart => {
                 self.state.text_buf.clear();
-                self.state.text_emitted = 0;
-                self.state.in_code_fence = false;
                 self.state.phase = Phase::Responding;
                 self.draw()
             }
             StreamEvent::TextDelta(d) => {
                 self.state.text_buf.push_str(d);
-                self.try_emit_text()
+                self.draw()
             }
             StreamEvent::TextEnd { .. } => {
-                self.flush_text()?;
+                let body = std::mem::take(&mut self.state.text_buf);
                 self.state.phase = Phase::Waiting;
-                self.draw()
+                if !body.is_empty() {
+                    self.emit_block(ContentBlock {
+                        kind: BlockKind::Assistant,
+                        body,
+                    })
+                } else {
+                    self.draw()
+                }
             }
             StreamEvent::ToolCallStart { name, .. } => {
                 self.state.phase = Phase::Tool(name.clone());
@@ -346,18 +277,18 @@ impl Tui {
                 self.state.total_usage.output_tokens += u.output_tokens;
                 self.state.total_usage.cache_read_tokens += u.cache_read_tokens;
                 self.state.total_usage.cache_write_tokens += u.cache_write_tokens;
-                self.emit_and_draw(vec![Line::styled(
-                    format!(
+                self.emit_block(ContentBlock {
+                    kind: BlockKind::Info,
+                    body: format!(
                         "tokens: {} in / {} out / {} cached",
                         u.input_tokens, u.output_tokens, u.cache_read_tokens
                     ),
-                    Style::default().add_modifier(Modifier::DIM),
-                )])
+                })
             }
-            StreamEvent::Error(msg) => self.emit_and_draw(vec![Line::styled(
-                format!("error: {}", msg),
-                Style::default().fg(Color::Red),
-            )]),
+            StreamEvent::Error(msg) => self.emit_block(ContentBlock {
+                kind: BlockKind::Error,
+                body: msg.clone(),
+            }),
             _ => self.draw(),
         }
     }
@@ -405,33 +336,14 @@ fn render_preview(frame: &mut Frame, state: &TuiState, area: Rect) {
     }
 
     let lines: Vec<Line<'static>> = match &state.phase {
-        Phase::Thinking => {
-            let pending = &state.thinking_buf[state.thinking_emitted..];
-            if pending.is_empty() {
-                vec![Line::styled(
-                    "thinking...",
-                    Style::default().add_modifier(Modifier::DIM),
-                )]
-            } else {
-                pending
-                    .lines()
-                    .map(|l| {
-                        Line::styled(
-                            l.to_string(),
-                            Style::default().add_modifier(Modifier::DIM),
-                        )
-                    })
-                    .collect()
-            }
-        }
-        Phase::Responding => {
-            let pending = &state.text_buf[state.text_emitted..];
-            if pending.is_empty() {
-                vec![]
-            } else {
-                let text = tui_markdown::from_str(pending);
-                text.lines.into_iter().map(own_line).collect()
-            }
+        Phase::Thinking if !state.thinking_buf.is_empty() => state
+            .thinking_buf
+            .lines()
+            .map(|l| Line::styled(l.to_string(), Style::default().add_modifier(Modifier::DIM)))
+            .collect(),
+        Phase::Responding if !state.text_buf.is_empty() => {
+            let text = tui_markdown::from_str(&state.text_buf);
+            text.lines.into_iter().map(own_line).collect()
         }
         _ => vec![Line::styled(
             state.phase.detail(),
@@ -469,6 +381,98 @@ fn render_status_bar(frame: &mut Frame, state: &TuiState, area: Rect) {
         .style(Style::default().bg(Color::DarkGray).fg(Color::White));
 
     frame.render_widget(Paragraph::new(bar), area);
+}
+
+// ---------------------------------------------------------------------------
+// Block rendering — each ContentBlock rendered as a ratatui widget
+// ---------------------------------------------------------------------------
+
+/// Convert a block's body into styled lines for rendering.
+fn render_block_content(block: &ContentBlock) -> Vec<Line<'static>> {
+    match &block.kind {
+        BlockKind::User | BlockKind::Assistant => {
+            let md = tui_markdown::from_str(&block.body);
+            md.lines.into_iter().map(own_line).collect()
+        }
+        BlockKind::Thinking => block
+            .body
+            .lines()
+            .map(|l| Line::styled(l.to_string(), Style::default().add_modifier(Modifier::DIM)))
+            .collect(),
+        BlockKind::Tool { is_error, .. } => {
+            let style = if *is_error {
+                Style::default().fg(Color::Red)
+            } else {
+                Style::default().add_modifier(Modifier::DIM)
+            };
+            block
+                .body
+                .lines()
+                .map(|l| Line::styled(l.to_string(), style))
+                .collect()
+        }
+        BlockKind::Info => vec![Line::styled(
+            block.body.clone(),
+            Style::default().add_modifier(Modifier::DIM),
+        )],
+        BlockKind::Error => block
+            .body
+            .lines()
+            .map(|l| Line::styled(l.to_string(), Style::default().fg(Color::Red)))
+            .collect(),
+    }
+}
+
+/// Compute the total rendered height of a block (content + chrome).
+fn block_render_height(kind: &BlockKind, width: u16, lines: &[Line<'static>]) -> u16 {
+    let (inner_width, chrome) = match kind {
+        BlockKind::Info => (width, 0u16),
+        _ => (width.saturating_sub(2).max(1), 2u16),
+    };
+    let para = Paragraph::new(Text::from(lines.to_vec())).wrap(Wrap { trim: false });
+    para.line_count(inner_width) as u16 + chrome
+}
+
+/// Render a block widget into a Buffer (used inside insert_before closures).
+fn render_block_widget(kind: &BlockKind, lines: &[Line<'static>], buf: &mut Buffer) {
+    match kind {
+        BlockKind::Info => {
+            Paragraph::new(Text::from(lines.to_vec()))
+                .wrap(Wrap { trim: false })
+                .render(buf.area, buf);
+        }
+        _ => {
+            let (title, style) = block_chrome(kind);
+            let chrome = Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .title(format!(" {} ", title))
+                .border_style(style);
+            let inner = chrome.inner(buf.area);
+            chrome.render(buf.area, buf);
+            Paragraph::new(Text::from(lines.to_vec()))
+                .wrap(Wrap { trim: false })
+                .render(inner, buf);
+        }
+    }
+}
+
+fn block_chrome(kind: &BlockKind) -> (String, Style) {
+    match kind {
+        BlockKind::User => ("you".into(), Style::default().fg(Color::Cyan)),
+        BlockKind::Assistant => ("assistant".into(), Style::default().fg(Color::Blue)),
+        BlockKind::Thinking => ("thinking".into(), Style::default().fg(Color::DarkGray)),
+        BlockKind::Tool { name, is_error } => {
+            let style = if *is_error {
+                Style::default().fg(Color::Red)
+            } else {
+                Style::default().fg(Color::Yellow)
+            };
+            (name.clone(), style)
+        }
+        BlockKind::Info => (String::new(), Style::default()),
+        BlockKind::Error => ("error".into(), Style::default().fg(Color::Red)),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -625,10 +629,10 @@ async fn run_prompt(
     thinking: ThinkingLevel,
     term_events: &mut EventStream,
 ) -> eyre::Result<()> {
-    tui.emit_and_draw(vec![Line::from(vec![
-        Span::styled("ri> ", Style::default().fg(Color::Cyan)),
-        Span::raw(text.to_string()),
-    ])])?;
+    tui.emit_block(ContentBlock {
+        kind: BlockKind::User,
+        body: text.to_string(),
+    })?;
 
     tui.state.phase = Phase::Waiting;
     tui.draw()?;
@@ -667,12 +671,20 @@ async fn run_prompt(
         }
     }
 
-    // Flush any remaining streaming content to scrollback (e.g. after cancellation).
+    // Emit any partial content as blocks (e.g. after cancellation).
     if !tui.state.text_buf.is_empty() {
-        tui.flush_text()?;
+        let body = std::mem::take(&mut tui.state.text_buf);
+        tui.emit_block(ContentBlock {
+            kind: BlockKind::Assistant,
+            body,
+        })?;
     }
     if !tui.state.thinking_buf.is_empty() {
-        tui.flush_thinking()?;
+        let body = std::mem::take(&mut tui.state.thinking_buf);
+        tui.emit_block(ContentBlock {
+            kind: BlockKind::Thinking,
+            body,
+        })?;
     }
 
     tui.state.phase = Phase::Input;
