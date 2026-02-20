@@ -116,9 +116,9 @@ impl LlmProvider for AnthropicProvider {
                 cost: ModelCost { input: 3.0, output: 15.0, cache_read: 0.3, cache_write: 3.75 },
             },
             Model {
-                id: "claude-opus-4-6-20250610".into(), name: "Claude Opus 4.6".into(),
-                reasoning: true, context_window: 200_000, max_tokens: 32_768,
-                cost: ModelCost { input: 15.0, output: 75.0, cache_read: 1.5, cache_write: 18.75 },
+                id: "claude-opus-4-6".into(), name: "Claude Opus 4.6".into(),
+                reasoning: true, context_window: 200_000, max_tokens: 64_000,
+                cost: ModelCost { input: 5.0, output: 25.0, cache_read: 0.5, cache_write: 6.25 },
             },
         ]
     }

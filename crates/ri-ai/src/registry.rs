@@ -16,14 +16,25 @@ pub fn all_providers() -> Vec<Box<dyn LlmProvider>> {
 }
 
 pub fn default_model_id() -> &'static str {
-    "claude-sonnet-4-20250514"
+    "claude-opus-4-6"
 }
 
 /// Resolve a model ID to its provider, only constructing the matching provider.
+/// Supports exact matches and prefix matches (e.g. "claude-opus-4-6" matches
+/// "claude-opus-4-6-20250610").
 pub async fn resolve(model_id: &str) -> eyre::Result<(Box<dyn LlmProvider>, Model)> {
+    // Exact match first.
     for factory in FACTORIES {
         let provider = factory();
         if let Some(model) = provider.models().into_iter().find(|m| m.id == model_id) {
+            return Ok((provider, model));
+        }
+    }
+
+    // Prefix match fallback.
+    for factory in FACTORIES {
+        let provider = factory();
+        if let Some(model) = provider.models().into_iter().find(|m| m.id.starts_with(model_id)) {
             return Ok((provider, model));
         }
     }
