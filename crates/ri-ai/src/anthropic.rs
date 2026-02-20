@@ -413,7 +413,13 @@ fn convert_message(msg: &Message) -> Value {
 fn convert_content(c: &ContentBlock) -> Value {
     match c {
         ContentBlock::Text { text, .. } => json!({ "type": "text", "text": text }),
-        ContentBlock::Thinking { thinking, .. } => json!({ "type": "thinking", "thinking": thinking }),
+        ContentBlock::Thinking { thinking, extra, .. } => {
+            if let Some(sig) = extra.get("sig").and_then(|v| v.as_str()) {
+                json!({ "type": "thinking", "thinking": thinking, "signature": sig })
+            } else {
+                json!({ "type": "text", "text": thinking })
+            }
+        }
         ContentBlock::Image { media_type, data, .. } => json!({
             "type": "image",
             "source": { "type": "base64", "media_type": media_type, "data": data }
@@ -445,6 +451,7 @@ enum AnthropicBlock {
 
 struct AnthropicState {
     blocks: HashMap<usize, AnthropicBlock>,
+    signatures: HashMap<usize, String>,
     usage: Usage,
     is_oauth: bool,
     original_tools: Vec<ToolSchema>,
@@ -452,7 +459,7 @@ struct AnthropicState {
 
 impl AnthropicState {
     fn new(is_oauth: bool, original_tools: Vec<ToolSchema>) -> Self {
-        Self { blocks: HashMap::new(), usage: Usage::default(), is_oauth, original_tools }
+        Self { blocks: HashMap::new(), signatures: HashMap::new(), usage: Usage::default(), is_oauth, original_tools }
     }
 
     /// Remap Claude Code tool names back to our original names when using OAuth.
@@ -527,7 +534,10 @@ impl SseInterpreter for AnthropicState {
                             }));
                         }
                     }
-                    "signature_delta" => {}
+                    "signature_delta" => {
+                        let sig = parsed["delta"]["signature"].as_str().unwrap_or("");
+                        self.signatures.entry(index).or_default().push_str(sig);
+                    }
                     other => { warn!("Unknown delta type: {}", other); }
                 }
             }
@@ -541,12 +551,13 @@ impl SseInterpreter for AnthropicState {
                     }
                 };
                 let index = parsed["index"].as_u64().unwrap_or(0) as usize;
+                let sig = self.signatures.remove(&index).filter(|s| !s.is_empty());
                 if let Some(block) = self.blocks.get(&index) {
                     match block {
-                        AnthropicBlock::Text => out.push(Ok(StreamEvent::TextEnd { sig: None })),
-                        AnthropicBlock::Thinking => out.push(Ok(StreamEvent::ThinkingEnd { sig: None })),
+                        AnthropicBlock::Text => out.push(Ok(StreamEvent::TextEnd { sig: sig.clone() })),
+                        AnthropicBlock::Thinking => out.push(Ok(StreamEvent::ThinkingEnd { sig })),
                         AnthropicBlock::ToolUse { id } => {
-                            out.push(Ok(StreamEvent::ToolCallEnd { id: id.clone(), sig: None }));
+                            out.push(Ok(StreamEvent::ToolCallEnd { id: id.clone(), sig }));
                         }
                     }
                 }
