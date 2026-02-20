@@ -1,5 +1,7 @@
 // Built-in tools for ri.
 
+pub mod resources;
+
 use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;

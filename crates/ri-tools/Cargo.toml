@@ -8,6 +8,7 @@ description = "Built-in coding tools (bash, read, write, edit) for ri"
 [dependencies]
 ri.workspace = true
 tokio.workspace = true
+serde = { workspace = true }
 serde_json.workspace = true
 tokio-util.workspace = true
 async-trait.workspace = true
