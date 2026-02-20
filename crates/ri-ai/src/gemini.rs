@@ -240,7 +240,7 @@ fn build_body(variant: GeminiVariant, project_id: &str, opts: &RequestOptions) -
 
     let mut generation_config = json!({ "maxOutputTokens": max_tokens });
 
-    if opts.model.reasoning && opts.thinking != ThinkingLevel::Off {
+    if opts.thinking != ThinkingLevel::Off {
         if is_gemini3(&opts.model.id) {
             if let Some(level_str) = thinking_level_string(opts.thinking, &opts.model.id) {
                 generation_config["thinkingConfig"] = json!({

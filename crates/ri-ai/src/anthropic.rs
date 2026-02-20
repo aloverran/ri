@@ -381,28 +381,16 @@ fn build_body(opts: &RequestOptions, is_oauth: bool) -> Value {
         body["tools"] = json!(tools);
     }
 
-    if opts.model.reasoning && opts.thinking != ThinkingLevel::Off {
-        let is_opus_46 = opts.model.id.contains("opus-4-6") || opts.model.id.contains("opus-4.6");
-        if is_opus_46 {
-            body["thinking"] = json!({ "type": "adaptive" });
-            let effort = match opts.thinking {
-                ThinkingLevel::Low => "low",
-                ThinkingLevel::Medium => "medium",
-                ThinkingLevel::High => "high",
-                ThinkingLevel::XHigh => "max",
-                ThinkingLevel::Off => unreachable!(),
-            };
-            body["output_config"] = json!({ "effort": effort });
-        } else {
-            let budget = match opts.thinking {
-                ThinkingLevel::Low => 1024,
-                ThinkingLevel::Medium => 4096,
-                ThinkingLevel::High => 16384,
-                ThinkingLevel::XHigh => 32768,
-                ThinkingLevel::Off => unreachable!(),
-            };
-            body["thinking"] = json!({ "type": "enabled", "budget_tokens": budget });
-        }
+    if opts.thinking != ThinkingLevel::Off {
+        body["thinking"] = json!({ "type": "adaptive" });
+        let effort = match opts.thinking {
+            ThinkingLevel::Low => "low",
+            ThinkingLevel::Medium => "medium",
+            ThinkingLevel::High => "high",
+            ThinkingLevel::XHigh => "max",
+            ThinkingLevel::Off => unreachable!(),
+        };
+        body["output_config"] = json!({ "effort": effort });
     }
 
     body
