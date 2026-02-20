@@ -104,6 +104,8 @@ async fn run_bash(
     cwd: PathBuf,
     cancel: tokio_util::sync::CancellationToken,
 ) -> ToolOutput {
+    use command_group::AsyncCommandGroup;
+
     let command = match input["command"].as_str() {
         Some(c) => c,
         None => return ToolOutput { text: "missing 'command' parameter".into(), is_error: true },
@@ -117,20 +119,17 @@ async fn run_bash(
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
 
-    // Create a new process group so we can kill the entire tree on timeout.
-    #[cfg(unix)]
-    cmd.process_group(0);
-
-    let mut child = match cmd.spawn() {
+    // group_spawn creates a process group (Unix) or job object (Windows)
+    // so we can kill the entire tree on cleanup.
+    let mut child = match cmd.group_spawn() {
         Ok(c) => c,
         Err(e) => return ToolOutput { text: format!("Failed to spawn: {}", e), is_error: true },
     };
 
-    let pid = child.id();
-
     // Take stdout/stderr handles for concurrent reading.
-    let stdout = child.stdout.take();
-    let stderr = child.stderr.take();
+    let inner = child.inner();
+    let stdout = inner.stdout.take();
+    let stderr = inner.stderr.take();
 
     let stdout_task = tokio::spawn(async move {
         let mut buf = Vec::new();
@@ -149,26 +148,32 @@ async fn run_bash(
         buf
     });
 
-    // Wait for process with timeout and cancellation.
-    let status = tokio::select! {
-        result = child.wait() => Some(result),
+    // Wait for the shell process with timeout and cancellation.
+    let exit_status = tokio::select! {
+        result = child.inner().wait() => {
+            match result {
+                Ok(s) => Some(s),
+                Err(e) => {
+                    let _ = child.kill().await;
+                    let _ = stdout_task.await;
+                    let _ = stderr_task.await;
+                    return ToolOutput { text: format!("Process error: {}", e), is_error: true };
+                }
+            }
+        },
         _ = tokio::time::sleep(std::time::Duration::from_millis(timeout_ms)) => None,
         _ = cancel.cancelled() => None,
     };
 
-    if status.is_none() {
-        // Kill the entire process group.
-        #[cfg(unix)]
-        if let Some(pid) = pid {
-            unsafe { libc::kill((pid as i32).wrapping_neg(), libc::SIGKILL); }
-        }
-        // Fallback: kill the direct child.
-        let _ = child.start_kill();
-        // Reap to avoid zombie.
-        let _ = child.wait().await;
-        // Wait for pipe readers to finish.
-        let _ = stdout_task.await;
-        let _ = stderr_task.await;
+    // Always kill the process group after the shell exits or on timeout.
+    // This cleans up any backgrounded children, which also closes their
+    // inherited pipe FDs so the stdout/stderr readers can finish.
+    let _ = child.start_kill();
+
+    let stdout_bytes = stdout_task.await.unwrap_or_default();
+    let stderr_bytes = stderr_task.await.unwrap_or_default();
+
+    if exit_status.is_none() {
         return ToolOutput {
             text: if cancel.is_cancelled() {
                 "Command aborted".into()
@@ -179,18 +184,7 @@ async fn run_bash(
         };
     }
 
-    let exit_status = match status.unwrap() {
-        Ok(s) => s,
-        Err(e) => {
-            let _ = stdout_task.await;
-            let _ = stderr_task.await;
-            return ToolOutput { text: format!("Process error: {}", e), is_error: true };
-        }
-    };
-
-    let stdout_bytes = stdout_task.await.unwrap_or_default();
-    let stderr_bytes = stderr_task.await.unwrap_or_default();
-    let exit_code = exit_status.code().unwrap_or(-1);
+    let exit_code = exit_status.unwrap().code().unwrap_or(-1);
 
     let stdout = String::from_utf8_lossy(&stdout_bytes);
     let stderr = String::from_utf8_lossy(&stderr_bytes);

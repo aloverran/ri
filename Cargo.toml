@@ -31,6 +31,7 @@ bytes = "1"
 tokio-util = { version = "0.7", features = ["rt"] }
 urlencoding = "2"
 async-trait = "0.1"
+command-group = { version = "5", features = ["with-tokio"] }
 async-stream = "0.3"
 ri = { path = "crates/ri" }
 ri-ai = { path = "crates/ri-ai" }
