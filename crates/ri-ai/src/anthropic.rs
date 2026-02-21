@@ -403,7 +403,10 @@ fn convert_message(msg: &Message) -> Value {
         Role::System => "user",
     };
 
-    let content: Vec<Value> = msg.content.iter().map(convert_content).collect();
+    let content: Vec<Value> = msg.content.iter()
+        .filter(|c| !matches!(c, ContentBlock::Error { .. }))
+        .map(convert_content)
+        .collect();
     let has_tool_results = msg.content.iter().any(|c| matches!(c, ContentBlock::ToolResult { .. }));
     let effective_role = if has_tool_results { "user" } else { role };
 
@@ -436,6 +439,10 @@ fn convert_content(c: &ContentBlock) -> Value {
                 "is_error": is_error,
             })
         }
+        ContentBlock::Error { message, .. } => json!({
+            "type": "text",
+            "text": format!("[Error: {}]", message)
+        }),
         ContentBlock::Unknown(v) => v.clone(),
     }
 }

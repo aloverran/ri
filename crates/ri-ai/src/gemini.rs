@@ -318,10 +318,16 @@ fn build_contents(messages: &[Message], model_id: &str) -> Vec<Value> {
     for msg in messages {
         if msg.role == Role::System { continue; }
 
-        let has_tool_results = msg.content.iter().any(|c| matches!(c, ContentBlock::ToolResult { .. }));
+        let filtered_content: Vec<&ContentBlock> = msg.content.iter()
+            .filter(|c| !matches!(c, ContentBlock::Error { .. }))
+            .collect();
+
+        if filtered_content.is_empty() { continue; }
+
+        let has_tool_results = filtered_content.iter().any(|c| matches!(c, ContentBlock::ToolResult { .. }));
 
         if has_tool_results {
-            let parts: Vec<Value> = msg.content.iter().filter_map(|c| {
+            let parts: Vec<Value> = filtered_content.iter().filter_map(|c| {
                 if let ContentBlock::ToolResult { tool_use_id, content, is_error, .. } = c {
                     let tool_name = tool_names.get(tool_use_id.as_str())
                         .cloned()
@@ -373,7 +379,7 @@ fn build_contents(messages: &[Message], model_id: &str) -> Vec<Value> {
         };
 
         let mut parts: Vec<Value> = Vec::new();
-        for block in &msg.content {
+        for block in filtered_content {
             match block {
                 ContentBlock::Text { text, extra } => {
                     if text.trim().is_empty() { continue; }
@@ -422,6 +428,7 @@ fn build_contents(messages: &[Message], model_id: &str) -> Vec<Value> {
                 ContentBlock::Image { media_type, data, .. } => {
                     parts.push(json!({ "inlineData": { "mimeType": media_type, "data": data } }));
                 }
+                ContentBlock::Error { .. } => {}
                 ContentBlock::Unknown(_) => {}
             }
         }

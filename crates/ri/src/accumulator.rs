@@ -99,7 +99,10 @@ impl StreamAccumulator {
                 }
             }
             StreamEvent::Usage(u) => { self.usage = Some(u.clone()); }
-            StreamEvent::Done | StreamEvent::Error(_) => {}
+            StreamEvent::Error(e) => {
+                self.content.push(ContentBlock::error(e));
+            }
+            StreamEvent::Done => {}
         }
     }
 

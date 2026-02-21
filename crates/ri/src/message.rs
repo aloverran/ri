@@ -52,6 +52,11 @@ pub enum ContentBlock {
         #[serde(flatten)]
         extra: JsonMap,
     },
+    Error {
+        message: String,
+        #[serde(flatten)]
+        extra: JsonMap,
+    },
     // Catch-all for unknown block types -- preserves round-trip.
     #[serde(untagged)]
     Unknown(serde_json::Value),
@@ -81,6 +86,10 @@ impl ContentBlock {
             is_error,
             extra: JsonMap::new(),
         }
+    }
+
+    pub fn error(s: impl Into<String>) -> Self {
+        ContentBlock::Error { message: s.into(), extra: JsonMap::new() }
     }
 }
 
