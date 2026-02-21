@@ -42,12 +42,21 @@ pub fn load_settings() -> Settings {
         .unwrap_or_default()
 }
 
+/// Walk up from `dir`, collecting context files (AGENTS.md, CLAUDE.md).
+/// At each level checks `.agents/` subdirectory then the directory itself.
+/// Stops at a `.git` boundary. Returns files in walk order (closest first).
+pub fn find_context_files(dir: &Path) -> Vec<ContextFile> {
+    let mut files = Vec::new();
+    let mut seen = HashSet::new();
+    collect_walk(dir, &mut files, &mut seen);
+    files
+}
+
 /// Discover context files for the agent system prompt.
 ///
 /// Returns files in prompt order:
 /// 1. Global: ~/.config/agents/ (AGENTS.md, CLAUDE.md)
-/// 2. Project-local: walk up from cwd, at each level checking
-///    .agents/ directory then bare files. Stops at .git boundary.
+/// 2. Project-local: walk up from cwd via `find_context_files`.
 pub fn discover_context_files(cwd: &Path) -> Vec<ContextFile> {
     let mut files = Vec::new();
     let mut seen = HashSet::new();
@@ -58,14 +67,7 @@ pub fn discover_context_files(cwd: &Path) -> Vec<ContextFile> {
     }
 
     // Project-local: walk up from cwd.
-    // Canonicalize so parent() walks correctly even if cwd was relative.
-    let mut dir = Some(cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf()));
-    while let Some(d) = dir {
-        scan_dir(&d.join(".agents"), &mut files, &mut seen);
-        scan_dir(&d, &mut files, &mut seen);
-        if d.join(".git").exists() { break; }
-        dir = d.parent().map(|p| p.to_path_buf());
-    }
+    collect_walk(cwd, &mut files, &mut seen);
 
     files
 }
@@ -93,6 +95,18 @@ Use them to understand the codebase before making changes.\n\n\
 Be concise. Focus on what the user asked for. Do not over-engineer.";
 
 // -- Internal --
+
+/// Walk up from `dir`, scanning at each level. Shared by find_context_files
+/// and discover_context_files (which seeds `seen` with global files first).
+fn collect_walk(dir: &Path, files: &mut Vec<ContextFile>, seen: &mut HashSet<PathBuf>) {
+    let mut current = Some(dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf()));
+    while let Some(d) = current {
+        scan_dir(&d.join(".agents"), files, seen);
+        scan_dir(&d, files, seen);
+        if d.join(".git").exists() { break; }
+        current = d.parent().map(|p| p.to_path_buf());
+    }
+}
 
 /// Scan a directory for context files (AGENTS.md, CLAUDE.md).
 /// Each discovered file is the root of its own include graph; its parent
