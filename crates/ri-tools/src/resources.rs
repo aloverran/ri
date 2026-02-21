@@ -84,6 +84,7 @@ pub fn build_system_prompt(context_files: &[ContextFile]) -> String {
     parts.join("\n\n")
 }
 
+
 pub const BASE_SYSTEM_PROMPT: &str = "\
 You are ri, a coding agent. You help with software engineering tasks: \
 fixing bugs, adding features, refactoring code, and more.\n\n\

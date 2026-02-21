@@ -1,5 +1,6 @@
 // Built-in tools for ri.
 
+pub mod prompts;
 pub mod resources;
 
 use std::path::{Path, PathBuf};
