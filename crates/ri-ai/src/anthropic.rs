@@ -341,28 +341,16 @@ fn build_body(opts: &RequestOptions, is_oauth: bool) -> Value {
         "messages": messages,
         "max_tokens": max_tokens,
         "stream": true,
+        "cache_control": { "type": "ephemeral" },
     });
 
     if is_oauth {
-        let system_blocks = vec![
-            json!({
-                "type": "text",
-                "text": "You are Claude Code, Anthropic's official CLI for Claude.",
-                "cache_control": { "type": "ephemeral" }
-            }),
-            json!({
-                "type": "text",
-                "text": opts.system_prompt,
-                "cache_control": { "type": "ephemeral" }
-            }),
-        ];
-        body["system"] = json!(system_blocks);
+        body["system"] = json!([
+            { "type": "text", "text": "You are Claude Code, Anthropic's official CLI for Claude." },
+            { "type": "text", "text": opts.system_prompt },
+        ]);
     } else {
-        body["system"] = json!([{
-            "type": "text",
-            "text": opts.system_prompt,
-            "cache_control": { "type": "ephemeral" }
-        }]);
+        body["system"] = json!([{ "type": "text", "text": opts.system_prompt }]);
     }
 
     if !opts.tools.is_empty() {
