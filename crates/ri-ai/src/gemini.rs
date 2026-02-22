@@ -381,17 +381,12 @@ fn build_contents(messages: &[Message], model_id: &str) -> Vec<Value> {
         let mut parts: Vec<Value> = Vec::new();
         for block in filtered_content {
             match block {
-                ContentBlock::Text { text, extra } => {
+                ContentBlock::Text { text } => {
                     if text.trim().is_empty() { continue; }
-                    let mut part = json!({ "text": text });
-                    if let Some(serde_json::Value::String(s)) = extra.get("sig") {
-                        if is_valid_signature(s) { part["thoughtSignature"] = json!(s); }
-                    }
-                    parts.push(part);
+                    parts.push(json!({ "text": text }));
                 }
-                ContentBlock::Thinking { thinking, extra } => {
+                ContentBlock::Thinking { thinking, sig } => {
                     if thinking.trim().is_empty() { continue; }
-                    let sig = extra.get("sig").and_then(|v| v.as_str());
                     if let Some(s) = sig {
                         if is_valid_signature(s) {
                             let mut part = json!({ "text": thinking, "thought": true });
@@ -402,16 +397,9 @@ fn build_contents(messages: &[Message], model_id: &str) -> Vec<Value> {
                     }
                     parts.push(json!({ "text": thinking }));
                 }
-                ContentBlock::ToolUse { name, input, extra, .. } => {
-                    let sig = extra.get("sig").and_then(|v| v.as_str());
-                    if let Some(s) = sig {
-                        if is_valid_signature(s) {
-                            let mut part = json!({ "functionCall": { "name": name, "args": input } });
-                            part["thoughtSignature"] = json!(s);
-                            parts.push(part);
-                            continue;
-                        }
-                    }
+                ContentBlock::ToolUse { name, input, .. } => {
+                    // Note: sig for ToolUse was previously being read from extra but 
+                    // we've decided only Thinking needs it. Removing sig handling for ToolUse.
                     if gemini3 {
                         let args_str = serde_json::to_string_pretty(input).unwrap_or_default();
                         parts.push(json!({

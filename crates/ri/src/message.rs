@@ -2,8 +2,6 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use uuid::Uuid;
 
-use crate::JsonMap;
-
 // -- Role --
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -21,27 +19,22 @@ pub enum Role {
 pub enum ContentBlock {
     Text {
         text: String,
-        #[serde(flatten)]
-        extra: JsonMap,
     },
     Thinking {
         thinking: String,
-        #[serde(flatten)]
-        extra: JsonMap,
+        /// Provider signature for replaying thinking blocks (Anthropic, Gemini).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sig: Option<String>,
     },
     Image {
         #[serde(rename = "mediaType")]
         media_type: String,
         data: String,
-        #[serde(flatten)]
-        extra: JsonMap,
     },
     ToolUse {
         id: String,
         name: String,
         input: serde_json::Value,
-        #[serde(flatten)]
-        extra: JsonMap,
     },
     ToolResult {
         #[serde(rename = "toolUseId")]
@@ -49,13 +42,12 @@ pub enum ContentBlock {
         content: Vec<ContentBlock>,
         #[serde(default)]
         is_error: bool,
-        #[serde(flatten)]
-        extra: JsonMap,
+        /// Structured data for UI rendering. Not sent to the LLM.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        details: Option<serde_json::Value>,
     },
     Error {
         message: String,
-        #[serde(flatten)]
-        extra: JsonMap,
     },
     // Catch-all for unknown block types -- preserves round-trip.
     #[serde(untagged)]
@@ -64,19 +56,19 @@ pub enum ContentBlock {
 
 impl ContentBlock {
     pub fn text(s: impl Into<String>) -> Self {
-        ContentBlock::Text { text: s.into(), extra: JsonMap::new() }
+        ContentBlock::Text { text: s.into() }
     }
 
     pub fn thinking(s: impl Into<String>) -> Self {
-        ContentBlock::Thinking { thinking: s.into(), extra: JsonMap::new() }
+        ContentBlock::Thinking { thinking: s.into(), sig: None }
     }
 
     pub fn tool_use(id: impl Into<String>, name: impl Into<String>, input: serde_json::Value) -> Self {
-        ContentBlock::ToolUse { id: id.into(), name: name.into(), input, extra: JsonMap::new() }
+        ContentBlock::ToolUse { id: id.into(), name: name.into(), input }
     }
 
-    pub fn tool_result(tool_use_id: impl Into<String>, content: Vec<ContentBlock>, is_error: bool) -> Self {
-        ContentBlock::ToolResult { tool_use_id: tool_use_id.into(), content, is_error, extra: JsonMap::new() }
+    pub fn tool_result(tool_use_id: impl Into<String>, content: Vec<ContentBlock>, is_error: bool, details: Option<serde_json::Value>) -> Self {
+        ContentBlock::ToolResult { tool_use_id: tool_use_id.into(), content, is_error, details }
     }
 
     pub fn tool_result_text(tool_use_id: impl Into<String>, text: impl Into<String>, is_error: bool) -> Self {
@@ -84,12 +76,21 @@ impl ContentBlock {
             tool_use_id: tool_use_id.into(),
             content: vec![ContentBlock::text(text)],
             is_error,
-            extra: JsonMap::new(),
+            details: None,
+        }
+    }
+
+    pub fn tool_result_with_details(tool_use_id: impl Into<String>, text: impl Into<String>, is_error: bool, details: Option<serde_json::Value>) -> Self {
+        ContentBlock::ToolResult {
+            tool_use_id: tool_use_id.into(),
+            content: vec![ContentBlock::text(text)],
+            is_error,
+            details,
         }
     }
 
     pub fn error(s: impl Into<String>) -> Self {
-        ContentBlock::Error { message: s.into(), extra: JsonMap::new() }
+        ContentBlock::Error { message: s.into() }
     }
 }
 
@@ -127,16 +128,14 @@ pub struct Message {
     pub content: Vec<ContentBlock>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provenance: Option<Provenance>,
+    /// Freeform metadata for plugins and higher layers to attach to messages.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub meta: Option<serde_json::Value>,
-    // Preserve unknown top-level fields for forward compat.
-    #[serde(flatten)]
-    pub extra: JsonMap,
 }
 
 impl Message {
     pub fn new(id: String, role: Role, content: Vec<ContentBlock>) -> Self {
-        Message { id, role, content, provenance: None, meta: None, extra: JsonMap::new() }
+        Message { id, role, content, provenance: None, meta: None }
     }
 
     pub fn user(text: impl Into<String>) -> Self {
@@ -288,46 +287,63 @@ mod tests {
     }
 
     #[test]
-    fn test_content_block_text_extra_roundtrip() {
+    fn test_thinking_sig_roundtrip() {
         let json_data = json!({
-            "type": "text",
-            "text": "hello",
-            "sig": "signature",
-            "meta": {"foo": "bar"}
+            "type": "thinking",
+            "thinking": "let me reason",
+            "sig": "abc123"
         });
-        let json_str = json_data.to_string();
-        
-        let block: ContentBlock = serde_json::from_str(&json_str).unwrap();
-        
-        if let ContentBlock::Text { text, extra } = &block {
-            assert_eq!(text, "hello");
-            assert_eq!(extra.get("sig").unwrap(), "signature");
-            assert_eq!(extra.get("meta").unwrap().get("foo").unwrap(), "bar");
-            assert!(!extra.contains_key("type"));
+        let block: ContentBlock = serde_json::from_str(&json_data.to_string()).unwrap();
+        if let ContentBlock::Thinking { thinking, sig } = &block {
+            assert_eq!(thinking, "let me reason");
+            assert_eq!(sig.as_deref(), Some("abc123"));
         } else {
-            panic!("Expected Text variant");
+            panic!("Expected Thinking variant");
         }
-        
-        let round_trip = serde_json::to_string(&block).unwrap();
-        let back: serde_json::Value = serde_json::from_str(&round_trip).unwrap();
-        assert_eq!(back, json_data);
+        let round_trip: serde_json::Value = serde_json::from_str(&serde_json::to_string(&block).unwrap()).unwrap();
+        assert_eq!(round_trip, json_data);
     }
 
     #[test]
-    fn test_message_extra_roundtrip() {
+    fn test_thinking_no_sig() {
+        let json_data = json!({ "type": "thinking", "thinking": "hello" });
+        let block: ContentBlock = serde_json::from_str(&json_data.to_string()).unwrap();
+        if let ContentBlock::Thinking { sig, .. } = &block {
+            assert!(sig.is_none());
+        } else {
+            panic!("Expected Thinking variant");
+        }
+        // sig should be omitted from serialization when None
+        let serialized = serde_json::to_string(&block).unwrap();
+        assert!(!serialized.contains("sig"));
+    }
+
+    #[test]
+    fn test_tool_result_details_roundtrip() {
         let json_data = json!({
-            "id": "msg1",
-            "role": "user",
-            "content": [{"type": "text", "text": "hi"}],
-            "unknown_top_field": "val"
+            "type": "tool_result",
+            "toolUseId": "call_1",
+            "content": [{"type": "text", "text": "ok"}],
+            "is_error": false,
+            "details": {"exit_code": 0, "lines": 42}
         });
-        
-        let msg: Message = serde_json::from_str(&json_data.to_string()).unwrap();
-        assert_eq!(msg.extra.get("unknown_top_field").unwrap(), "val");
-        
-        let round_trip = serde_json::to_string(&msg).unwrap();
-        let back: serde_json::Value = serde_json::from_str(&round_trip).unwrap();
-        assert_eq!(back, json_data);
+        let block: ContentBlock = serde_json::from_str(&json_data.to_string()).unwrap();
+        if let ContentBlock::ToolResult { details, .. } = &block {
+            let d = details.as_ref().unwrap();
+            assert_eq!(d["exit_code"], 0);
+            assert_eq!(d["lines"], 42);
+        } else {
+            panic!("Expected ToolResult variant");
+        }
+        let round_trip: serde_json::Value = serde_json::from_str(&serde_json::to_string(&block).unwrap()).unwrap();
+        assert_eq!(round_trip, json_data);
+    }
+
+    #[test]
+    fn test_tool_result_no_details() {
+        let block = ContentBlock::tool_result_text("call_1", "done", false);
+        let serialized = serde_json::to_string(&block).unwrap();
+        assert!(!serialized.contains("details"));
     }
 
     #[test]
@@ -337,8 +353,6 @@ mod tests {
         });
         
         let res: Result<ContentBlock, _> = serde_json::from_str(&json_data.to_string());
-        // Since the enum is tagged, serde usually expects the tag.
-        // But ContentBlock::Unknown is untagged.
         assert!(res.is_ok(), "Should match Unknown even if type is missing. Error: {:?}", res.err());
         if let ContentBlock::Unknown(v) = res.unwrap() {
             assert_eq!(v.get("data").unwrap(), "no type here");

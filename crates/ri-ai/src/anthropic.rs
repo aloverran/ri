@@ -415,19 +415,19 @@ fn convert_message(msg: &Message) -> Value {
 
 fn convert_content(c: &ContentBlock) -> Value {
     match c {
-        ContentBlock::Text { text, .. } => json!({ "type": "text", "text": text }),
-        ContentBlock::Thinking { thinking, extra, .. } => {
-            if let Some(sig) = extra.get("sig").and_then(|v| v.as_str()) {
-                json!({ "type": "thinking", "thinking": thinking, "signature": sig })
+        ContentBlock::Text { text } => json!({ "type": "text", "text": text }),
+        ContentBlock::Thinking { thinking, sig } => {
+            if let Some(s) = sig {
+                json!({ "type": "thinking", "thinking": thinking, "signature": s })
             } else {
                 json!({ "type": "text", "text": thinking })
             }
         }
-        ContentBlock::Image { media_type, data, .. } => json!({
+        ContentBlock::Image { media_type, data } => json!({
             "type": "image",
             "source": { "type": "base64", "media_type": media_type, "data": data }
         }),
-        ContentBlock::ToolUse { id, name, input, .. } => json!({
+        ContentBlock::ToolUse { id, name, input } => json!({
             "type": "tool_use", "id": id, "name": name, "input": input
         }),
         ContentBlock::ToolResult { tool_use_id, content, is_error, .. } => {
@@ -439,7 +439,7 @@ fn convert_content(c: &ContentBlock) -> Value {
                 "is_error": is_error,
             })
         }
-        ContentBlock::Error { message, .. } => json!({
+        ContentBlock::Error { message } => json!({
             "type": "text",
             "text": format!("[Error: {}]", message)
         }),

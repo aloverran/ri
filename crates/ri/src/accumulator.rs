@@ -6,7 +6,7 @@
 
 use std::collections::HashMap;
 
-use crate::{ContentBlock, JsonMap, StreamEvent, Usage};
+use crate::{ContentBlock, StreamEvent, Usage};
 
 /// In-progress tool call being assembled from streaming deltas.
 struct PendingToolCall {
@@ -42,15 +42,10 @@ impl StreamAccumulator {
         match event {
             StreamEvent::TextStart => { self.text_buf.clear(); }
             StreamEvent::TextDelta(d) => { self.text_buf.push_str(d); }
-            StreamEvent::TextEnd { sig } => {
+            StreamEvent::TextEnd { .. } => {
                 if !self.text_buf.is_empty() {
-                    let mut extra = JsonMap::new();
-                    if let Some(s) = sig {
-                        extra.insert("sig".into(), serde_json::Value::String(s.clone()));
-                    }
                     self.content.push(ContentBlock::Text {
                         text: std::mem::take(&mut self.text_buf),
-                        extra,
                     });
                 }
             }
@@ -58,13 +53,9 @@ impl StreamAccumulator {
             StreamEvent::ThinkingDelta(d) => { self.thinking_buf.push_str(d); }
             StreamEvent::ThinkingEnd { sig } => {
                 if !self.thinking_buf.is_empty() {
-                    let mut extra = JsonMap::new();
-                    if let Some(s) = sig {
-                        extra.insert("sig".into(), serde_json::Value::String(s.clone()));
-                    }
                     self.content.push(ContentBlock::Thinking {
                         thinking: std::mem::take(&mut self.thinking_buf),
-                        extra,
+                        sig: sig.clone(),
                     });
                 }
             }
@@ -79,22 +70,17 @@ impl StreamAccumulator {
                     tc.json_buf.push_str(json_fragment);
                 }
             }
-            StreamEvent::ToolCallEnd { id, sig } => {
+            StreamEvent::ToolCallEnd { id, .. } => {
                 if let Some(tc) = self.tool_calls.remove(id) {
                     let input: serde_json::Value = serde_json::from_str(&tc.json_buf)
                         .unwrap_or_else(|_| serde_json::json!({
                             "error": "Invalid JSON from model",
                             "partial": tc.json_buf,
                         }));
-                    let mut extra = JsonMap::new();
-                    if let Some(s) = sig {
-                        extra.insert("sig".into(), serde_json::Value::String(s.clone()));
-                    }
                     self.content.push(ContentBlock::ToolUse {
                         id: id.clone(),
                         name: tc.name,
                         input,
-                        extra,
                     });
                 }
             }

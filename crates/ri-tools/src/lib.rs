@@ -109,7 +109,11 @@ async fn run_bash(
 
     let command = match input["command"].as_str() {
         Some(c) => c,
-        None => return ToolOutput { text: "missing 'command' parameter".into(), is_error: true },
+        None => return ToolOutput {
+            text: "missing 'command' parameter".into(),
+            is_error: true,
+            details: None,
+        },
     };
     let timeout_ms = input["timeout"].as_u64().unwrap_or(120_000);
 
@@ -124,7 +128,11 @@ async fn run_bash(
     // so we can kill the entire tree on cleanup.
     let mut child = match cmd.group_spawn() {
         Ok(c) => c,
-        Err(e) => return ToolOutput { text: format!("Failed to spawn: {}", e), is_error: true },
+        Err(e) => return ToolOutput {
+            text: format!("Failed to spawn: {}", e),
+            is_error: true,
+            details: None,
+        },
     };
 
     // Take stdout/stderr handles for concurrent reading.
@@ -158,7 +166,11 @@ async fn run_bash(
                     let _ = child.kill().await;
                     let _ = stdout_task.await;
                     let _ = stderr_task.await;
-                    return ToolOutput { text: format!("Process error: {}", e), is_error: true };
+                    return ToolOutput {
+                        text: format!("Process error: {}", e),
+                        is_error: true,
+                        details: None,
+                    };
                 }
             }
         },
@@ -182,6 +194,7 @@ async fn run_bash(
                 format!("Command timed out after {}ms", timeout_ms)
             },
             is_error: true,
+            details: None,
         };
     }
 
@@ -199,19 +212,35 @@ async fn run_bash(
     let truncated = truncate_output(&combined, 2000, 50 * 1024);
     let text = format!("Exit code: {}\n{}", exit_code, truncated);
 
-    ToolOutput { text, is_error: exit_code != 0 }
+    ToolOutput {
+        text,
+        is_error: exit_code != 0,
+        details: Some(serde_json::json!({
+            "exit_code": exit_code,
+            "stdout": stdout,
+            "stderr": stderr,
+        })),
+    }
 }
 
 async fn run_read(input: serde_json::Value, cwd: PathBuf) -> ToolOutput {
     let path_str = match input["path"].as_str() {
         Some(p) => p,
-        None => return ToolOutput { text: "missing 'path' parameter".into(), is_error: true },
+        None => return ToolOutput {
+            text: "missing 'path' parameter".into(),
+            is_error: true,
+            details: None,
+        },
     };
 
     let path = resolve_path(path_str, &cwd);
     let content = match tokio::fs::read_to_string(&path).await {
         Ok(c) => c,
-        Err(e) => return ToolOutput { text: format!("Failed to read {}: {}", path.display(), e), is_error: true },
+        Err(e) => return ToolOutput {
+            text: format!("Failed to read {}: {}", path.display(), e),
+            is_error: true,
+            details: None,
+        },
     };
 
     let offset = input["offset"].as_u64().unwrap_or(1).max(1) as usize - 1;
@@ -233,23 +262,45 @@ async fn run_read(input: serde_json::Value, cwd: PathBuf) -> ToolOutput {
         numbered
     };
 
-    ToolOutput { text, is_error: false }
+    ToolOutput {
+        text,
+        is_error: false,
+        details: Some(serde_json::json!({
+            "path": path_str,
+            "total_lines": total,
+            "offset": offset + 1,
+            "limit": limit,
+            "content": content,
+        })),
+    }
 }
 
 async fn run_write(input: serde_json::Value, cwd: PathBuf) -> ToolOutput {
     let path_str = match input["path"].as_str() {
         Some(p) => p,
-        None => return ToolOutput { text: "missing 'path' parameter".into(), is_error: true },
+        None => return ToolOutput {
+            text: "missing 'path' parameter".into(),
+            is_error: true,
+            details: None,
+        },
     };
     let content = match input["content"].as_str() {
         Some(c) => c,
-        None => return ToolOutput { text: "missing 'content' parameter".into(), is_error: true },
+        None => return ToolOutput {
+            text: "missing 'content' parameter".into(),
+            is_error: true,
+            details: None,
+        },
     };
 
     let path = resolve_path(path_str, &cwd);
     if let Some(parent) = path.parent() {
         if let Err(e) = tokio::fs::create_dir_all(parent).await {
-            return ToolOutput { text: format!("Failed to create directories: {}", e), is_error: true };
+            return ToolOutput {
+                text: format!("Failed to create directories: {}", e),
+                is_error: true,
+                details: None,
+            };
         }
     }
 
@@ -257,46 +308,87 @@ async fn run_write(input: serde_json::Value, cwd: PathBuf) -> ToolOutput {
         Ok(()) => ToolOutput {
             text: format!("Wrote {} bytes to {}", content.len(), path.display()),
             is_error: false,
+            details: Some(serde_json::json!({
+                "path": path_str,
+                "size": content.len(),
+            })),
         },
-        Err(e) => ToolOutput { text: format!("Failed to write: {}", e), is_error: true },
+        Err(e) => ToolOutput {
+            text: format!("Failed to write: {}", e),
+            is_error: true,
+            details: None,
+        },
     }
 }
 
 async fn run_edit(input: serde_json::Value, cwd: PathBuf) -> ToolOutput {
     let path_str = match input["path"].as_str() {
         Some(p) => p,
-        None => return ToolOutput { text: "missing 'path' parameter".into(), is_error: true },
+        None => return ToolOutput {
+            text: "missing 'path' parameter".into(),
+            is_error: true,
+            details: None,
+        },
     };
     let old_text = match input["old_text"].as_str() {
         Some(t) => t,
-        None => return ToolOutput { text: "missing 'old_text' parameter".into(), is_error: true },
+        None => return ToolOutput {
+            text: "missing 'old_text' parameter".into(),
+            is_error: true,
+            details: None,
+        },
     };
     let new_text = match input["new_text"].as_str() {
         Some(t) => t,
-        None => return ToolOutput { text: "missing 'new_text' parameter".into(), is_error: true },
+        None => return ToolOutput {
+            text: "missing 'new_text' parameter".into(),
+            is_error: true,
+            details: None,
+        },
     };
 
     let path = resolve_path(path_str, &cwd);
     let content = match tokio::fs::read_to_string(&path).await {
         Ok(c) => c,
-        Err(e) => return ToolOutput { text: format!("Failed to read {}: {}", path.display(), e), is_error: true },
+        Err(e) => return ToolOutput {
+            text: format!("Failed to read {}: {}", path.display(), e),
+            is_error: true,
+            details: None,
+        },
     };
 
     let count = content.matches(old_text).count();
     if count == 0 {
-        return ToolOutput { text: "old_text not found in file".into(), is_error: true };
+        return ToolOutput {
+            text: "old_text not found in file".into(),
+            is_error: true,
+            details: None,
+        };
     }
     if count > 1 {
         return ToolOutput {
             text: format!("old_text found {} times; must be unique", count),
             is_error: true,
+            details: None,
         };
     }
 
     let new_content = content.replacen(old_text, new_text, 1);
     match tokio::fs::write(&path, &new_content).await {
-        Ok(()) => ToolOutput { text: format!("Edited {}", path.display()), is_error: false },
-        Err(e) => ToolOutput { text: format!("Failed to write: {}", e), is_error: true },
+        Ok(()) => ToolOutput {
+            text: format!("Edited {}", path.display()),
+            is_error: false,
+            details: Some(serde_json::json!({
+                "path": path_str,
+                "old_text": old_text,
+                "new_text": new_text,
+            })),
+        },
+        Err(e) => ToolOutput {
+            text: format!("Failed to write: {}", e),
+            is_error: true,
+            details: None,
+        },
     }
 }
 

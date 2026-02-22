@@ -78,8 +78,11 @@ pub struct ToolSchema {
 
 /// Result of executing a tool.
 pub struct ToolOutput {
+    /// Text content sent to the LLM as the tool result.
     pub text: String,
     pub is_error: bool,
+    /// Structured data for UI rendering. Not sent to the LLM.
+    pub details: Option<serde_json::Value>,
 }
 
 /// A tool the agent can invoke. Provides schema (for the LLM API)
