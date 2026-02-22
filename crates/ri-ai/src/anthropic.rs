@@ -448,13 +448,21 @@ struct AnthropicState {
     blocks: HashMap<usize, AnthropicBlock>,
     signatures: HashMap<usize, String>,
     usage: Usage,
+    raw_usage: serde_json::Map<String, Value>,
     is_oauth: bool,
     original_tools: Vec<ToolSchema>,
 }
 
 impl AnthropicState {
     fn new(is_oauth: bool, original_tools: Vec<ToolSchema>) -> Self {
-        Self { blocks: HashMap::new(), signatures: HashMap::new(), usage: Usage::default(), is_oauth, original_tools }
+        Self {
+            blocks: HashMap::new(),
+            signatures: HashMap::new(),
+            usage: Usage::default(),
+            raw_usage: serde_json::Map::new(),
+            is_oauth,
+            original_tools,
+        }
     }
 
     /// Remap Claude Code tool names back to our original names when using OAuth.
@@ -564,6 +572,12 @@ impl SseInterpreter for AnthropicState {
                         if let Some(n) = usage["input_tokens"].as_u64() { self.usage.input_tokens = n; }
                         if let Some(n) = usage["cache_read_input_tokens"].as_u64() { self.usage.cache_read_tokens = n; }
                         if let Some(n) = usage["cache_creation_input_tokens"].as_u64() { self.usage.cache_write_tokens = n; }
+                        // Merge all fields into raw_usage for debug display.
+                        if let Some(obj) = usage.as_object() {
+                            for (k, v) in obj {
+                                self.raw_usage.insert(k.clone(), v.clone());
+                            }
+                        }
                     }
                 }
             }
@@ -572,12 +586,20 @@ impl SseInterpreter for AnthropicState {
                 if let Ok(parsed) = serde_json::from_str::<Value>(&sse.data) {
                     if let Some(usage) = parsed.get("usage") {
                         if let Some(n) = usage["output_tokens"].as_u64() { self.usage.output_tokens = n; }
+                        if let Some(obj) = usage.as_object() {
+                            for (k, v) in obj {
+                                self.raw_usage.insert(k.clone(), v.clone());
+                            }
+                        }
                     }
                 }
             }
 
             "ping" => {}
             "message_stop" => {
+                if !self.raw_usage.is_empty() {
+                    self.usage.extras = Some(Value::Object(self.raw_usage.clone()));
+                }
                 let u = &self.usage;
                 if u.input_tokens > 0 || u.output_tokens > 0 {
                     out.push(Ok(StreamEvent::Usage(u.clone())));

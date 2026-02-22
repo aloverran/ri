@@ -106,6 +106,9 @@ pub struct Usage {
     pub cache_read_tokens: u64,
     #[serde(default)]
     pub cache_write_tokens: u64,
+    /// Raw provider-specific usage data for debug display.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extras: Option<serde_json::Value>,
 }
 
 // -- Provenance --

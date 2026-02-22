@@ -536,6 +536,7 @@ impl GeminiState {
             if let Some(n) = um["promptTokenCount"].as_u64() { self.usage.input_tokens = n; }
             if let Some(n) = um["candidatesTokenCount"].as_u64() { self.usage.output_tokens = n; }
             if let Some(n) = um["cachedContentTokenCount"].as_u64() { self.usage.cache_read_tokens = n; }
+            self.usage.extras = Some(um.clone());
         }
 
         if let Some(reason) = candidate.get("finishReason").and_then(|r| r.as_str()) {
