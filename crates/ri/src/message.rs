@@ -92,6 +92,46 @@ impl ContentBlock {
     pub fn error(s: impl Into<String>) -> Self {
         ContentBlock::Error { message: s.into() }
     }
+
+    /// Short human-readable summary of this block, targeting 500-1000 chars.
+    /// Intended for git-log style session history views.
+    pub fn summarize(&self) -> String {
+        match self {
+            ContentBlock::Text { text } => {
+                truncate_with_ellipsis(text, 800)
+            }
+            ContentBlock::Thinking { thinking, .. } => {
+                let body = truncate_with_ellipsis(thinking, 760);
+                format!("[thinking] {}", body)
+            }
+            ContentBlock::Image { media_type, .. } => {
+                format!("[image: {}]", media_type)
+            }
+            ContentBlock::ToolUse { name, input, .. } => {
+                let input_str = input.to_string();
+                let body = truncate_with_ellipsis(&input_str, 780 - name.len());
+                format!("[tool: {}] {}", name, body)
+            }
+            ContentBlock::ToolResult { is_error, content, .. } => {
+                let tag = if *is_error { "[tool error]" } else { "[tool result]" };
+                // Flatten inner text blocks into one string.
+                let inner: String = content.iter().map(|b| match b {
+                    ContentBlock::Text { text } => text.as_str(),
+                    _ => "",
+                }).collect::<Vec<_>>().join(" ");
+                let body = truncate_with_ellipsis(&inner, 780);
+                format!("{} {}", tag, body)
+            }
+            ContentBlock::Error { message } => {
+                let body = truncate_with_ellipsis(message, 790);
+                format!("[error] {}", body)
+            }
+            ContentBlock::Unknown(v) => {
+                let s = v.to_string();
+                truncate_with_ellipsis(&s, 800)
+            }
+        }
+    }
 }
 
 // -- Usage --
@@ -143,6 +183,46 @@ impl Message {
 
     pub fn user(text: impl Into<String>) -> Self {
         Self::new(gen_id(), Role::User, vec![ContentBlock::text(text)])
+    }
+
+    /// Short human-readable summary for git-log style session views.
+    /// Includes provenance (model, timestamp, input count) and full usage stats
+    /// followed by truncated content block summaries, targeting ~500-1000 chars total.
+    pub fn summarize(&self) -> String {
+        let role_tag = match self.role {
+            Role::System => "system",
+            Role::User => "user",
+            Role::Assistant => "assistant",
+        };
+
+        // Build the provenance/usage header if present.
+        // This is compact and fixed-size, so it always fits.
+        let header = if let Some(prov) = &self.provenance {
+            let usage_part = match &prov.usage {
+                Some(u) => format!(
+                    " | in:{} out:{} cache_r:{} cache_w:{}",
+                    u.input_tokens, u.output_tokens, u.cache_read_tokens, u.cache_write_tokens,
+                ),
+                None => String::new(),
+            };
+            format!(
+                " ({}{} | {} inputs | {})",
+                prov.model, usage_part, prov.input.len(), prov.ts,
+            )
+        } else {
+            String::new()
+        };
+
+        if self.content.is_empty() {
+            return format!("[{}]{} (empty)", role_tag, header);
+        }
+
+        // Content budget: total target minus the fixed parts.
+        let fixed_len = role_tag.len() + header.len() + 3; // "[" + "]" + " "
+        let content_budget = 800usize.saturating_sub(fixed_len);
+
+        let content_summary = summarize_blocks(&self.content, content_budget);
+        format!("[{}]{} {}", role_tag, header, content_summary)
     }
 }
 
@@ -257,6 +337,47 @@ pub fn gen_session_prefix(name: &str) -> String {
         format!("s_{}", rand)
     } else {
         format!("{}_{}", slug, rand)
+    }
+}
+
+// -- Summarization helpers --
+
+/// Summarize a list of content blocks into a single string within a char budget.
+/// Joins block summaries with " | ", splitting budget evenly across blocks.
+fn summarize_blocks(blocks: &[ContentBlock], budget: usize) -> String {
+    if blocks.len() == 1 {
+        return truncate_with_ellipsis(&blocks[0].summarize(), budget);
+    }
+    // Reserve 3 chars per separator " | " between blocks.
+    let separator_cost = (blocks.len() - 1) * 3;
+    let per_block = budget.saturating_sub(separator_cost) / blocks.len();
+    let parts: Vec<String> = blocks.iter().map(|b| {
+        truncate_with_ellipsis(&b.summarize(), per_block)
+    }).collect();
+    parts.join(" | ")
+}
+
+/// Truncate a string to at most `max_chars` characters, appending "..." if cut.
+/// Tries to break at a word boundary within the last 30 chars to avoid mid-word cuts.
+fn truncate_with_ellipsis(s: &str, max_chars: usize) -> String {
+    let s = s.trim();
+    if s.len() <= max_chars {
+        // Fast path: ASCII-only short strings (very common).
+        if s.is_ascii() {
+            return s.to_string();
+        }
+    }
+    let char_count = s.chars().count();
+    if char_count <= max_chars {
+        return s.to_string();
+    }
+    let cut: String = s.chars().take(max_chars).collect();
+    // Try to find a word boundary (space) in the last 30 chars to cut cleanly.
+    if let Some(pos) = cut[cut.len().saturating_sub(30)..].rfind(' ') {
+        let abs = cut.len().saturating_sub(30) + pos;
+        format!("{}...", &cut[..abs])
+    } else {
+        format!("{}...", cut)
     }
 }
 
