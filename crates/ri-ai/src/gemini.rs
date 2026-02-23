@@ -117,14 +117,19 @@ impl LlmProvider for GeminiProvider {
             ],
             GeminiVariant::Antigravity => vec![
                 Model {
-                    id: "gemini-3-pro".into(), name: "Gemini 3 Pro".into(),
+                    id: "gemini-3.1-pro-high".into(), name: "Gemini 3.1 Pro".into(),
                     reasoning: true, context_window: 1_048_576, max_tokens: 65_536,
-                    cost: ModelCost { input: 2.0, output: 6.0, cache_read: 0.5, cache_write: 0.0 },
+                    cost: ModelCost { input: 2.0, output: 12.0, cache_read: 0.2, cache_write: 2.375 },
+                },
+                Model {
+                    id: "gemini-3.1-pro-low".into(), name: "Gemini 3.1 Pro (Low)".into(),
+                    reasoning: true, context_window: 1_048_576, max_tokens: 65_536,
+                    cost: ModelCost { input: 2.0, output: 12.0, cache_read: 0.2, cache_write: 2.375 },
                 },
                 Model {
                     id: "gemini-3-flash".into(), name: "Gemini 3 Flash".into(),
                     reasoning: true, context_window: 1_048_576, max_tokens: 65_536,
-                    cost: ModelCost { input: 0.5, output: 1.5, cache_read: 0.125, cache_write: 0.0 },
+                    cost: ModelCost { input: 0.5, output: 3.0, cache_read: 0.5, cache_write: 0.0 },
                 },
             ],
         }
@@ -211,7 +216,7 @@ fn build_request(
     let url = format!("{}/v1internal:streamGenerateContent?alt=sse", endpoint);
 
     let ua = match variant {
-        GeminiVariant::Antigravity => "antigravity/1.15.8 darwin/arm64",
+        GeminiVariant::Antigravity => "antigravity/1.18.0 darwin/arm64",
         GeminiVariant::Cli => "google-cloud-sdk vscode_cloudshelleditor/0.1",
     };
 
@@ -431,10 +436,11 @@ fn build_contents(messages: &[Message], model_id: &str) -> Vec<Value> {
 
 fn is_gemini3(model_id: &str) -> bool {
     model_id.contains("3-pro") || model_id.contains("3-flash")
+        || model_id.contains("3.1-pro") || model_id.contains("3.1-flash")
 }
 
 fn thinking_level_string(level: ThinkingLevel, model_id: &str) -> Option<&'static str> {
-    let is_pro = model_id.contains("3-pro");
+    let is_pro = model_id.contains("3-pro") || model_id.contains("3.1-pro");
     match level {
         ThinkingLevel::Off => None,
         ThinkingLevel::Low => Some("LOW"),
