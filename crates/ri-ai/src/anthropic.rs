@@ -569,9 +569,14 @@ impl SseInterpreter for AnthropicState {
             "message_start" => {
                 if let Ok(parsed) = serde_json::from_str::<Value>(&sse.data) {
                     if let Some(usage) = parsed.get("message").and_then(|m| m.get("usage")) {
-                        if let Some(n) = usage["input_tokens"].as_u64() { self.usage.input_tokens = n; }
-                        if let Some(n) = usage["cache_read_input_tokens"].as_u64() { self.usage.cache_read_tokens = n; }
-                        if let Some(n) = usage["cache_creation_input_tokens"].as_u64() { self.usage.cache_write_tokens = n; }
+                        // Anthropic reports input_tokens as non-cached only.
+                        // Normalize to total prompt context (matching Gemini's promptTokenCount).
+                        let base = usage["input_tokens"].as_u64().unwrap_or(0);
+                        let cache_read = usage["cache_read_input_tokens"].as_u64().unwrap_or(0);
+                        let cache_write = usage["cache_creation_input_tokens"].as_u64().unwrap_or(0);
+                        self.usage.input_tokens = base + cache_read + cache_write;
+                        self.usage.cache_read_tokens = cache_read;
+                        self.usage.cache_write_tokens = cache_write;
                         // Merge all fields into raw_usage for debug display.
                         if let Some(obj) = usage.as_object() {
                             for (k, v) in obj {
