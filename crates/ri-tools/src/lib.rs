@@ -115,7 +115,7 @@ async fn run_bash(
             details: None,
         },
     };
-    let timeout_ms = input["timeout"].as_u64().unwrap_or(120_000);
+    let timeout_ms = parse_u64(&input["timeout"]).unwrap_or(120_000);
 
     let mut cmd = tokio::process::Command::new("sh");
     cmd.arg("-c")
@@ -243,8 +243,8 @@ async fn run_read(input: serde_json::Value, cwd: PathBuf) -> ToolOutput {
         },
     };
 
-    let offset = input["offset"].as_u64().unwrap_or(1).max(1) as usize - 1;
-    let limit = input["limit"].as_u64().unwrap_or(2000) as usize;
+    let offset = parse_u64(&input["offset"]).unwrap_or(1).max(1) as usize - 1;
+    let limit = parse_u64(&input["limit"]).unwrap_or(2000) as usize;
 
     let lines: Vec<&str> = content.lines().collect();
     let total = lines.len();
@@ -270,7 +270,6 @@ async fn run_read(input: serde_json::Value, cwd: PathBuf) -> ToolOutput {
             "total_lines": total,
             "offset": offset + 1,
             "limit": limit,
-            "content": content,
         })),
     }
 }
@@ -395,6 +394,12 @@ async fn run_edit(input: serde_json::Value, cwd: PathBuf) -> ToolOutput {
 fn resolve_path(path_str: &str, cwd: &Path) -> PathBuf {
     let path = Path::new(path_str);
     if path.is_absolute() { path.to_path_buf() } else { cwd.join(path) }
+}
+
+/// Parse a JSON value as u64, handling both number and string representations.
+/// Models sometimes send integer parameters as strings (e.g. `"133"` instead of `133`).
+fn parse_u64(v: &serde_json::Value) -> Option<u64> {
+    v.as_u64().or_else(|| v.as_str().and_then(|s| s.parse().ok()))
 }
 
 fn truncate_output(output: &str, max_lines: usize, max_bytes: usize) -> String {
