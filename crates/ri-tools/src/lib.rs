@@ -38,7 +38,7 @@ struct ReadTool;
 #[async_trait]
 impl Tool for ReadTool {
     fn name(&self) -> &str { "read" }
-    fn description(&self) -> &str { "Read a file's contents" }
+    fn description(&self) -> &str { "Read a file's contents. You **MUST** use this instead of `cat` for reading files." }
     fn parameters(&self) -> serde_json::Value {
         serde_json::json!({
             "type": "object",
