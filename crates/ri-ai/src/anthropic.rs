@@ -369,7 +369,7 @@ fn build_body(opts: &RequestOptions, is_oauth: bool) -> Value {
         body["tools"] = json!(tools);
     }
 
-    if opts.thinking != ThinkingLevel::Off {
+    if opts.thinking != ThinkingLevel::Off && opts.model.reasoning {
         body["thinking"] = json!({ "type": "adaptive" });
         let effort = match opts.thinking {
             ThinkingLevel::Low => "low",
