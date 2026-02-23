@@ -19,6 +19,14 @@ pub fn default_model_id() -> &'static str {
     "claude-opus-4-6"
 }
 
+/// All model IDs across every registered provider.
+pub fn available_model_ids() -> Vec<String> {
+    FACTORIES.iter()
+        .flat_map(|f| f().models())
+        .map(|m| m.id)
+        .collect()
+}
+
 /// Resolve a model ID to its provider, only constructing the matching provider.
 /// Supports exact matches and prefix matches (e.g. "claude-opus-4-6" matches
 /// "claude-opus-4-6-20250610").
@@ -39,9 +47,6 @@ pub async fn resolve(model_id: &str) -> eyre::Result<(Box<dyn LlmProvider>, Mode
         }
     }
 
-    let available: Vec<String> = FACTORIES.iter()
-        .flat_map(|f| f().models())
-        .map(|m| m.id)
-        .collect();
+    let available = available_model_ids();
     Err(eyre::eyre!("Unknown model '{}'. Available: {}", model_id, available.join(", ")))
 }
