@@ -35,14 +35,9 @@ Native async traits are generally not object-safe. You cannot use Box<dyn Databa
 Solution: Use #[async_trait], which handles the boxing for you.
 
 ## Style Guidelines
-* Treat the file as a narrative. The reader enters through the public interface. Helper functions should generally be defined immediately after the function that calls them (depth-first ordering) OR grouped by 'feature' regions. Do not force me to jump around the file to trace a single execution path.
-* Organize files for Newspaper Readability. The most critical, high-level public API entry points must be at the top. For files with a logical 'flow' (ie. login, logout) functions should be ordered by their flow within the lifecycle. Implementation details and private helpers should be placed near their 'owner' functions. Prioritize flatness and locality.
-* Write this code as if it is part of a widely used, high-end idiomatic library (like the Rust std), with a slightly more playful feeling. It must be thoughtful about namespace pollution, naming, modern idioms, and assume the reader does not have the IDE open.
-* Names must reflect intent, not just implementation.
-* Practice 'Strict Hygiene' with includes and imports. Use typedefs/using directives only to add semantic meaning, not just to save typing characters. If a type is complex, alias it to what it represents in the domain.
-* Files names should always stay in sync with the content within the file.
 * We prefer longer files (like c) over separating every component into a file. This follows from the principle of narrative readability. Many small files means you must jump around (losing the narrative of the code).
 * Type comments should speak as describing the thing they are above (ie. singular not plural)
+* Keep tracing macros short where possible by using direct field names. ie '%name' over 'path = %name'.
 
 ## Clean Code
 
