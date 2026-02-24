@@ -83,11 +83,15 @@ impl SessionStore {
 
         entries.sort_by(|a, b| a.file_name().cmp(&b.file_name()));
 
+        let files = entries.len();
         for entry in entries {
             if let Err(e) = self.load_file(&entry.path()) {
                 tracing::warn!("Failed to load session file {}: {}", entry.path().display(), e);
             }
         }
+
+        let messages = self.pool.len();
+        tracing::info!(files, messages, "loaded session history");
 
         Ok(())
     }
@@ -169,6 +173,8 @@ impl SessionStore {
         self.active_prefix = prefix;
         self.active_counter = 0;
 
+        tracing::info!(%name, path = %path.display(), "created session");
+
         Ok(path)
     }
 
@@ -188,6 +194,7 @@ impl SessionStore {
             return Err(eyre::eyre!("Cannot write message with empty ID"));
         }
         let id = msg.id.clone();
+        tracing::debug!(%id, ?msg.role, "wrote message");
 
         if let Some(ref mut file) = self.active {
             let json = serde_json::to_string(&msg)?;

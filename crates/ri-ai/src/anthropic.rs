@@ -303,7 +303,7 @@ fn build_request(api_key: &str, opts: &RequestOptions) -> reqwest::RequestBuilde
     let body = build_body(opts, is_oauth);
     let url = "https://api.anthropic.com/v1/messages";
 
-    tracing::debug!(url, body = %body, "Anthropic API request");
+    tracing::trace!(url, %body, "Anthropic API request");
 
     let mut builder = reqwest::Client::new()
         .post(url)

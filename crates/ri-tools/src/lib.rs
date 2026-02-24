@@ -6,6 +6,7 @@ pub mod resources;
 use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
+use tracing::Instrument;
 use ri::{Tool, ToolOutput};
 
 pub fn all_tools() -> Vec<Box<dyn Tool>> {
@@ -29,7 +30,9 @@ impl Tool for BashTool {
         })
     }
     async fn run(&self, input: serde_json::Value, cwd: PathBuf, cancel: tokio_util::sync::CancellationToken) -> ToolOutput {
-        run_bash(input, cwd, cancel).await
+        run_bash(input, cwd, cancel)
+            .instrument(tracing::info_span!("tool", name = "bash"))
+            .await
     }
 }
 
@@ -51,7 +54,9 @@ impl Tool for ReadTool {
         })
     }
     async fn run(&self, input: serde_json::Value, cwd: PathBuf, _cancel: tokio_util::sync::CancellationToken) -> ToolOutput {
-        run_read(input, cwd).await
+        run_read(input, cwd)
+            .instrument(tracing::info_span!("tool", name = "read"))
+            .await
     }
 }
 
@@ -72,7 +77,9 @@ impl Tool for WriteTool {
         })
     }
     async fn run(&self, input: serde_json::Value, cwd: PathBuf, _cancel: tokio_util::sync::CancellationToken) -> ToolOutput {
-        run_write(input, cwd).await
+        run_write(input, cwd)
+            .instrument(tracing::info_span!("tool", name = "write"))
+            .await
     }
 }
 
@@ -94,7 +101,9 @@ impl Tool for EditTool {
         })
     }
     async fn run(&self, input: serde_json::Value, cwd: PathBuf, _cancel: tokio_util::sync::CancellationToken) -> ToolOutput {
-        run_edit(input, cwd).await
+        run_edit(input, cwd)
+            .instrument(tracing::info_span!("tool", name = "edit"))
+            .await
     }
 }
 
@@ -199,6 +208,7 @@ async fn run_bash(
     }
 
     let exit_code = exit_status.unwrap().code().unwrap_or(-1);
+    tracing::debug!(exit_code, "bash complete");
 
     let stdout = String::from_utf8_lossy(&stdout_bytes);
     let stderr = String::from_utf8_lossy(&stderr_bytes);

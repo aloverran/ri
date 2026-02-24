@@ -224,7 +224,7 @@ fn build_request(
         GeminiVariant::Cli => "google-cloud-sdk vscode_cloudshelleditor/0.1",
     };
 
-    tracing::debug!(url = %url, body = %body, "Gemini API request");
+    tracing::trace!(%url, %body, "Gemini API request");
 
     reqwest::Client::new()
         .post(&url)
