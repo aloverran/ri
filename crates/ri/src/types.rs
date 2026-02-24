@@ -162,6 +162,11 @@ pub trait LlmProvider: Send + Sync {
     fn models(&self) -> Vec<Model>;
     fn is_authenticated(&self) -> bool;
 
+    /// Human-readable label for the authenticated account (e.g. email).
+    /// Returns None when not authenticated or when the provider has no
+    /// account identity (like API-key-only providers).
+    fn account_label(&self) -> Option<String> { None }
+
     /// Start a login flow. Returns an AuthMethod describing what
     /// the user needs to do, or None if login is not supported.
     async fn begin_login(&self) -> eyre::Result<Option<AuthMethod>>;

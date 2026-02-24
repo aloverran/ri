@@ -139,6 +139,10 @@ impl LlmProvider for GeminiProvider {
         self.state.try_lock().map(|s| !s.token.is_empty()).unwrap_or(false)
     }
 
+    fn account_label(&self) -> Option<String> {
+        gemini_auth::load_creds(self.variant).and_then(|c| c.email)
+    }
+
     async fn begin_login(&self) -> eyre::Result<Option<AuthMethod>> {
         let cfg = gemini_auth::config_for(self.variant);
         let verifier = crate::creds::generate_verifier();
