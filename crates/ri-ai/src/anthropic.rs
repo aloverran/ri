@@ -504,7 +504,7 @@ impl SseInterpreter for AnthropicState {
                         self.blocks.insert(index, AnthropicBlock::ToolUse { id: id.clone() });
                         out.push(Ok(StreamEvent::ToolCallStart { id, name }));
                     }
-                    other => { error!("Unknown content block type: {}", other); }
+                    other => { error!("Unknown content block type: [{}]", other); }
                 }
             }
 
@@ -541,7 +541,7 @@ impl SseInterpreter for AnthropicState {
                         let sig = parsed["delta"]["signature"].as_str().unwrap_or("");
                         self.signatures.entry(index).or_default().push_str(sig);
                     }
-                    other => { error!("Unknown delta type: {}", other); }
+                    other => { error!("Unknown delta type: [{}]", other); }
                 }
             }
 
@@ -629,7 +629,7 @@ impl SseInterpreter for AnthropicState {
                 }
             }
 
-            other => { error!("Unknown SSE event type: {}", other); }
+            other => { error!("Unknown SSE event type: [{}]", other); }
         }
 
         out

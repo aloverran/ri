@@ -91,7 +91,7 @@ impl SessionStore {
         }
 
         let messages = self.pool.len();
-        tracing::info!(files, messages, "loaded session history");
+        tracing::info!("Loaded session history ({files} files, {messages} messages)");
 
         Ok(())
     }
@@ -173,7 +173,7 @@ impl SessionStore {
         self.active_prefix = prefix;
         self.active_counter = 0;
 
-        tracing::info!(%name, path = %path.display(), "created session");
+        tracing::info!("Created session [{}] at {}", name, path.display());
 
         Ok(path)
     }
@@ -194,7 +194,7 @@ impl SessionStore {
             return Err(eyre::eyre!("Cannot write message with empty ID"));
         }
         let id = msg.id.clone();
-        tracing::debug!(%id, ?msg.role, "wrote message");
+        tracing::debug!("Wrote {:?} message [{}]", msg.role, id);
 
         if let Some(ref mut file) = self.active {
             let json = serde_json::to_string(&msg)?;

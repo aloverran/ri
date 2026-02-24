@@ -341,7 +341,7 @@ fn build_contents(messages: &[Message], model_id: &str) -> Vec<Value> {
                     let tool_name = tool_names.get(tool_use_id.as_str())
                         .cloned()
                         .unwrap_or_else(|| {
-                            tracing::warn!("No tool name found for tool_use_id '{}'", tool_use_id);
+                            tracing::warn!("No tool name found for tool_use_id [{}]", tool_use_id);
                             "unknown".to_string()
                         });
                     let output_text: String = content.iter().filter_map(|b| {

@@ -63,9 +63,9 @@ impl Turn {
         if let Some(ref u) = usage {
             tracing::info!(
                 parent: &span,
+                "Turn complete ({} in, {} out, {} cache read, {} cache write)",
                 u.input_tokens, u.output_tokens,
                 u.cache_read_tokens, u.cache_write_tokens,
-                "turn complete",
             );
         }
         (content, usage)

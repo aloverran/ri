@@ -208,7 +208,7 @@ async fn run_bash(
     }
 
     let exit_code = exit_status.unwrap().code().unwrap_or(-1);
-    tracing::debug!(exit_code, "bash complete");
+    tracing::debug!("Bash exited with code {exit_code}");
 
     let stdout = String::from_utf8_lossy(&stdout_bytes);
     let stderr = String::from_utf8_lossy(&stderr_bytes);
