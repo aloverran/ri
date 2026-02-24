@@ -512,7 +512,7 @@ impl GeminiState {
         let chunk: Value = match serde_json::from_str(&sse.data) {
             Ok(v) => v,
             Err(e) => {
-                tracing::warn!("Failed to parse Gemini SSE payload: {}", e);
+                tracing::error!("Failed to parse Gemini SSE payload: {}", e);
                 return out;
             }
         };
