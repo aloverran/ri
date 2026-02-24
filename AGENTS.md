@@ -35,9 +35,11 @@ Native async traits are generally not object-safe. You cannot use Box<dyn Databa
 Solution: Use #[async_trait], which handles the boxing for you.
 
 ## Style Guidelines
+* Write Rust code as if it is part of a widely used, high-end idiomatic library (like the Rust std), with a slightly more playful feeling. It must be thoughtful about namespace pollution, naming, modern idioms, and assume the reader does not have the IDE open.
 * We prefer longer files (like c) over separating every component into a file. This follows from the principle of narrative readability. Many small files means you must jump around (losing the narrative of the code).
 * Type comments should speak as describing the thing they are above (ie. singular not plural)
 * Keep tracing macros short where possible by using direct field names. ie '%name' over 'path = %name'.
+
 
 ## Clean Code
 
@@ -62,7 +64,7 @@ On API-design: A well-designed API has the property that any ordering of functio
 * Primitives types are useful for data storage, but not as useful for domain modeling. Where it's not excessive, use domain specific types rather than primitives.
 * We don't mind pulling in 'fundamental' crates in the Rust ecosystem as long as they are intentional. It makes code easier to on-board when we use apis that other projects use, and keeps overall code bloat low. 
 
-# Composability
+## Composability
 So what makes a system composable? I see two major properties:
 Self-Similarity — Composable systems usually have a simple primitive that is self-similar. Think of a game grid, tetris pieces, repeating tessellations, etc.  Self-similarity means most things can plug into other things. They may not do something useful, but they can be infinitely re-arranged.
 Merging / Splitting — Two groups of primitives can be merged into a single primitive, and that 'merged primitive' acts just like any other primitive. Similarly, a primitive can be split into several 'pieces' and each of those pieces acts like any other primitive.
