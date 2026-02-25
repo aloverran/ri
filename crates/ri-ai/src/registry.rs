@@ -1,7 +1,7 @@
 // Provider registry -- lazy construction to avoid unnecessary credential loading.
 
 use ri::{LlmProvider, Model};
-use crate::{AnthropicProvider, GeminiProvider, GeminiVariant};
+use crate::{AnthropicProvider, GeminiProvider, GeminiVariant, OpenAICodexProvider};
 
 type ProviderFactory = fn() -> Box<dyn LlmProvider>;
 
@@ -9,6 +9,7 @@ const FACTORIES: &[ProviderFactory] = &[
     || Box::new(AnthropicProvider::new()),
     || Box::new(GeminiProvider::new(GeminiVariant::Cli)),
     || Box::new(GeminiProvider::new(GeminiVariant::Antigravity)),
+    || Box::new(OpenAICodexProvider::new()),
 ];
 
 pub fn all_providers() -> Vec<Box<dyn LlmProvider>> {

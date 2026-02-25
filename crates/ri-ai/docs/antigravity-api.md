@@ -7,7 +7,7 @@ See also: `gemini-cli-api.md` for the production variant (Gemini 2.5 models). Bo
 providers share the same wire protocol but differ in endpoint, models, thinking
 control, and a few request fields.
 
-Last updated: 2026-02-23.
+Last updated: 2026-02-25.
 
 ## Endpoint
 
@@ -15,9 +15,16 @@ The Antigravity sandbox endpoint URL is defined in `gemini_auth.rs`. It shares t
 same API surface as the production endpoint (documented in `gemini-cli-api.md`) but
 serves frontier models (Gemini 3.x) that are not available on production.
 
-The two endpoints serve **completely disjoint model sets** (probed 2026-02-23):
+For ri's Antigravity-specific model IDs, the endpoints serve **disjoint model sets**
+(probed 2026-02-23):
 - 2.5 models on Antigravity: **503** "No capacity available for model"
-- 3.x models on production: **403** Permission Denied or **404**
+- Antigravity model IDs on production: **403** Permission Denied or **404**
+
+**Note (2026-02-25):** Google's gemini-cli v0.30.0 uses a *different set of Gemini 3
+model IDs* (e.g. `gemini-3-pro-preview`, `gemini-3-flash-preview`) that are available
+on the production endpoint and/or the public Gemini API. These `-preview` IDs are
+distinct from the Antigravity IDs (`gemini-3.1-pro-high`, `gemini-3-flash`). See
+`gemini-cli-api.md` "Gemini 3 on Production" section for details.
 
 ## Authentication
 
@@ -410,13 +417,17 @@ Probed 2026-02-23. Model availability changes without notice.
 | `gemini-3-pro-high` | 200 + "Gemini 3 Pro is no longer available" |
 | `gemini-3-pro-low` | 200 + "Gemini 3 Pro is no longer available" |
 
-### Does Not Exist
+### Does Not Exist (on Antigravity endpoint)
 
 | Model ID | Status |
 |---|---|
 | `gemini-3.1-pro` (no suffix) | 404 |
 | `gemini-3.1-flash` | 404 |
 | `gemini-3.1-pro-preview` | 404 |
+
+**Note**: `gemini-3-pro-preview` and `gemini-3-flash-preview` (the gemini-cli model
+IDs) were NOT probed on the Antigravity endpoint. They likely return 404 here since
+Antigravity uses its own model ID scheme (`-high`/`-low` suffixes).
 
 ### thinkingLevel Support Matrix
 
