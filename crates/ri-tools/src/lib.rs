@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
 use tracing::Instrument;
-use ri::{Tool, ToolOutput};
+use ri::{Tool, ToolContext, ToolOutput};
 
 pub fn all_tools() -> Vec<Box<dyn Tool>> {
     vec![Box::new(BashTool), Box::new(ReadTool), Box::new(WriteTool), Box::new(EditTool)]
@@ -29,8 +29,8 @@ impl Tool for BashTool {
             "required": ["command"]
         })
     }
-    async fn run(&self, input: serde_json::Value, cwd: PathBuf, cancel: tokio_util::sync::CancellationToken) -> ToolOutput {
-        run_bash(input, cwd, cancel)
+    async fn run(&self, input: serde_json::Value, ctx: ToolContext, cancel: tokio_util::sync::CancellationToken) -> ToolOutput {
+        run_bash(input, ctx.cwd, cancel)
             .instrument(tracing::info_span!("tool", name = "bash"))
             .await
     }
@@ -53,8 +53,8 @@ impl Tool for ReadTool {
             "required": ["path"]
         })
     }
-    async fn run(&self, input: serde_json::Value, cwd: PathBuf, _cancel: tokio_util::sync::CancellationToken) -> ToolOutput {
-        run_read(input, cwd)
+    async fn run(&self, input: serde_json::Value, ctx: ToolContext, _cancel: tokio_util::sync::CancellationToken) -> ToolOutput {
+        run_read(input, ctx.cwd)
             .instrument(tracing::info_span!("tool", name = "read"))
             .await
     }
@@ -76,8 +76,8 @@ impl Tool for WriteTool {
             "required": ["path", "content"]
         })
     }
-    async fn run(&self, input: serde_json::Value, cwd: PathBuf, _cancel: tokio_util::sync::CancellationToken) -> ToolOutput {
-        run_write(input, cwd)
+    async fn run(&self, input: serde_json::Value, ctx: ToolContext, _cancel: tokio_util::sync::CancellationToken) -> ToolOutput {
+        run_write(input, ctx.cwd)
             .instrument(tracing::info_span!("tool", name = "write"))
             .await
     }
@@ -100,8 +100,8 @@ impl Tool for EditTool {
             "required": ["path", "old_text", "new_text"]
         })
     }
-    async fn run(&self, input: serde_json::Value, cwd: PathBuf, _cancel: tokio_util::sync::CancellationToken) -> ToolOutput {
-        run_edit(input, cwd)
+    async fn run(&self, input: serde_json::Value, ctx: ToolContext, _cancel: tokio_util::sync::CancellationToken) -> ToolOutput {
+        run_edit(input, ctx.cwd)
             .instrument(tracing::info_span!("tool", name = "edit"))
             .await
     }

@@ -5,7 +5,7 @@ use chrono::Utc;
 use serde::{Serialize, Deserialize};
 
 use crate::JsonMap;
-use crate::message::{gen_id, gen_session_prefix, ContentBlock, Message, MessagePool, Role};
+use crate::message::{gen_session_prefix, ContentBlock, Message, MessagePool, Provenance, Role};
 
 /// Session header -- serialized as the first line of a .jsonl session file.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -14,19 +14,22 @@ pub struct SessionHeader {
     pub ts: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
+    /// File-stem ID of the parent session, if this session was spawned by another.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent: Option<String>,
     #[serde(flatten)]
     pub extra: JsonMap,
 }
 
-/// Manages the message pool and active session file. Loads history from
-/// existing .jsonl files and writes new messages to the active session.
+/// Manages the message pool and session files. Loads history from
+/// existing .jsonl files and writes new messages to any session by ID.
+///
+/// The store holds no mutable per-session state. Each write opens the
+/// session file, scans it for the next available message ID, appends one
+/// JSONL line, and closes. The file is the source of truth.
 pub struct SessionStore {
     pub pool: MessagePool,
     sessions_dir: PathBuf,
-    active: Option<File>,
-    // Session prefix for generating message IDs in the active session.
-    active_prefix: String,
-    active_counter: u64,
 }
 
 impl SessionStore {
@@ -34,9 +37,6 @@ impl SessionStore {
         SessionStore {
             pool: MessagePool::new(),
             sessions_dir,
-            active: None,
-            active_prefix: String::new(),
-            active_counter: 0,
         }
     }
 
@@ -44,27 +44,6 @@ impl SessionStore {
         let home = dirs::home_dir()
             .ok_or_else(|| eyre::eyre!("Could not determine home directory"))?;
         Ok(home.join(".ri").join("sessions"))
-    }
-
-    /// Create a new filing, load history, start a session, and write the system message.
-    /// Returns (filing, session_ids) ready for the agent loop.
-    pub fn init(name: &str, cwd: &Path, system_prompt: &str) -> eyre::Result<(Self, Vec<String>)> {
-        let cwd_str = cwd.to_str()
-            .ok_or_else(|| eyre::eyre!("working directory contains non-UTF-8 characters"))?;
-        let sessions_dir = Self::default_dir()?;
-        let mut filing = Self::new(sessions_dir);
-        filing.load_all()?;
-        filing.new_session(name, cwd_str)?;
-
-        let sys_id = filing.next_id();
-        let sys_msg = Message::new(
-            sys_id.clone(),
-            Role::System,
-            vec![ContentBlock::text(system_prompt)],
-        );
-        filing.write_message(sys_msg)?;
-
-        Ok((filing, vec![sys_id]))
     }
 
     /// Load all .jsonl session files from the sessions directory into the pool.
@@ -120,13 +99,11 @@ impl SessionStore {
                 // Detect header structurally: has "session" key, no "role" key.
                 if let Ok(obj) = serde_json::from_str::<serde_json::Value>(trimmed) {
                     if obj.get("session").is_some() && obj.get("role").is_none() {
-                        // It's a session header, not a message.
                         continue;
                     }
                 }
             }
 
-            // Parse as message.
             match serde_json::from_str::<Message>(trimmed) {
                 Ok(msg) => {
                     self.pool.put(msg);
@@ -140,8 +117,19 @@ impl SessionStore {
         Ok(())
     }
 
-    /// Create a new .jsonl session file and set it as active.
-    pub fn new_session(&mut self, name: &str, cwd: &str) -> eyre::Result<PathBuf> {
+    /// Create a new session file. Returns the session ID (an opaque string,
+    /// currently a timestamp-based file stem like `"2026-02-24_201128_my-task"`).
+    ///
+    /// Pass `initial_ids` to record cross-session message references in the
+    /// header (e.g. parent context passed to a sub-agent). These are persisted
+    /// so that `readSession` can resolve them later.
+    pub fn create_session(
+        &mut self,
+        name: &str,
+        cwd: &str,
+        parent: Option<&str>,
+        initial_ids: &[String],
+    ) -> eyre::Result<String> {
         fs::create_dir_all(&self.sessions_dir)?;
 
         let now = Utc::now();
@@ -156,56 +144,105 @@ impl SessionStore {
             .append(true)
             .open(&path)?;
 
-        // Write header.
-        let header = SessionHeader {
+        let mut header = SessionHeader {
             session: name.to_string(),
             ts,
             cwd: Some(cwd.to_string()),
+            parent: parent.map(str::to_string),
             extra: Default::default(),
         };
-        let header_json = serde_json::to_string(&header)?;
-        writeln!(file, "{}", header_json)?;
+        if !initial_ids.is_empty() {
+            header.extra.insert(
+                "initial_ids".to_string(),
+                serde_json::to_value(initial_ids)?,
+            );
+        }
+        writeln!(file, "{}", serde_json::to_string(&header)?)?;
 
-        // Generate prefix for message IDs.
-        let prefix = gen_session_prefix(name);
+        let session_id = path.file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("")
+            .to_string();
 
-        self.active = Some(file);
-        self.active_prefix = prefix;
-        self.active_counter = 0;
-
-        tracing::info!("Created session [{}] at {}", name, path.display());
-
-        Ok(path)
+        tracing::info!("Created session [{}] -> [{}]", name, session_id);
+        Ok(session_id)
     }
 
-    /// Generate a new message ID for the active session.
-    pub fn next_id(&mut self) -> String {
-        self.active_counter += 1;
-        if self.active_prefix.is_empty() {
-            gen_id()
-        } else {
-            format!("{}_{}", self.active_prefix, self.active_counter)
+    /// Append a message to a session file and add it to the pool.
+    ///
+    /// This is the canonical constructor for Message. The caller provides
+    /// the content; the store assigns the sequential ID automatically.
+    /// Provide provenance for LLM-derived messages, meta for any extra data.
+    pub fn write_message(
+        &mut self,
+        session_id: &str,
+        role: Role,
+        content: Vec<ContentBlock>,
+        provenance: Option<Provenance>,
+        meta: Option<serde_json::Value>,
+    ) -> eyre::Result<Message> {
+        let path = self.sessions_dir.join(format!("{}.jsonl", session_id));
+        let id = scan_next_id(&path);
+
+        tracing::debug!("Writing {:?} message [{}] to session [{}]", role, id, session_id);
+
+        let msg = Message { id, role, content, provenance, meta };
+
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)?;
+        writeln!(file, "{}", serde_json::to_string(&msg)?)?;
+        file.flush()?;
+
+        self.pool.put(msg.clone());
+        Ok(msg)
+    }
+}
+
+/// Scan a session file for message IDs matching the `prefix_N` pattern.
+/// Returns the next available ID (`prefix_{max+1}`). If no messages exist
+/// yet, generates a fresh prefix from the filename.
+fn scan_next_id(path: &Path) -> String {
+    let mut max_counter: u64 = 0;
+    let mut prefix: Option<String> = None;
+
+    if let Ok(file) = File::open(path) {
+        let reader = BufReader::new(file);
+        for line in reader.lines().flatten() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() { continue; }
+            // Quick reject: skip lines without "id" (headers, malformed).
+            if !trimmed.contains("\"id\"") { continue; }
+            if let Some(id) = extract_id(trimmed) {
+                if let Some(pos) = id.rfind('_') {
+                    if let Ok(n) = id[pos + 1..].parse::<u64>() {
+                        prefix = Some(id[..pos].to_string());
+                        max_counter = max_counter.max(n);
+                    }
+                }
+            }
         }
     }
 
-    /// Write a message to the pool AND append to the active session file.
-    pub fn write_message(&mut self, msg: Message) -> eyre::Result<String> {
-        if msg.id.is_empty() {
-            return Err(eyre::eyre!("Cannot write message with empty ID"));
-        }
-        let id = msg.id.clone();
-        tracing::debug!("Wrote {:?} message [{}]", msg.role, id);
+    let prefix = prefix.unwrap_or_else(|| {
+        // Derive a prefix from the filename (the session name portion).
+        let stem = path.file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("s");
+        gen_session_prefix(stem)
+    });
 
-        if let Some(ref mut file) = self.active {
-            let json = serde_json::to_string(&msg)?;
-            writeln!(file, "{}", json)?;
-            file.flush()?;
-        }
+    format!("{}_{}", prefix, max_counter + 1)
+}
 
-        self.pool.put(msg);
-        Ok(id)
-    }
-
+/// Fast ID extraction without full JSON parse -- just find the "id" field value.
+fn extract_id(line: &str) -> Option<&str> {
+    // Look for "id":"<value>" pattern. Avoids serde_json for speed on large files.
+    let needle = "\"id\":\"";
+    let start = line.find(needle)? + needle.len();
+    let end = start + line[start..].find('"')?;
+    Some(&line[start..end])
 }
 
 fn slugify(name: &str) -> String {
@@ -218,7 +255,6 @@ fn slugify(name: &str) -> String {
             }
         })
         .collect();
-    // Collapse multiple dashes.
     let mut result = String::new();
     let mut prev_dash = false;
     for c in slug.chars() {

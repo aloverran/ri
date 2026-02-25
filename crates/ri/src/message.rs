@@ -177,14 +177,6 @@ pub struct Message {
 }
 
 impl Message {
-    pub fn new(id: String, role: Role, content: Vec<ContentBlock>) -> Self {
-        Message { id, role, content, provenance: None, meta: None }
-    }
-
-    pub fn user(text: impl Into<String>) -> Self {
-        Self::new(gen_id(), Role::User, vec![ContentBlock::text(text)])
-    }
-
     /// Short human-readable summary for git-log style session views.
     /// Includes provenance (model, timestamp, input count) and full usage stats
     /// followed by truncated content block summaries, targeting ~500-1000 chars total.
@@ -373,9 +365,13 @@ fn truncate_with_ellipsis(s: &str, max_chars: usize) -> String {
     }
     let cut: String = s.chars().take(max_chars).collect();
     // Try to find a word boundary (space) in the last 30 chars to cut cleanly.
-    if let Some(pos) = cut[cut.len().saturating_sub(30)..].rfind(' ') {
-        let abs = cut.len().saturating_sub(30) + pos;
-        format!("{}...", &cut[..abs])
+    // Use char_indices to find a safe byte offset 30 characters from the end.
+    let search_start = cut.char_indices()
+        .rev()
+        .nth(29)
+        .map_or(0, |(i, _)| i);
+    if let Some(pos) = cut[search_start..].rfind(' ') {
+        format!("{}...", &cut[..search_start + pos])
     } else {
         format!("{}...", cut)
     }

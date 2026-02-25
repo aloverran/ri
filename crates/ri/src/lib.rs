@@ -14,7 +14,7 @@ pub use message::{
 };
 pub use types::{
     ApiError, AuthMethod, EventStream, LlmProvider, Model, ModelCost, RequestOptions,
-    StreamEvent, ThinkingLevel, Tool, ToolOutput, ToolSchema,
+    StreamEvent, ThinkingLevel, Tool, ToolContext, ToolOutput, ToolSchema,
 };
 pub use accumulator::StreamAccumulator;
 pub use store::{SessionStore, SessionHeader};

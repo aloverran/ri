@@ -85,6 +85,16 @@ pub struct ToolOutput {
     pub details: Option<serde_json::Value>,
 }
 
+/// Ambient context passed to every tool invocation by the agent loop.
+/// Carries the working directory and the identity of the calling session
+/// so that meta-tools (e.g. runAgent) can establish parent relationships.
+#[derive(Debug, Clone)]
+pub struct ToolContext {
+    pub cwd: PathBuf,
+    /// File-stem ID of the session that invoked this tool, if known.
+    pub session_id: Option<String>,
+}
+
 /// A tool the agent can invoke. Provides schema (for the LLM API)
 /// and an async execution function.
 #[async_trait]
@@ -96,7 +106,7 @@ pub trait Tool: Send + Sync {
     async fn run(
         &self,
         input: serde_json::Value,
-        cwd: PathBuf,
+        ctx: ToolContext,
         cancel: tokio_util::sync::CancellationToken,
     ) -> ToolOutput;
 
