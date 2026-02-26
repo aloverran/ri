@@ -147,6 +147,10 @@ impl LlmProvider for OpenAICodexProvider {
         self.state.try_lock().map(|s| !s.access_token.is_empty()).unwrap_or(false)
     }
 
+    fn can_logout(&self) -> bool {
+        load_creds().is_some()
+    }
+
     async fn begin_login(&self) -> eyre::Result<Option<AuthMethod>> {
         let verifier = creds::generate_verifier();
         let challenge = creds::challenge(&verifier);
@@ -206,6 +210,16 @@ impl LlmProvider for OpenAICodexProvider {
         state.access_token = creds.access_token;
         state.account_id = account_id;
 
+        Ok(())
+    }
+
+    async fn logout(&self) -> eyre::Result<()> {
+        if let Ok(path) = creds_path() {
+            let _ = std::fs::remove_file(&path);
+        }
+        let mut state = self.state.lock().await;
+        state.access_token.clear();
+        state.account_id.clear();
         Ok(())
     }
 

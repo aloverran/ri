@@ -177,12 +177,21 @@ pub trait LlmProvider: Send + Sync {
     /// account identity (like API-key-only providers).
     fn account_label(&self) -> Option<String> { None }
 
+    /// Whether stored credentials can be removed. False when auth comes
+    /// from an environment variable rather than a credential file.
+    fn can_logout(&self) -> bool { false }
+
     /// Start a login flow. Returns an AuthMethod describing what
     /// the user needs to do, or None if login is not supported.
     async fn begin_login(&self) -> eyre::Result<Option<AuthMethod>>;
 
     /// Complete a login flow with the code/callback from the user.
     async fn complete_login(&self, response: &str) -> eyre::Result<()>;
+
+    /// Remove stored credentials and clear in-memory auth state.
+    async fn logout(&self) -> eyre::Result<()> {
+        Err(eyre::eyre!("Logout not supported for this provider"))
+    }
 
     /// Stream a response from the LLM.
     async fn stream(&self, opts: RequestOptions) -> Result<EventStream, ApiError>;

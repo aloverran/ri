@@ -128,6 +128,12 @@ impl LlmProvider for AnthropicProvider {
         self.state.try_lock().map(|s| !s.api_key.is_empty()).unwrap_or(false)
     }
 
+    fn can_logout(&self) -> bool {
+        // Env-var auth cannot be logged out; only file-based OAuth.
+        std::env::var("ANTHROPIC_API_KEY").unwrap_or_default().is_empty()
+            && load_creds().is_some()
+    }
+
     async fn begin_login(&self) -> eyre::Result<Option<AuthMethod>> {
         let verifier = crate::creds::generate_verifier();
         let challenge = crate::creds::challenge(&verifier);
@@ -201,6 +207,21 @@ impl LlmProvider for AnthropicProvider {
         state.api_key = key;
         state.is_oauth = true;
 
+        Ok(())
+    }
+
+    async fn logout(&self) -> eyre::Result<()> {
+        if !std::env::var("ANTHROPIC_API_KEY").unwrap_or_default().is_empty() {
+            return Err(eyre::eyre!(
+                "Anthropic auth is via ANTHROPIC_API_KEY env var -- remove it to logout"
+            ));
+        }
+        if let Ok(path) = creds_path() {
+            let _ = std::fs::remove_file(&path);
+        }
+        let mut state = self.state.lock().await;
+        state.api_key.clear();
+        state.is_oauth = false;
         Ok(())
     }
 

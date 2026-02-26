@@ -11,7 +11,7 @@ use super::gemini::GeminiVariant;
 
 // -- Credential storage --
 
-fn creds_path(variant: GeminiVariant) -> eyre::Result<PathBuf> {
+pub fn creds_path(variant: GeminiVariant) -> eyre::Result<PathBuf> {
     let name = match variant {
         GeminiVariant::Cli => "gemini_cli_auth.json",
         GeminiVariant::Antigravity => "gemini_antigravity_auth.json",

@@ -143,6 +143,10 @@ impl LlmProvider for GeminiProvider {
         gemini_auth::load_creds(self.variant).and_then(|c| c.email)
     }
 
+    fn can_logout(&self) -> bool {
+        gemini_auth::load_creds(self.variant).is_some()
+    }
+
     async fn begin_login(&self) -> eyre::Result<Option<AuthMethod>> {
         let cfg = gemini_auth::config_for(self.variant);
         let verifier = crate::creds::generate_verifier();
@@ -191,6 +195,16 @@ impl LlmProvider for GeminiProvider {
         state.token = token;
         state.project_id = project_id;
 
+        Ok(())
+    }
+
+    async fn logout(&self) -> eyre::Result<()> {
+        if let Ok(path) = gemini_auth::creds_path(self.variant) {
+            let _ = std::fs::remove_file(&path);
+        }
+        let mut state = self.state.lock().await;
+        state.token.clear();
+        state.project_id.clear();
         Ok(())
     }
 
