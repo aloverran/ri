@@ -91,7 +91,7 @@ pub fn format_context_files(context_files: &[ContextFile]) -> String {
 ///
 /// Gathers platform, OS, git status, date, and working directory so the LLM
 /// has situational awareness. Mirrors our pi env-info extension.
-pub fn get_environment_system_prompt() -> String {
+pub fn get_environment_system_prompt(additional_lines: Option<Vec<String>>) -> String {
     let cwd = env::current_dir()
         .map(|p| p.display().to_string())
         .unwrap_or_else(|_| "unknown".into());
@@ -115,7 +115,7 @@ pub fn get_environment_system_prompt() -> String {
     let os_version = format!("{} {}", os.os_type(), os.version());
     let date = chrono::Local::now().format("%Y-%m-%d").to_string();
 
-    let lines = [
+    let mut lines = vec![
         format!("Working directory: {cwd}"),
         format!("Is directory a git repo: {}", if is_git_repo { "Yes" } else { "No" }),
         format!("Platform: {platform}"),
@@ -124,9 +124,15 @@ pub fn get_environment_system_prompt() -> String {
         format!("Today's date: {date}"),
     ];
 
+    if let Some(additional_lines) = additional_lines {
+        for line in additional_lines {
+            lines.push(line);
+        }
+    }
+
     format!(
-        "\nHere is useful information about the environment you are running in:\n<env>\n{}\n</env>",
-        lines.join("\n"),
+        "\nHere is useful information about the environment you are running in:\n\n<env>\n\n{}\n\n</env>",
+        lines.join("\\\n"),
     )
 }
 
