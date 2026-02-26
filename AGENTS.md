@@ -59,7 +59,6 @@ When we modify code, we don't just add/edit/remove willy nilly. We think of the 
 
 In general, we always favor clean code over performance, because Rust is extremely fast by default. Even with allocations, copies, etc. We rarely try to prematurely optimize.
 
-On documentation and commenting, the more fundamental (used) or public something is, the more it deserves a doc comment. On the other hand, the more strange something is the more it deserves a comment. But we don't stress about documenting everything, we use good sense to help those who are ramping onto the codebase get their bearings and understand what the purpose of code is. Purpose is very helpful -- what purpose does this code serve in the broader system? That's what we aim to document, not what is obvious in the code itself.
 
 On API-design: A well-designed API has the property that any ordering of function calls to it forms a valid system state. These APIs form almost a language for expressing what you want out of them, and they are robust because changes to the way it is used do not create hidden bugs or put the system in an invalid state. Great APIs are often expressive: they are flexible, made of simple building blocks but with the ability to form various more-complex shapes.
 
