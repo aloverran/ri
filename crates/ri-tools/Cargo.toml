@@ -14,3 +14,5 @@ tokio-util.workspace = true
 async-trait.workspace = true
 command-group.workspace = true
 tracing.workspace = true
+chrono.workspace = true
+os_info.workspace = true

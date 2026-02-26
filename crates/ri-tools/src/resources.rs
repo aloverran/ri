@@ -72,9 +72,14 @@ pub fn discover_context_files(cwd: &Path) -> Vec<ContextFile> {
     files
 }
 
+// todo: we should break this out into the consumers to control.
+// we could provide a default system prompt, for quick use, but generally this is the focus
+// of your configuration and you want direct control.
 /// Build the default system prompt from discovered context files.
 pub fn build_system_prompt(context_files: &[ContextFile]) -> String {
     let mut parts: Vec<String> = vec![BASE_SYSTEM_PROMPT.to_string()];
+
+    parts.push(format!("## Environment\n\n{}", get_environment_system_prompt()));
 
     if !context_files.is_empty() {
         parts.push("# Context Files".to_string());
@@ -86,6 +91,48 @@ pub fn build_system_prompt(context_files: &[ContextFile]) -> String {
     parts.join("\n\n")
 }
 
+/// Build an environment info block for the system prompt.
+///
+/// Gathers platform, OS, git status, date, and working directory so the LLM
+/// has situational awareness. Mirrors our pi env-info extension.
+pub fn get_environment_system_prompt() -> String {
+    let cwd = env::current_dir()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| "unknown".into());
+
+    let is_git_repo = env::current_dir()
+        .ok()
+        .and_then(|d| {
+            std::process::Command::new("git")
+                .args(["rev-parse", "--is-inside-work-tree"])
+                .current_dir(&d)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .ok()
+        })
+        .is_some_and(|s| s.success());
+
+    let platform = env::consts::OS;
+    let arch = env::consts::ARCH;
+    let os = os_info::get();
+    let os_version = format!("{} {}", os.os_type(), os.version());
+    let date = chrono::Local::now().format("%Y-%m-%d").to_string();
+
+    let lines = [
+        format!("Working directory: {cwd}"),
+        format!("Is directory a git repo: {}", if is_git_repo { "Yes" } else { "No" }),
+        format!("Platform: {platform}"),
+        format!("Architecture: {arch}"),
+        format!("OS version: {os_version}"),
+        format!("Today's date: {date}"),
+    ];
+
+    format!(
+        "\nHere is useful information about the environment you are running in:\n<env>\n{}\n</env>",
+        lines.join("\n"),
+    )
+}
 
 pub const BASE_SYSTEM_PROMPT: &str = "\
 You are ri, a coding agent. You help with software engineering tasks: \
