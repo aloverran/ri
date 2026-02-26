@@ -72,22 +72,18 @@ pub fn discover_context_files(cwd: &Path) -> Vec<ContextFile> {
     files
 }
 
-// todo: we should break this out into the consumers to control.
-// we could provide a default system prompt, for quick use, but generally this is the focus
-// of your configuration and you want direct control.
-/// Build the default system prompt from discovered context files.
-pub fn build_system_prompt(context_files: &[ContextFile]) -> String {
-    let mut parts: Vec<String> = vec![BASE_SYSTEM_PROMPT.to_string()];
-
-    parts.push(format!("## Environment\n\n{}", get_environment_system_prompt()));
-
-    if !context_files.is_empty() {
-        parts.push("# Context Files".to_string());
-        for cf in context_files {
-            parts.push(format!("## {}\n\n{}", cf.path.display(), cf.content));
-        }
+/// Format context files into a prompt section.
+///
+/// Each file gets a markdown header with its path and its content below.
+/// Returns an empty string if there are no context files.
+pub fn format_context_files(context_files: &[ContextFile]) -> String {
+    if context_files.is_empty() {
+        return String::new();
     }
-
+    let mut parts = vec!["# Context Files".to_string()];
+    for cf in context_files {
+        parts.push(format!("## {}\n\n{}", cf.path.display(), cf.content));
+    }
     parts.join("\n\n")
 }
 
