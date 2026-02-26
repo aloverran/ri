@@ -3,6 +3,8 @@
 While rust gives us lots of tools to maximize performance, we aim for the subset of Rust that gives us 90% performance 
 but allows us to avoid some of the particularly annoying syntax and lifetimes. 
 
+We use Rust because it is effortlessly cross-platform to Windows, Mac, and Linux. We avoid platform-specific code at all costs because it's code we cannot test on our development machine! It is much more preferrable to write platform agnostic Rust because it gives us confidence it works. Write once, run everywhere.
+
 ## Async in Traits
 Async functions in traits are stable in Rust (since version 1.75.0, released December 2023)! You can now write async fn directly inside trait definitions without external crates.
 

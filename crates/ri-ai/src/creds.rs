@@ -55,19 +55,19 @@ pub fn save(path: &Path, creds: &Credentials) -> eyre::Result<()> {
     }
     let data = serde_json::to_string_pretty(creds)?;
     std::fs::write(path, &data)?;
-    restrict_permissions(path)?;
+    restrict_file_permissions(path)?;
     Ok(())
 }
 
 #[cfg(unix)]
-fn restrict_permissions(path: &Path) -> eyre::Result<()> {
+pub fn restrict_file_permissions(path: &Path) -> eyre::Result<()> {
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
     Ok(())
 }
 
 #[cfg(not(unix))]
-fn restrict_permissions(_path: &Path) -> eyre::Result<()> {
+pub fn restrict_file_permissions(_path: &Path) -> eyre::Result<()> {
     Ok(())
 }
 

@@ -1,10 +1,11 @@
-// Google Gemini provider -- Cloud Code Assist API.
+// Google Gemini provider.
 //
-// Supports two variants:
-//   Cli:          standard Gemini models via cloudcode-pa.googleapis.com
-//   Antigravity:  Gemini 3 via daily-cloudcode-pa.sandbox.googleapis.com
+// Supports three variants:
+//   Cli:          standard Gemini models via cloudcode-pa.googleapis.com (OAuth)
+//   Antigravity:  Gemini 3 via daily-cloudcode-pa.sandbox.googleapis.com (OAuth)
+//   ApiKey:       Gemini 3 via generativelanguage.googleapis.com (GEMINI_API_KEY env var)
 //
-// Auth, credential management, and project discovery are in gemini_auth.rs.
+// OAuth credential management and project discovery are in gemini_auth.rs.
 
 use std::collections::HashMap;
 use async_trait::async_trait;
@@ -24,6 +25,35 @@ use crate::gemini_auth;
 pub enum GeminiVariant {
     Cli,
     Antigravity,
+    /// Direct Gemini API via GEMINI_API_KEY env var. No OAuth, no project.
+    ApiKey,
+}
+
+// -- API key file storage --
+
+fn api_key_path() -> eyre::Result<std::path::PathBuf> {
+    Ok(crate::creds::ri_dir()?.join("gemini_api_key"))
+}
+
+fn load_api_key() -> Option<String> {
+    // Saved file takes priority; env var is the fallback.
+    if let Ok(path) = api_key_path() {
+        if let Ok(key) = std::fs::read_to_string(&path) {
+            let key = key.trim().to_string();
+            if !key.is_empty() { return Some(key); }
+        }
+    }
+    std::env::var("GEMINI_API_KEY").ok().filter(|k| !k.is_empty())
+}
+
+fn save_api_key(key: &str) -> eyre::Result<()> {
+    let path = api_key_path()?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&path, key)?;
+    crate::creds::restrict_file_permissions(&path)?;
+    Ok(())
 }
 
 // -- Provider struct --
@@ -43,10 +73,18 @@ struct ProviderState {
 
 impl GeminiProvider {
     pub fn new(variant: GeminiVariant) -> Self {
-        let (token, project_id) = if let Some(creds) = gemini_auth::load_creds(variant) {
-            (creds.access_token, creds.project_id.unwrap_or_default())
-        } else {
-            (String::new(), String::new())
+        let (token, project_id) = match variant {
+            GeminiVariant::ApiKey => {
+                let key = load_api_key().unwrap_or_default();
+                (key, String::new())
+            }
+            _ => {
+                if let Some(creds) = gemini_auth::load_creds(variant) {
+                    (creds.access_token, creds.project_id.unwrap_or_default())
+                } else {
+                    (String::new(), String::new())
+                }
+            }
         };
 
         Self {
@@ -64,6 +102,11 @@ impl GeminiProvider {
         let mut state = self.state.lock().await;
         if state.token.is_empty() {
             return Ok((String::new(), String::new()));
+        }
+
+        // API key auth doesn't expire or refresh.
+        if self.variant == GeminiVariant::ApiKey {
+            return Ok((state.token.clone(), String::new()));
         }
 
         if let Some(creds) = gemini_auth::load_creds(self.variant) {
@@ -91,6 +134,7 @@ impl LlmProvider for GeminiProvider {
         match self.variant {
             GeminiVariant::Cli => "google-gemini-cli",
             GeminiVariant::Antigravity => "google-antigravity",
+            GeminiVariant::ApiKey => "google-gemini-api",
         }
     }
 
@@ -98,6 +142,7 @@ impl LlmProvider for GeminiProvider {
         match self.variant {
             GeminiVariant::Cli => "Google Gemini CLI",
             GeminiVariant::Antigravity => "Google Antigravity",
+            GeminiVariant::ApiKey => "Google Gemini API",
         }
     }
 
@@ -132,6 +177,18 @@ impl LlmProvider for GeminiProvider {
                     cost: ModelCost { input: 0.5, output: 3.0, cache_read: 0.5, cache_write: 0.0 },
                 },
             ],
+            GeminiVariant::ApiKey => vec![
+                Model {
+                    id: "gemini-3-pro-preview".into(), name: "Gemini 3 Pro".into(),
+                    reasoning: true, context_window: 1_000_000, max_tokens: 64_000,
+                    cost: ModelCost { input: 2.0, output: 12.0, cache_read: 0.0, cache_write: 0.0 },
+                },
+                Model {
+                    id: "gemini-3-flash-preview".into(), name: "Gemini 3 Flash".into(),
+                    reasoning: true, context_window: 1_000_000, max_tokens: 64_000,
+                    cost: ModelCost { input: 0.5, output: 3.0, cache_read: 0.0, cache_write: 0.0 },
+                },
+            ],
         }
     }
 
@@ -140,14 +197,35 @@ impl LlmProvider for GeminiProvider {
     }
 
     fn account_label(&self) -> Option<String> {
-        gemini_auth::load_creds(self.variant).and_then(|c| c.email)
+        match self.variant {
+            GeminiVariant::ApiKey => {
+                if self.state.try_lock().map(|s| !s.token.is_empty()).unwrap_or(false) {
+                    Some("API key".to_string())
+                } else {
+                    None
+                }
+            }
+            _ => gemini_auth::load_creds(self.variant).and_then(|c| c.email),
+        }
     }
 
     fn can_logout(&self) -> bool {
-        gemini_auth::load_creds(self.variant).is_some()
+        match self.variant {
+            // Can logout if key is saved to file (not just env var).
+            GeminiVariant::ApiKey => api_key_path().ok()
+                .map(|p| p.exists())
+                .unwrap_or(false),
+            _ => gemini_auth::load_creds(self.variant).is_some(),
+        }
     }
 
     async fn begin_login(&self) -> eyre::Result<Option<AuthMethod>> {
+        if self.variant == GeminiVariant::ApiKey {
+            return Ok(Some(AuthMethod::TextInput {
+                prompt: "Enter your Gemini API key (from aistudio.google.com):".into(),
+                placeholder: "API key...".into(),
+            }));
+        }
         let cfg = gemini_auth::config_for(self.variant);
         let verifier = crate::creds::generate_verifier();
         let challenge = crate::creds::challenge(&verifier);
@@ -168,6 +246,16 @@ impl LlmProvider for GeminiProvider {
     }
 
     async fn complete_login(&self, code: &str) -> eyre::Result<()> {
+        if self.variant == GeminiVariant::ApiKey {
+            let key = code.trim();
+            if key.is_empty() {
+                return Err(eyre::eyre!("API key cannot be empty"));
+            }
+            save_api_key(key)?;
+            let mut state = self.state.lock().await;
+            state.token = key.to_string();
+            return Ok(());
+        }
         let (verifier, login_state) = {
             let mut state = self.state.lock().await;
             let v = state.login_verifier.take()
@@ -199,6 +287,15 @@ impl LlmProvider for GeminiProvider {
     }
 
     async fn logout(&self) -> eyre::Result<()> {
+        if self.variant == GeminiVariant::ApiKey {
+            if let Ok(path) = api_key_path() {
+                let _ = std::fs::remove_file(&path);
+            }
+            let mut state = self.state.lock().await;
+            // Fall back to env var if present, otherwise clear.
+            state.token = std::env::var("GEMINI_API_KEY").unwrap_or_default();
+            return Ok(());
+        }
         if let Ok(path) = gemini_auth::creds_path(self.variant) {
             let _ = std::fs::remove_file(&path);
         }
@@ -226,19 +323,25 @@ fn build_request(
     project_id: &str,
     opts: &RequestOptions,
 ) -> reqwest::RequestBuilder {
-    let body = build_body(variant, project_id, opts);
+    if variant == GeminiVariant::ApiKey {
+        return build_api_key_request(token, opts);
+    }
+
+    let body = build_cloud_body(variant, project_id, opts);
     let endpoint = match variant {
         GeminiVariant::Antigravity => gemini_auth::ANTIGRAVITY_DAILY_ENDPOINT,
         GeminiVariant::Cli => gemini_auth::GEMINI_CLI_ENDPOINT,
+        GeminiVariant::ApiKey => unreachable!(),
     };
     let url = format!("{}/v1internal:streamGenerateContent?alt=sse", endpoint);
 
     let ua = match variant {
         GeminiVariant::Antigravity => "antigravity/1.18.0 darwin/arm64",
         GeminiVariant::Cli => "google-cloud-sdk vscode_cloudshelleditor/0.1",
+        GeminiVariant::ApiKey => unreachable!(),
     };
 
-    tracing::trace!(%url, %body, "Gemini API request");
+    tracing::trace!(%url, %body, "Gemini Cloud Code Assist request");
 
     reqwest::Client::new()
         .post(&url)
@@ -255,7 +358,67 @@ fn build_request(
         .body(body.to_string())
 }
 
-fn build_body(variant: GeminiVariant, project_id: &str, opts: &RequestOptions) -> Value {
+/// Build request for the public Gemini API (API key auth, no Cloud Code Assist wrapper).
+fn build_api_key_request(api_key: &str, opts: &RequestOptions) -> reqwest::RequestBuilder {
+    let url = format!(
+        "https://generativelanguage.googleapis.com/v1beta/models/{}:streamGenerateContent?alt=sse&key={}",
+        opts.model.id, api_key,
+    );
+
+    let body = build_api_key_body(opts);
+
+    tracing::trace!("Gemini API key request to model [{}]", opts.model.id);
+
+    reqwest::Client::new()
+        .post(&url)
+        .header("content-type", "application/json")
+        .header("accept", "text/event-stream")
+        .body(body.to_string())
+}
+
+/// Body for the public Gemini API -- a direct GenerateContentRequest
+/// (no project/model/request envelope like Cloud Code Assist).
+fn build_api_key_body(opts: &RequestOptions) -> Value {
+    let contents = build_contents(&opts.messages, &opts.model.id);
+
+    let max_tokens = opts.max_tokens
+        .unwrap_or_else(|| (opts.model.max_tokens / 3).max(4096));
+
+    let mut generation_config = json!({ "maxOutputTokens": max_tokens });
+
+    if opts.thinking != ThinkingLevel::Off && opts.model.reasoning {
+        if let Some(level_str) = thinking_level_string(opts.thinking, &opts.model.id) {
+            generation_config["thinkingConfig"] = json!({
+                "includeThoughts": true,
+                "thinkingLevel": level_str,
+            });
+        }
+    }
+
+    let mut body = json!({
+        "contents": contents,
+        "generationConfig": generation_config,
+    });
+
+    if !opts.system_prompt.is_empty() {
+        body["systemInstruction"] = json!({ "parts": [{ "text": opts.system_prompt }] });
+    }
+
+    if !opts.tools.is_empty() {
+        let declarations: Vec<Value> = opts.tools.iter().map(|t| {
+            json!({
+                "name": t.name,
+                "description": t.description,
+                "parameters": t.parameters,
+            })
+        }).collect();
+        body["tools"] = json!([{ "functionDeclarations": declarations }]);
+    }
+
+    body
+}
+
+fn build_cloud_body(variant: GeminiVariant, project_id: &str, opts: &RequestOptions) -> Value {
     let contents = build_contents(&opts.messages, &opts.model.id);
 
     let max_tokens = opts.max_tokens

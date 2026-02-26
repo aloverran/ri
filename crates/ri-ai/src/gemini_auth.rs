@@ -15,6 +15,7 @@ pub fn creds_path(variant: GeminiVariant) -> eyre::Result<PathBuf> {
     let name = match variant {
         GeminiVariant::Cli => "gemini_cli_auth.json",
         GeminiVariant::Antigravity => "gemini_antigravity_auth.json",
+        GeminiVariant::ApiKey => unreachable!("ApiKey variant uses env var, not credential files"),
     };
     Ok(creds::ri_dir()?.join(name))
 }
@@ -98,6 +99,7 @@ pub fn config_for(variant: GeminiVariant) -> VariantConfig {
             port: 51121,
             callback_path: "/oauth-callback",
         },
+        GeminiVariant::ApiKey => unreachable!("ApiKey variant does not use OAuth"),
     }
 }
 
@@ -215,6 +217,7 @@ async fn discover_project(
     let endpoints = match variant {
         GeminiVariant::Antigravity => vec![GEMINI_CLI_ENDPOINT, ANTIGRAVITY_DAILY_ENDPOINT],
         GeminiVariant::Cli => vec![GEMINI_CLI_ENDPOINT],
+        GeminiVariant::ApiKey => unreachable!("ApiKey variant does not discover projects"),
     };
 
     for endpoint in &endpoints {

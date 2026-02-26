@@ -9,6 +9,7 @@ const FACTORIES: &[ProviderFactory] = &[
     || Box::new(AnthropicProvider::new()),
     || Box::new(GeminiProvider::new(GeminiVariant::Cli)),
     || Box::new(GeminiProvider::new(GeminiVariant::Antigravity)),
+    || Box::new(GeminiProvider::new(GeminiVariant::ApiKey)),
     || Box::new(OpenAICodexProvider::new()),
 ];
 

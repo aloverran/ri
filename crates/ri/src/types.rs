@@ -161,6 +161,8 @@ pub enum AuthMethod {
     PasteCode { url: String },
     /// CLI starts a local HTTP server, user visits URL via browser (e.g. Google OAuth).
     LocalCallback { url: String, port: u16, path: String },
+    /// User types a value into a text field (e.g. API key).
+    TextInput { prompt: String, placeholder: String },
 }
 
 /// The trait that LLM providers implement. Used as `dyn LlmProvider`
