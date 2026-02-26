@@ -92,23 +92,6 @@ pub fn format_context_files(context_files: &[ContextFile]) -> String {
 /// Gathers platform, OS, git status, date, and working directory so the LLM
 /// has situational awareness. Mirrors our pi env-info extension.
 pub fn get_environment_system_prompt(additional_lines: Option<Vec<String>>) -> String {
-    let cwd = env::current_dir()
-        .map(|p| p.display().to_string())
-        .unwrap_or_else(|_| "unknown".into());
-
-    let is_git_repo = env::current_dir()
-        .ok()
-        .and_then(|d| {
-            std::process::Command::new("git")
-                .args(["rev-parse", "--is-inside-work-tree"])
-                .current_dir(&d)
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status()
-                .ok()
-        })
-        .is_some_and(|s| s.success());
-
     let platform = env::consts::OS;
     let arch = env::consts::ARCH;
     let os = os_info::get();
@@ -116,12 +99,10 @@ pub fn get_environment_system_prompt(additional_lines: Option<Vec<String>>) -> S
     let date = chrono::Local::now().format("%Y-%m-%d").to_string();
 
     let mut lines = vec![
-        format!("Working directory: {cwd}"),
-        format!("Is directory a git repo: {}", if is_git_repo { "Yes" } else { "No" }),
         format!("Platform: {platform}"),
         format!("Architecture: {arch}"),
         format!("OS version: {os_version}"),
-        format!("Today's date: {date}"),
+        format!("Date of first message: {date}"),
     ];
 
     if let Some(additional_lines) = additional_lines {
