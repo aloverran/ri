@@ -179,7 +179,7 @@ pub trait LlmProvider: Send + Sync {
 
     /// Whether stored credentials can be removed. False when auth comes
     /// from an environment variable rather than a credential file.
-    fn can_logout(&self) -> bool { false }
+    fn can_logout(&self) -> bool;
 
     /// Start a login flow. Returns an AuthMethod describing what
     /// the user needs to do, or None if login is not supported.
@@ -189,9 +189,7 @@ pub trait LlmProvider: Send + Sync {
     async fn complete_login(&self, response: &str) -> eyre::Result<()>;
 
     /// Remove stored credentials and clear in-memory auth state.
-    async fn logout(&self) -> eyre::Result<()> {
-        Err(eyre::eyre!("Logout not supported for this provider"))
-    }
+    async fn logout(&self) -> eyre::Result<()>;
 
     /// Stream a response from the LLM.
     async fn stream(&self, opts: RequestOptions) -> Result<EventStream, ApiError>;
