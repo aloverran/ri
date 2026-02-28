@@ -41,7 +41,7 @@ Solution: Use #[async_trait], which handles the boxing for you.
 * We prefer longer files (like c) over separating every component into a file. This follows from the principle of narrative readability. Many small files means you must jump around (losing the narrative of the code).
 * Type comments should speak as describing the thing they are above (ie. singular not plural)
 * Keep tracing macros short where possible by using direct field names. ie '%name' over 'path = %name'.
-
+* Section comments within files should be used sparingly. 
 
 ## Clean Code
 
