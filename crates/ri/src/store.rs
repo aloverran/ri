@@ -201,6 +201,14 @@ struct HeadLine {
     head: StepId,
 }
 
+/// A title-update line. The last one in the file wins. Written by
+/// background title generation -- separate from the session header
+/// so titles can evolve without rewriting the file.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct TitleLine {
+    title: String,
+}
+
 // -- Store --
 
 /// Manages the pool and session files. Loads history from existing JSONL
@@ -318,6 +326,12 @@ impl Store {
             } else if obj.get("head").is_some() {
                 if let Ok(hl) = serde_json::from_value::<HeadLine>(obj) {
                     head = Some(hl.head);
+                }
+            } else if obj.get("title").is_some() {
+                if let Ok(tl) = serde_json::from_value::<TitleLine>(obj) {
+                    if let Some(h) = header.as_mut() {
+                        h.session = tl.title;
+                    }
                 }
             } else {
                 tracing::debug!("{}:{}: unrecognized line type, skipping", path.display(), line_num + 1);
@@ -467,6 +481,30 @@ impl Store {
         let session = self.sessions.get(session_id)?;
         let step = self.pool.get_step(session.head.as_str())?;
         Some(&step.context)
+    }
+
+    /// Persist a generated title to the session file and update the in-memory
+    /// session name. Append-only: writes a `{"title": "..."}` line.
+    pub fn write_title(
+        &mut self,
+        session_id: &SessionId,
+        title: &str,
+    ) -> eyre::Result<()> {
+        let path = self.sessions_dir.join(format!("{}.jsonl", session_id));
+        let line = TitleLine { title: title.to_string() };
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)?;
+        writeln!(file, "{}", serde_json::to_string(&line)?)?;
+        file.flush()?;
+
+        if let Some(session) = self.sessions.get_mut(session_id.as_str()) {
+            session.name = title.to_string();
+        }
+
+        tracing::debug!("Wrote title [{}] to session [{}]", title, session_id);
+        Ok(())
     }
 
     // -- Internal writing helpers --

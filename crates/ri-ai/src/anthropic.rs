@@ -111,13 +111,33 @@ impl LlmProvider for AnthropicProvider {
     fn models(&self) -> Vec<Model> {
         vec![
             Model {
+                id: "claude-3-5-haiku-20241022".into(), name: "Claude Haiku 3.5".into(),
+                reasoning: false, context_window: 200_000, max_tokens: 8_192,
+                cost: ModelCost { input: 0.8, output: 4.0, cache_read: 0.08, cache_write: 1.0 },
+            },
+            Model {
+                id: "claude-haiku-4-5-20251001".into(), name: "Claude Haiku 4.5".into(),
+                reasoning: true, context_window: 200_000, max_tokens: 64_000,
+                cost: ModelCost { input: 1.0, output: 5.0, cache_read: 0.1, cache_write: 1.25 },
+            },
+            Model {
                 id: "claude-sonnet-4-20250514".into(), name: "Claude Sonnet 4".into(),
                 reasoning: false, context_window: 200_000, max_tokens: 16_384,
                 cost: ModelCost { input: 3.0, output: 15.0, cache_read: 0.3, cache_write: 3.75 },
             },
             Model {
-                id: "claude-opus-4-6".into(), name: "Claude Opus 4.6".into(),
+                id: "claude-sonnet-4-5-20250929".into(), name: "Claude Sonnet 4.5".into(),
                 reasoning: true, context_window: 200_000, max_tokens: 64_000,
+                cost: ModelCost { input: 3.0, output: 15.0, cache_read: 0.3, cache_write: 3.75 },
+            },
+            Model {
+                id: "claude-sonnet-4-6".into(), name: "Claude Sonnet 4.6".into(),
+                reasoning: true, context_window: 200_000, max_tokens: 64_000,
+                cost: ModelCost { input: 3.0, output: 15.0, cache_read: 0.3, cache_write: 3.75 },
+            },
+            Model {
+                id: "claude-opus-4-6".into(), name: "Claude Opus 4.6".into(),
+                reasoning: true, context_window: 200_000, max_tokens: 128_000,
                 cost: ModelCost { input: 5.0, output: 25.0, cache_read: 0.5, cache_write: 6.25 },
             },
         ]
