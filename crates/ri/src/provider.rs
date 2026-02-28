@@ -10,7 +10,8 @@ use async_trait::async_trait;
 use futures::Stream;
 use serde::{Deserialize, Serialize};
 
-use crate::message::{Message, SessionId, StreamEvent};
+use crate::message::{Message, SessionId};
+use crate::stream::StreamEvent;
 
 // -- Model --
 

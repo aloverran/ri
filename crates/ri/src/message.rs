@@ -4,9 +4,6 @@
 //! in the pool and is referenced by ID. Messages are authored (by humans,
 //! tools, or code) or derived (produced by an LLM call). Both are the same
 //! type -- provenance lives in the Step that introduced a derived message.
-//!
-//! This module also defines the streaming protocol: `StreamEvent` is the
-//! incremental form of content blocks as they arrive from a provider.
 
 use std::borrow::Borrow;
 use std::fmt;
@@ -220,27 +217,6 @@ pub struct Usage {
     /// Raw provider-specific usage data for debug display.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub extras: Option<serde_json::Value>,
-}
-
-/// Normalized events emitted by LLM providers during response streaming.
-///
-/// These are the incremental form of content blocks: a TextStart/Delta/End
-/// sequence accumulates into a ContentBlock::Text, and so on. The
-/// StreamAccumulator handles this conversion.
-#[derive(Debug, Clone)]
-pub enum StreamEvent {
-    TextStart,
-    TextDelta(String),
-    TextEnd { sig: Option<String> },
-    ThinkingStart,
-    ThinkingDelta(String),
-    ThinkingEnd { sig: Option<String> },
-    ToolCallStart { id: String, name: String },
-    ToolCallDelta { id: String, json_fragment: String },
-    ToolCallEnd { id: String, sig: Option<String> },
-    Usage(Usage),
-    Done,
-    Error(String),
 }
 
 /// Generate a globally unique ID (UUID v4, hex, no dashes).
