@@ -334,7 +334,7 @@ impl Store {
                     }
                 }
             } else {
-                tracing::debug!("{}:{}: unrecognized line type, skipping", path.display(), line_num + 1);
+                tracing::warn!("{}:{}: unrecognized line type, skipping", path.display(), line_num + 1);
             }
         }
 
