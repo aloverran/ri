@@ -78,8 +78,8 @@ impl Message {
             return format!("[{}] (empty)", role_tag);
         }
 
-        let fixed_len = role_tag.len() + 3;
-        let content_budget = 800usize.saturating_sub(fixed_len);
+        let fixed_len = role_tag.len() + 3; // "[" + role + "] "
+        let content_budget = SUMMARY_WIDTH.saturating_sub(fixed_len);
         let content_summary = summarize_blocks(&self.content, content_budget);
         format!("[{}] {}", role_tag, content_summary)
     }
@@ -164,40 +164,41 @@ impl ContentBlock {
         ContentBlock::Error { message: s.into() }
     }
 
-    /// Short human-readable summary of this block, targeting 500-1000 chars.
+    /// Short human-readable summary of this block, targeting ~800 chars.
     pub fn summarize(&self) -> String {
         match self {
             ContentBlock::Text { text } => {
-                truncate_with_ellipsis(text, 800)
+                truncate_with_ellipsis(text, SUMMARY_WIDTH)
             }
             ContentBlock::Thinking { thinking, .. } => {
-                let body = truncate_with_ellipsis(thinking, 760);
-                format!("[thinking] {}", body)
+                let tag = "[thinking] ";
+                let body = truncate_with_ellipsis(thinking, SUMMARY_WIDTH - tag.len());
+                format!("{tag}{body}")
             }
             ContentBlock::Image { media_type, .. } => {
-                format!("[image: {}]", media_type)
+                format!("[image: {media_type}]")
             }
             ContentBlock::ToolUse { name, input, .. } => {
-                let input_str = input.to_string();
-                let body = truncate_with_ellipsis(&input_str, 780 - name.len());
-                format!("[tool: {}] {}", name, body)
+                let tag = format!("[tool: {name}] ");
+                let body = truncate_with_ellipsis(&input.to_string(), SUMMARY_WIDTH.saturating_sub(tag.len()));
+                format!("{tag}{body}")
             }
             ContentBlock::ToolResult { is_error, content, .. } => {
-                let tag = if *is_error { "[tool error]" } else { "[tool result]" };
+                let tag = if *is_error { "[tool error] " } else { "[tool result] " };
                 let inner: String = content.iter().map(|b| match b {
                     ContentBlock::Text { text } => text.as_str(),
                     _ => "",
                 }).collect::<Vec<_>>().join(" ");
-                let body = truncate_with_ellipsis(&inner, 780);
-                format!("{} {}", tag, body)
+                let body = truncate_with_ellipsis(&inner, SUMMARY_WIDTH - tag.len());
+                format!("{tag}{body}")
             }
             ContentBlock::Error { message } => {
-                let body = truncate_with_ellipsis(message, 790);
-                format!("[error] {}", body)
+                let tag = "[error] ";
+                let body = truncate_with_ellipsis(message, SUMMARY_WIDTH - tag.len());
+                format!("{tag}{body}")
             }
             ContentBlock::Unknown(v) => {
-                let s = v.to_string();
-                truncate_with_ellipsis(&s, 800)
+                truncate_with_ellipsis(&v.to_string(), SUMMARY_WIDTH)
             }
         }
     }
@@ -225,6 +226,10 @@ pub fn gen_id() -> String {
 }
 
 // Summarization helpers (private)
+
+/// Target width for single-block summaries. Tagged blocks subtract their
+/// prefix length from this budget so the total stays consistent.
+const SUMMARY_WIDTH: usize = 800;
 
 fn summarize_blocks(blocks: &[ContentBlock], budget: usize) -> String {
     if blocks.len() == 1 {
