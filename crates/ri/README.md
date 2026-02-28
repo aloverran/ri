@@ -4,16 +4,10 @@ Core types, traits, and storage for ri. This is the foundation crate that all ot
 
 ## Modules
 
-**message** -- `Message`, `Role`, `ContentBlock`, `Provenance`, `Usage`, `MessagePool`, `SessionHeader`, `SessionInfo`. The message is the fundamental building block: an immutable content blob with optional provenance (which LLM call produced it). The pool is an in-memory `HashMap<Id, Message>` with insertion-order iteration.
+**message** -- The atomic building block. `MessageId`, `SessionId`, `StepId` (ID newtypes), `Role`, `ContentBlock` (typed content within a message), `StreamEvent` (incremental form of content blocks during streaming), `Usage`, `Message`, `gen_id()`.
 
-**model** -- `Model` (id, name, context window, max tokens, cost), `ModelCost`, `ThinkingLevel`.
+**provider** -- Contracts for LLM providers and tools. `Model`, `ModelCost`, `ThinkingLevel`, `LlmProvider` trait, `RequestOptions`, `ApiError`, `EventStream`, `AuthMethod`, `Tool` trait, `ToolSchema`, `ToolOutput`, `ToolContext`.
 
-**provider** -- `LlmProvider` trait with `stream(RequestOptions) -> EventStream`. Also `ApiError`, `RequestOptions`, `EventStream`.
+**store** -- Persistence and the object pool. `Pool` (in-memory message/step store), `Context` (ordered message ID list), `Step` (history DAG node), `Session` (named pointer to a step), `SessionHeader`, `Store` (pool + JSONL file management).
 
-**event** -- `StreamEvent`: normalized events from any LLM provider (TextStart/Delta/End, ThinkingStart/Delta/End, ToolCallStart/Delta/End, Done, Error). Also `ToolSchema` for tool definitions sent to the LLM API.
-
-**tool** -- `ToolDef`, `ToolFn`, `ToolOutput`. Tools are plain function pointers, not trait objects.
-
-**filing** -- `SessionFiling`: reads/writes per-session JSONL files, manages the message pool, tracks the active session.
-
-**id** -- `gen_id()`, `gen_session_prefix()`. UUID-based ID generation.
+**accumulator** -- `StreamAccumulator`: pure state machine that converts `StreamEvent`s into `Vec<ContentBlock>` + `Usage`.

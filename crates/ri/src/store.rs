@@ -1,39 +1,158 @@
-//! Session storage: manages the pool and session files on disk.
+//! Session storage: the pool, the history DAG, and session files.
 //!
-//! Filing strategy: one JSONL file per session, append-only.
-//! Each line is one of:
+//! This module owns the in-memory object store (Pool) and its persistence
+//! layer (Store). On disk, each session is an append-only JSONL file with
+//! four line types:
+//!
 //! - Session header: `{"session": "name", "ts": "...", ...}`
 //! - Message: `{"msg": "m1", "role": "user", "content": [...]}`
 //! - Step: `{"step": "s1", "context": ["m1", "m2"], "parents": [], "meta": {...}}`
 //! - Head update: `{"head": "s2"}`
 //!
 //! The session's current state is the last `{"head": ...}` line.
-//! Messages and steps accumulate in the pool for cross-session lookup.
 
+use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
-use crate::message::{gen_session_prefix, ContentBlock, Context, Message, MessageId, Pool, Role, SessionId, Step, StepId};
+use crate::message::{ContentBlock, Message, MessageId, Role, SessionId, StepId};
+
+// -- Context --
+
+/// An ordered list of message references. Represents what the LLM sees.
+///
+/// Just a Vec of message IDs pointing into the pool. Treat it like a value.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Context {
+    pub messages: Vec<MessageId>,
+}
+
+impl Context {
+    pub fn new() -> Self {
+        Context { messages: Vec::new() }
+    }
+
+    pub fn from_ids(ids: Vec<MessageId>) -> Self {
+        Context { messages: ids }
+    }
+
+    pub fn len(&self) -> usize {
+        self.messages.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.messages.is_empty()
+    }
+}
+
+// -- Step --
+
+/// A point in the history DAG. Records a context snapshot and parent steps.
+///
+/// Like a git commit: captures *what* the context looks like at this point
+/// and *how* it got here (parents). The meta field carries model info, usage,
+/// timestamps, or any application-specific data.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Step {
+    pub id: StepId,
+    pub context: Context,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub parents: Vec<StepId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub meta: Option<serde_json::Value>,
+}
+
+// -- Pool --
+
+/// The shared object store. Messages and steps live here, referenced by ID.
+///
+/// The pool doesn't know about sessions or files. It's a bag of objects
+/// with lookup by ID. The Store layer populates it from disk and writes
+/// new objects to session files.
+pub struct Pool {
+    messages: HashMap<MessageId, Message>,
+    steps: HashMap<StepId, Step>,
+}
+
+impl Pool {
+    pub fn new() -> Self {
+        Pool {
+            messages: HashMap::new(),
+            steps: HashMap::new(),
+        }
+    }
+
+    // -- Messages (read) --
+
+    pub fn get_message(&self, id: &str) -> Option<&Message> {
+        self.messages.get(id)
+    }
+
+    /// Resolve an ordered list of message IDs to their messages.
+    /// Silently skips IDs not found in the pool.
+    pub fn resolve(&self, ids: &[MessageId]) -> Vec<&Message> {
+        ids.iter().filter_map(|id| self.messages.get(id)).collect()
+    }
+
+    /// Resolve a context to its messages.
+    pub fn resolve_context(&self, ctx: &Context) -> Vec<&Message> {
+        self.resolve(&ctx.messages)
+    }
+
+    // -- Messages (write, crate-internal) --
+
+    pub(crate) fn put_message(&mut self, msg: Message) {
+        assert!(!msg.id.as_str().is_empty(), "message ID must not be empty (role={:?})", msg.role);
+        self.messages.insert(msg.id.clone(), msg);
+    }
+
+    pub(crate) fn message_count(&self) -> usize {
+        self.messages.len()
+    }
+
+    // -- Steps (read) --
+
+    pub fn get_step(&self, id: &str) -> Option<&Step> {
+        self.steps.get(id)
+    }
+
+    // -- Steps (write, crate-internal) --
+
+    pub(crate) fn put_step(&mut self, step: Step) {
+        assert!(!step.id.as_str().is_empty(), "step ID must not be empty");
+        self.steps.insert(step.id.clone(), step);
+    }
+
+    pub(crate) fn step_count(&self) -> usize {
+        self.steps.len()
+    }
+}
+
+impl Default for Pool {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 // -- Session (the pointer) --
 
 /// A named pointer to a step. Like a git branch.
 ///
-/// The session is not stored in the pool -- it's the entry point that
-/// references into it. On disk, the session header is the first line
-/// of the JSONL file, and head updates are appended as `{"head": "..."}` lines.
+/// Not stored in the pool -- it's the entry point that references into it.
+/// On disk, the header is the first line and head updates are appended as
+/// `{"head": "..."}` lines.
 #[derive(Debug, Clone)]
 pub struct Session {
     /// Human-readable name (e.g. "fix-login").
     pub name: String,
-    /// File-stem ID (e.g. "2026-02-28_120000_fix-login"). Used to locate the file.
+    /// File-stem ID (e.g. "2026-02-28_120000_fix-login"). Locates the file.
     pub file_id: SessionId,
-    /// Current step this session points to. Always valid -- initialized to a
-    /// root step with empty context at session creation.
+    /// Current step this session points to.
     pub head: StepId,
     pub cwd: Option<String>,
     /// File-stem ID of the parent session, if spawned by another.
@@ -90,7 +209,7 @@ pub struct Store {
     pub pool: Pool,
     sessions_dir: PathBuf,
     /// Loaded session metadata, keyed by file_id.
-    sessions: std::collections::HashMap<SessionId, Session>,
+    sessions: HashMap<SessionId, Session>,
 }
 
 impl Store {
@@ -98,7 +217,7 @@ impl Store {
         Store {
             pool: Pool::new(),
             sessions_dir,
-            sessions: std::collections::HashMap::new(),
+            sessions: HashMap::new(),
         }
     }
 
@@ -106,10 +225,6 @@ impl Store {
         let home = dirs::home_dir()
             .ok_or_else(|| eyre::eyre!("Could not determine home directory"))?;
         Ok(home.join(".ri").join("sessions"))
-    }
-
-    pub fn sessions_dir(&self) -> &Path {
-        &self.sessions_dir
     }
 
     pub fn get_session(&self, file_id: &str) -> Option<&Session> {
@@ -179,12 +294,10 @@ impl Store {
             };
 
             if obj.get("session").is_some() {
-                // Session header line.
                 if let Ok(h) = serde_json::from_value::<SessionHeader>(obj) {
                     header = Some(h);
                 }
             } else if obj.get("msg").is_some() {
-                // Message line.
                 if let Ok(ml) = serde_json::from_value::<MessageLine>(obj) {
                     self.pool.put_message(Message {
                         id: ml.msg,
@@ -194,7 +307,6 @@ impl Store {
                     });
                 }
             } else if obj.get("step").is_some() {
-                // Step line.
                 if let Ok(sl) = serde_json::from_value::<StepLine>(obj) {
                     self.pool.put_step(Step {
                         id: sl.step,
@@ -204,7 +316,6 @@ impl Store {
                     });
                 }
             } else if obj.get("head").is_some() {
-                // Head update line -- last one wins.
                 if let Ok(hl) = serde_json::from_value::<HeadLine>(obj) {
                     head = Some(hl.head);
                 }
@@ -332,9 +443,37 @@ impl Store {
         Ok(msg)
     }
 
+    /// Snapshot the current context as a new step and update the session's head.
+    ///
+    /// This is the primary persistence mechanism: after any meaningful change
+    /// to the message list, call checkpoint to record the state. On reload,
+    /// the head step's context gives back exactly this list.
+    pub fn checkpoint(
+        &mut self,
+        session_id: &SessionId,
+        message_ids: &[MessageId],
+        meta: Option<serde_json::Value>,
+    ) -> eyre::Result<Step> {
+        let context = Context::from_ids(message_ids.to_vec());
+        let parents = self.sessions.get(session_id.as_str())
+            .map(|s| s.head.clone())
+            .into_iter()
+            .collect();
+        self.write_step(session_id, context, parents, meta)
+    }
+
+    /// Convenience: get the current context for a session (from its head step).
+    pub fn head_context(&self, session_id: &str) -> Option<&Context> {
+        let session = self.sessions.get(session_id)?;
+        let step = self.pool.get_step(session.head.as_str())?;
+        Some(&step.context)
+    }
+
+    // -- Internal writing helpers --
+
     /// Write a step to a session file, add it to the pool, and update the
-    /// session's head pointer. Returns the step.
-    pub fn write_step(
+    /// session's head pointer.
+    fn write_step(
         &mut self,
         session_id: &SessionId,
         context: Context,
@@ -344,12 +483,7 @@ impl Store {
         let path = self.sessions_dir.join(format!("{}.jsonl", session_id));
         let id = StepId::new(scan_next_id(&path, "step"));
 
-        let step = Step {
-            id,
-            context,
-            parents,
-            meta,
-        };
+        let step = Step { id, context, parents, meta };
 
         let step_line = StepLine {
             step: step.id.clone(),
@@ -377,71 +511,12 @@ impl Store {
 
         Ok(step)
     }
-
-    /// Update a session's head pointer without creating a new step.
-    /// Used for repointing a session to an existing step (e.g. after compaction).
-    pub fn update_head(
-        &mut self,
-        session_id: &SessionId,
-        step_id: &StepId,
-    ) -> eyre::Result<()> {
-        let path = self.sessions_dir.join(format!("{}.jsonl", session_id));
-        let head_line = HeadLine { head: step_id.clone() };
-
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)?;
-        writeln!(file, "{}", serde_json::to_string(&head_line)?)?;
-        file.flush()?;
-
-        if let Some(session) = self.sessions.get_mut(session_id.as_str()) {
-            session.head = step_id.clone();
-        }
-
-        Ok(())
-    }
-
-    /// Snapshot the current context as a new step and update the session's head.
-    ///
-    /// This is the primary persistence mechanism: after any meaningful change
-    /// to the message list, call checkpoint to record the state. On reload,
-    /// the head step's context gives back exactly this list.
-    pub fn checkpoint(
-        &mut self,
-        session_id: &SessionId,
-        message_ids: &[MessageId],
-        meta: Option<serde_json::Value>,
-    ) -> eyre::Result<Step> {
-        let context = Context::from_ids(message_ids.to_vec());
-        let parents = self.sessions.get(session_id.as_str())
-            .map(|s| s.head.clone())
-            .into_iter()
-            .collect();
-        self.write_step(session_id, context, parents, meta)
-    }
-
-    /// Convenience: get the current context for a session (from its head step).
-    pub fn head_context(&self, session_id: &str) -> Option<&Context> {
-        let session = self.sessions.get(session_id)?;
-        let step = self.pool.get_step(session.head.as_str())?;
-        Some(&step.context)
-    }
-
-    /// Convenience: resolve the current context's messages for a session.
-    pub fn head_messages(&self, session_id: &str) -> Vec<&Message> {
-        match self.head_context(session_id) {
-            Some(ctx) => self.pool.resolve_context(ctx),
-            None => Vec::new(),
-        }
-    }
 }
 
 // -- ID scanning --
 
 /// Scan a session file for IDs matching `{prefix}_{N}` pattern and return
-/// the next available ID. The `kind` parameter ("msg" or "step") determines
-/// which JSON key to look for.
+/// the next available ID.
 fn scan_next_id(path: &Path, kind: &str) -> String {
     let needle = format!("\"{}\":\"", kind);
     let mut max_counter: u64 = 0;
@@ -480,6 +555,21 @@ fn extract_field_value<'a>(line: &'a str, needle: &str) -> Option<&'a str> {
     let start = line.find(needle)? + needle.len();
     let end = start + line[start..].find('"')?;
     Some(&line[start..end])
+}
+
+/// Generate a session prefix from name + random suffix, used to create
+/// human-readable but unique IDs within a session file.
+fn gen_session_prefix(name: &str) -> String {
+    let slug: String = name.chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .take(6)
+        .collect();
+    let rand = &Uuid::new_v4().simple().to_string()[..6];
+    if slug.is_empty() {
+        format!("s_{}", rand)
+    } else {
+        format!("{}_{}", slug, rand)
+    }
 }
 
 fn slugify(name: &str) -> String {

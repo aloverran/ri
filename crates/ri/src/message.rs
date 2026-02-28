@@ -1,20 +1,17 @@
-//! Core data types for ri's message model.
+//! The message: ri's atomic building block.
 //!
-//! Three layers, inspired by git's object model:
+//! A message is an immutable content blob (role + content blocks) that lives
+//! in the pool and is referenced by ID. Messages are authored (by humans,
+//! tools, or code) or derived (produced by an LLM call). Both are the same
+//! type -- provenance lives in the Step that introduced a derived message.
 //!
-//! - **Message**: Immutable content blob (role + content blocks). Like a git blob.
-//! - **Context**: Ordered list of message IDs. Like a git tree. Cheap to clone
-//!   (copy-on-write via shared message pool). Treat it like a value.
-//! - **Step**: A point in the history DAG. Records a context snapshot, parent
-//!   steps, and metadata. Like a git commit.
-//!
-//! Sessions (defined in store.rs) are named pointers to steps -- like git branches.
+//! This module also defines the streaming protocol: `StreamEvent` is the
+//! incremental form of content blocks as they arrive from a provider.
 
 use std::borrow::Borrow;
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use uuid::Uuid;
 
 // -- ID newtypes --
@@ -95,6 +92,7 @@ pub enum Role {
 
 // -- Content blocks --
 
+/// A typed piece of content within a message.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ContentBlock {
@@ -152,16 +150,7 @@ impl ContentBlock {
         ContentBlock::ToolResult { tool_use_id: tool_use_id.into(), content, is_error, details }
     }
 
-    pub fn tool_result_text(tool_use_id: impl Into<String>, text: impl Into<String>, is_error: bool) -> Self {
-        ContentBlock::ToolResult {
-            tool_use_id: tool_use_id.into(),
-            content: vec![ContentBlock::text(text)],
-            is_error,
-            details: None,
-        }
-    }
-
-    pub fn tool_result_with_details(tool_use_id: impl Into<String>, text: impl Into<String>, is_error: bool, details: Option<serde_json::Value>) -> Self {
+    pub fn tool_result_text(tool_use_id: impl Into<String>, text: impl Into<String>, is_error: bool, details: Option<serde_json::Value>) -> Self {
         ContentBlock::ToolResult {
             tool_use_id: tool_use_id.into(),
             content: vec![ContentBlock::text(text)],
@@ -213,8 +202,32 @@ impl ContentBlock {
     }
 }
 
+// -- Stream events --
+
+/// Normalized events emitted by LLM providers during response streaming.
+///
+/// These are the incremental form of content blocks: a TextStart/Delta/End
+/// sequence accumulates into a ContentBlock::Text, and so on. The
+/// StreamAccumulator handles this conversion.
+#[derive(Debug, Clone)]
+pub enum StreamEvent {
+    TextStart,
+    TextDelta(String),
+    TextEnd { sig: Option<String> },
+    ThinkingStart,
+    ThinkingDelta(String),
+    ThinkingEnd { sig: Option<String> },
+    ToolCallStart { id: String, name: String },
+    ToolCallDelta { id: String, json_fragment: String },
+    ToolCallEnd { id: String, sig: Option<String> },
+    Usage(Usage),
+    Done,
+    Error(String),
+}
+
 // -- Usage --
 
+/// Token usage from a single LLM call.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Usage {
     #[serde(default)]
@@ -265,210 +278,11 @@ impl Message {
     }
 }
 
-// -- Context --
-
-/// An ordered list of message references. Represents what the LLM sees.
-///
-/// Under the hood, just a Vec of message IDs pointing into the pool.
-/// Cloning is cheap (small vec of short strings). Treat it like a value type.
-///
-/// This is the copy-on-write building block: two contexts can share most of
-/// their message IDs, and creating a variant (append, replace, subset) is
-/// a simple Vec operation on the ID list.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct Context {
-    pub messages: Vec<MessageId>,
-}
-
-impl Context {
-    pub fn new() -> Self {
-        Context { messages: Vec::new() }
-    }
-
-    pub fn from_ids(ids: Vec<MessageId>) -> Self {
-        Context { messages: ids }
-    }
-
-    /// New context with a message appended.
-    pub fn append(&self, id: impl Into<MessageId>) -> Self {
-        let mut msgs = self.messages.clone();
-        msgs.push(id.into());
-        Context { messages: msgs }
-    }
-
-    /// New context with several messages appended.
-    pub fn extend(&self, ids: impl IntoIterator<Item = MessageId>) -> Self {
-        let mut msgs = self.messages.clone();
-        msgs.extend(ids);
-        Context { messages: msgs }
-    }
-
-    /// New context with the message at `index` replaced.
-    pub fn replace(&self, index: usize, id: impl Into<MessageId>) -> Self {
-        let mut msgs = self.messages.clone();
-        msgs[index] = id.into();
-        Context { messages: msgs }
-    }
-
-    /// New context containing only messages in the given range.
-    pub fn subset(&self, range: std::ops::Range<usize>) -> Self {
-        Context { messages: self.messages[range].to_vec() }
-    }
-
-    /// New context with the message at `index` removed.
-    pub fn without(&self, index: usize) -> Self {
-        let mut msgs = self.messages.clone();
-        msgs.remove(index);
-        Context { messages: msgs }
-    }
-
-    pub fn len(&self) -> usize {
-        self.messages.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.messages.is_empty()
-    }
-
-    pub fn iter(&self) -> impl Iterator<Item = &MessageId> {
-        self.messages.iter()
-    }
-}
-
-// -- Step --
-
-/// A point in the history DAG. Records a context snapshot, parent steps,
-/// and metadata about how this context was produced.
-///
-/// Like a git commit: it captures *what* the context looks like at this point
-/// and *how* it got here (parents). The meta field carries model info, usage
-/// stats, timestamps, or any application-specific data.
-///
-/// Parent steps form a DAG:
-/// - Linear turn: one parent (the previous step)
-/// - Compaction: one parent, meta notes it was compacted
-/// - Merge: multiple parents
-/// - Root: no parents (initial context)
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Step {
-    pub id: StepId,
-    pub context: Context,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub parents: Vec<StepId>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub meta: Option<serde_json::Value>,
-}
-
-// -- Pool --
-
-/// The shared object store. Messages and steps live here, referenced by ID.
-///
-/// The pool doesn't know about sessions or files. It's a bag of objects
-/// with lookup by ID. The store layer populates it from disk and writes
-/// new objects to session files.
-pub struct Pool {
-    messages: HashMap<MessageId, Message>,
-    steps: HashMap<StepId, Step>,
-}
-
-impl Pool {
-    pub fn new() -> Self {
-        Pool {
-            messages: HashMap::new(),
-            steps: HashMap::new(),
-        }
-    }
-
-    // -- Messages --
-
-    pub fn put_message(&mut self, msg: Message) {
-        assert!(!msg.id.as_str().is_empty(), "Message ID must not be empty (role={:?})", msg.role);
-        self.messages.insert(msg.id.clone(), msg);
-    }
-
-    pub fn get_message(&self, id: &str) -> Option<&Message> {
-        self.messages.get(id)
-    }
-
-    /// Resolve an ordered list of message IDs to their messages.
-    /// Silently skips IDs not found in the pool.
-    pub fn resolve(&self, ids: &[MessageId]) -> Vec<&Message> {
-        ids.iter().filter_map(|id| self.messages.get(id)).collect()
-    }
-
-    /// Resolve a context to its messages.
-    pub fn resolve_context(&self, ctx: &Context) -> Vec<&Message> {
-        self.resolve(&ctx.messages)
-    }
-
-    pub fn message_count(&self) -> usize {
-        self.messages.len()
-    }
-
-    // -- Steps --
-
-    pub fn put_step(&mut self, step: Step) {
-        assert!(!step.id.as_str().is_empty(), "Step ID must not be empty");
-        self.steps.insert(step.id.clone(), step);
-    }
-
-    pub fn get_step(&self, id: &str) -> Option<&Step> {
-        self.steps.get(id)
-    }
-
-    pub fn step_count(&self) -> usize {
-        self.steps.len()
-    }
-
-    /// Walk parent steps from the given step ID, collecting the full
-    /// ancestry chain (breadth-first). Useful for history views.
-    pub fn step_ancestry(&self, id: &str) -> Vec<&Step> {
-        let mut visited = std::collections::HashSet::new();
-        let mut queue = std::collections::VecDeque::new();
-        let mut result = Vec::new();
-
-        queue.push_back(id.to_string());
-        while let Some(current) = queue.pop_front() {
-            if !visited.insert(current.clone()) { continue; }
-            if let Some(step) = self.steps.get(current.as_str()) {
-                result.push(step);
-                for parent_id in &step.parents {
-                    if !visited.contains(parent_id.as_str()) {
-                        queue.push_back(parent_id.to_string());
-                    }
-                }
-            }
-        }
-        result
-    }
-}
-
-impl Default for Pool {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 // -- ID generation --
 
-/// Generate a globally unique ID.
+/// Generate a globally unique ID (UUID v4, hex, no dashes).
 pub fn gen_id() -> String {
     Uuid::new_v4().simple().to_string()
-}
-
-/// Generate a session prefix from name + random suffix, used to create
-/// human-readable but unique IDs within a session file.
-pub fn gen_session_prefix(name: &str) -> String {
-    let slug: String = name.chars()
-        .filter(|c| c.is_ascii_alphanumeric())
-        .take(6)
-        .collect();
-    let rand = &Uuid::new_v4().simple().to_string()[..6];
-    if slug.is_empty() {
-        format!("s_{}", rand)
-    } else {
-        format!("{}_{}", slug, rand)
-    }
 }
 
 // -- Summarization helpers --
@@ -512,73 +326,6 @@ fn truncate_with_ellipsis(s: &str, max_chars: usize) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
-
-    #[test]
-    fn context_append_does_not_mutate_original() {
-        let c1 = Context::from_ids(vec!["a".into(), "b".into()]);
-        let c2 = c1.append("c");
-        assert_eq!(c1.len(), 2);
-        assert_eq!(c2.len(), 3);
-        assert_eq!(c2.messages, vec![MessageId::from("a"), MessageId::from("b"), MessageId::from("c")]);
-    }
-
-    #[test]
-    fn context_replace() {
-        let c1 = Context::from_ids(vec!["a".into(), "b".into(), "c".into()]);
-        let c2 = c1.replace(1, "x");
-        assert_eq!(c2.messages, vec![MessageId::from("a"), MessageId::from("x"), MessageId::from("c")]);
-        assert_eq!(c1.messages, vec![MessageId::from("a"), MessageId::from("b"), MessageId::from("c")]);
-    }
-
-    #[test]
-    fn context_without() {
-        let c1 = Context::from_ids(vec!["a".into(), "b".into(), "c".into()]);
-        let c2 = c1.without(1);
-        assert_eq!(c2.messages, vec![MessageId::from("a"), MessageId::from("c")]);
-    }
-
-    #[test]
-    fn context_subset() {
-        let c1 = Context::from_ids(vec!["a".into(), "b".into(), "c".into(), "d".into()]);
-        let c2 = c1.subset(1..3);
-        assert_eq!(c2.messages, vec![MessageId::from("b"), MessageId::from("c")]);
-    }
-
-    #[test]
-    fn pool_resolve_context() {
-        let mut pool = Pool::new();
-        pool.put_message(Message { id: "m1".into(), role: Role::User, content: vec![ContentBlock::text("hello")], meta: None });
-        pool.put_message(Message { id: "m2".into(), role: Role::Assistant, content: vec![ContentBlock::text("hi")], meta: None });
-
-        let ctx = Context::from_ids(vec!["m1".into(), "m2".into(), "m_missing".into()]);
-        let resolved = pool.resolve_context(&ctx);
-        assert_eq!(resolved.len(), 2); // m_missing silently skipped
-        assert_eq!(resolved[0].id, MessageId::from("m1"));
-        assert_eq!(resolved[1].id, MessageId::from("m2"));
-    }
-
-    #[test]
-    fn step_ancestry_linear() {
-        let mut pool = Pool::new();
-        pool.put_step(Step { id: "s1".into(), context: Context::new(), parents: vec![], meta: None });
-        pool.put_step(Step { id: "s2".into(), context: Context::new(), parents: vec!["s1".into()], meta: None });
-        pool.put_step(Step { id: "s3".into(), context: Context::new(), parents: vec!["s2".into()], meta: None });
-
-        let ancestry = pool.step_ancestry("s3");
-        let ids: Vec<&str> = ancestry.iter().map(|s| s.id.as_str()).collect();
-        assert_eq!(ids, vec!["s3", "s2", "s1"]);
-    }
-
-    #[test]
-    fn step_ancestry_merge() {
-        let mut pool = Pool::new();
-        pool.put_step(Step { id: "s1".into(), context: Context::new(), parents: vec![], meta: None });
-        pool.put_step(Step { id: "s2".into(), context: Context::new(), parents: vec![], meta: None });
-        pool.put_step(Step { id: "s3".into(), context: Context::new(), parents: vec!["s1".into(), "s2".into()], meta: None });
-
-        let ancestry = pool.step_ancestry("s3");
-        assert_eq!(ancestry.len(), 3);
-    }
 
     #[test]
     fn content_block_unknown_roundtrip() {

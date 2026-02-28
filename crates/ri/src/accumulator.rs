@@ -6,7 +6,7 @@
 
 use std::collections::HashMap;
 
-use crate::{ContentBlock, StreamEvent, Usage};
+use crate::message::{ContentBlock, StreamEvent, Usage};
 
 /// In-progress tool call being assembled from streaming deltas.
 struct PendingToolCall {

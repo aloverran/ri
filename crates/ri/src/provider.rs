@@ -1,9 +1,8 @@
-//! Core types, traits, and protocols for ri.
+//! Provider and tool contracts.
 //!
-//! Defined in the foundation crate so higher layers can program against
-//! these abstractions without depending on specific implementations.
-//! Contains: model metadata, the LLM provider trait, the tool trait,
-//! the streaming event protocol, and error types.
+//! Defines the abstractions that higher layers (ri-ai, ri-tools) implement:
+//! model metadata, the LLM provider trait, the tool trait, request/error
+//! types, and auth flow descriptions.
 
 use std::path::PathBuf;
 use std::pin::Pin;
@@ -11,7 +10,7 @@ use async_trait::async_trait;
 use futures::Stream;
 use serde::{Deserialize, Serialize};
 
-use crate::message::{Message, SessionId, Usage};
+use crate::message::{Message, SessionId, StreamEvent};
 
 // -- Model --
 
@@ -44,26 +43,6 @@ pub enum ThinkingLevel {
     High,
     #[serde(rename = "xhigh")]
     XHigh,
-}
-
-// -- Stream events --
-
-/// Normalized stream events emitted by LLM providers during response streaming.
-/// The agent loop consumes these to accumulate content blocks and detect tool calls.
-#[derive(Debug, Clone)]
-pub enum StreamEvent {
-    TextStart,
-    TextDelta(String),
-    TextEnd { sig: Option<String> },
-    ThinkingStart,
-    ThinkingDelta(String),
-    ThinkingEnd { sig: Option<String> },
-    ToolCallStart { id: String, name: String },
-    ToolCallDelta { id: String, json_fragment: String },
-    ToolCallEnd { id: String, sig: Option<String> },
-    Usage(Usage),
-    Done,
-    Error(String),
 }
 
 // -- Tools --
