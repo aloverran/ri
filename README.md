@@ -2,7 +2,7 @@
 
 BYO-coding agent. Ri is a set of Rust libraries that let you build your own Claude-code style coding agent. The idea is that instead of writing plugins and extensions to a black-box core, each person builds their own coding agent from a set of pieces.
 
-In Ri, your coding agent is just a Rust project that uses the `ri` and `ri-cli` packages. On top, you write custom Rust scripts,  terminal UI, or LLM tools, or pull from existing `ri` packages uploaded by other users to crates.io. Run your coding agent with `cargo run --release` or compile it to a binary with `cargo build --release`.
+In Ri, your coding agent is just a Rust project that uses the `ri` and `ri-tools` packages. On top, you write custom Rust scripts, terminal UI, or LLM tools, or pull from existing `ri` packages uploaded by other users to crates.io. Run your coding agent with `cargo run --release` or compile it to a binary with `cargo build --release`.
 
 Ri is heavily inspired by the `pi` project. Many thanks to `badlogic`.
 
@@ -18,11 +18,11 @@ cargo init
 
 # Philosophy:
 
-Pi has the right idea by keep a slim core, but when working with it I found that I constantly rubbed up against the friction of the extension interface. The UI isn't quite modifiable enough, I can't change how commands work, or how messages are stored. 
+Pi has the right idea by keep a slim core, but when working with it I found that I constantly rubbed up against the friction of the extension interface. The UI isn't quite modifiable enough, I can't change how commands work, or how messages are stored.
 
 Ri takes an even simpler approach: Why not make your configuration just normal Rust code? Ri has a small core that manages interacting with the LLM APIs, storing messages on disk, etc. Then you simply build the UI and tooling on top of it that you prefer.
 
-And since the configuration is just Rust code, common configuration (like a Claude Code style TUI) can simply be packages on `crates.io` that you can pull in. 
+And since the configuration is just Rust code, common configuration (like a Claude Code style TUI) can simply be packages on `crates.io` that you can pull in.
 
 Ri is heavily inspired by `pi-agent`. It has a slim core focused on 4 tools: `read`, `edit`, `write`, and `bash`. However, there are a few big differences:
 
@@ -38,20 +38,22 @@ Then restart ri.
 
 ## Message Storage
 
-Like Pi, of the things Ri provides is a file-based storage for session messages. However, the way Ri approaches storage is more like a database of messages with parent pointers. It treats the 'message' as the fundamental building block of an LLM session. Each message is just text, and is either authored (user messages, tool results) or generated (the result of an LLM call). Generated messages have `provenance`, that is they store pointers to the list of messages that defined the context for that call. 
+Ri provides a file-based storage for session history. The data model uses two kinds of objects: **messages** (pure content blobs) and **steps** (context snapshots forming a history DAG).
 
-In the simplest of chats, this is simply stored as a list of messages, however when you move to more advanced workflows (forking, editing history, compaction, summarization, cross-session communication) the message history becomes a directed graph of messages, each pointing at the set of messages it came from.
+A message is just text with a role (user, assistant, system). It carries no information about which LLM call produced it or what context it was part of. Messages live in a shared pool, referenced by globally unique IDs.
 
-This is very powerful because it means that editing the message history is a first-class operation. Here are some operations that are simple with Ri that would be complex with other tools:
-- Remove all tool calls from history.
-- Fan out 5 LLM turns with the current message history, then summarize the results into a single message and add it to the current history.
-- Query Ri: Which sessions touched this file?
+A step is like a git commit: it captures a snapshot of which messages the LLM should see (the "context") and points to parent steps. A session is like a git branch -- a named pointer to the latest step.
 
-The message history forms an immutable DAG of LLM results, each time you take a turn, a new message is appended to the bottom.
+In the simplest of chats, the history is a linear chain of steps, each adding the latest messages to the context. But because steps form a DAG, advanced workflows are natural:
+
+- **Branching**: Fork the history and explore different approaches, then merge.
+- **Compaction**: Summarize old messages into a new message, create a step with the summary replacing the originals.
+- **Cross-session**: Pull messages from another session into this one. The globally unique IDs make it work.
+- **Fan-out**: Send the same context to different models, compare results.
+- **Editing history**: Create a new step with a modified context. The old steps remain.
 
 The point of this architecture is to enable much more interesting agent session structures, even abandoning the concept of sessions at all.
 
-But of course, you can work with Ri in the standard 'chatbot' way that you'd expect. In which case, the storage just becomes a linear list of messages, as you'd expect.
+But of course, you can work with Ri in the standard 'chatbot' way that you'd expect. In which case, the storage just becomes a linear chain of steps with growing contexts.
 
 _This file was written by a human._
-

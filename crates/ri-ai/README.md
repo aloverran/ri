@@ -2,22 +2,26 @@
 
 LLM provider implementations. Turns `RequestOptions` into HTTP requests, sends them, and parses the SSE response stream into `StreamEvent`s.
 
-Currently supports Anthropic (Messages API) and Google Gemini (Cloud Code Assist API, both standard and Antigravity variants).
+Currently supports Anthropic (Messages API), Google Gemini (Cloud Code Assist API), and OpenAI Codex (ChatGPT Responses API).
 
 ## What's here
 
-**Provider enum** — `Provider::Anthropic { api_key }` and `Provider::Gemini { variant, token, project_id }`. Implements `LlmProvider` from ri. The flow is: `build_request()` produces an `ApiRequest` (url, headers, body as plain data), `http::send()` fires it and returns a byte stream, `event_stream()` wraps that in a provider-specific SSE interpreter.
+**anthropic** -- Builds Anthropic Messages API requests. Handles two auth modes: API key (`x-api-key` header) and OAuth (`Bearer` token with claude-code beta headers). For OAuth, tool names are mapped to/from Claude Code's PascalCase convention. Supports thinking configuration: adaptive mode for Opus 4.6, budget-based for other reasoning models.
 
-**anthropic** — Builds Anthropic Messages API requests. Handles two auth modes: API key (`x-api-key` header) and OAuth (`Bearer` token with claude-code beta headers). For OAuth, tool names are mapped to/from Claude Code's PascalCase convention. Supports thinking configuration: adaptive mode for Opus 4.6, budget-based for other reasoning models.
+**gemini** -- Builds Google Cloud Code Assist requests. Three variants: `Cli` (cloudcode-pa.googleapis.com), `Antigravity` (daily sandbox endpoint for Gemini 3), and `ApiKey` (generativelanguage.googleapis.com). Handles Gemini's `thoughtSignature` requirement -- tool calls from other providers without valid signatures are converted to descriptive text. Thinking levels map to Gemini's `thinkingLevel` strings for Gemini 3, or `thinkingBudget` tokens for older models.
 
-**gemini** — Builds Google Cloud Code Assist requests. Two variants: `Cli` (cloudcode-pa.googleapis.com) and `Antigravity` (daily sandbox endpoint for Gemini 3). Handles Gemini's `thoughtSignature` requirement — tool calls from other providers without valid signatures are converted to descriptive text to avoid API errors. Thinking levels map to Gemini's `thinkingLevel` strings for Gemini 3, or `thinkingBudget` tokens for older models.
+**openai_codex** -- OpenAI Codex via the ChatGPT Responses API (`chatgpt.com/backend-api/codex/responses`). OAuth2 PKCE via auth.openai.com with a local HTTP callback. Uses the Responses API format (instructions + typed input items, encrypted reasoning replay). Tool call IDs are compound (`call_id|item_id`).
 
-**sse** — Shared SSE parser used by both providers. Handles standard SSE framing (event/data fields, blank-line delimiters), partial chunks, CRLF normalization, and multi-line data. Each provider interprets the parsed `SseEvent` payloads independently.
+**turn** -- `Turn`: call a provider and accumulate the streamed response into content blocks. Thin wrapper over `LlmProvider::stream()` + `StreamAccumulator`. The fundamental "call the LLM once" building block.
 
-**http** — `send(ApiRequest) -> ByteStream`. Single function that fires a request via reqwest and returns the streaming response. Parses HTTP error responses into typed `ApiError` variants.
+**registry** -- Provider factories, model catalog, and resolution. `all_providers()`, `resolve(model_id)`, `available_model_ids()`. Code-defined, no JSON config.
 
-**auth** — OAuth flows for Anthropic and Google. `auth::anthropic` does PKCE authorization code flow against claude.ai. `auth::google` does PKCE flow with a local HTTP callback server (port 8085 for Gemini CLI, 51121 for Antigravity), including project discovery via the Cloud Code Assist API. `auth::pkce` provides the shared verifier/challenge utilities. `OAuthCredentials` holds refresh/access tokens with expiry tracking.
+**sse** -- Shared SSE parser used by all providers. Handles standard SSE framing (event/data fields, blank-line delimiters), partial chunks, CRLF normalization. Each provider interprets the parsed `SseEvent` payloads independently.
+
+**creds** -- Credential persistence. OAuth tokens stored in `~/.ri/auth.json` with per-provider sections. Refresh/access tokens with expiry tracking.
+
+**gemini_auth** -- Google OAuth PKCE flows and project discovery.
 
 ## Depends on
 
-ri. External: reqwest, tokio, serde, futures, bytes, sha2, rand, base64, chrono, uuid.
+ri. External: reqwest, tokio, serde, futures, bytes, sha2, rand, base64, chrono, uuid, async-stream.
