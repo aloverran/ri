@@ -14,71 +14,48 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-// -- ID newtypes --
+// -- ID types --
+//
+// String newtypes for message, step, and session identifiers.
+// Separate types so the compiler catches mix-ups.
 
-macro_rules! define_id {
-    ($(#[$meta:meta])* $name:ident) => {
-        $(#[$meta])*
+macro_rules! string_id {
+    ($name:ident, $doc:expr) => {
+        #[doc = $doc]
         #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
         #[serde(transparent)]
         pub struct $name(String);
 
         impl $name {
-            pub fn new(s: impl Into<String>) -> Self {
-                $name(s.into())
-            }
-
-            pub fn as_str(&self) -> &str {
-                &self.0
-            }
+            pub fn new(s: impl Into<String>) -> Self { Self(s.into()) }
+            pub fn as_str(&self) -> &str { &self.0 }
         }
 
         impl fmt::Display for $name {
-            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-                f.write_str(&self.0)
-            }
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { f.write_str(&self.0) }
         }
 
         impl AsRef<str> for $name {
-            fn as_ref(&self) -> &str {
-                &self.0
-            }
+            fn as_ref(&self) -> &str { &self.0 }
         }
 
         impl Borrow<str> for $name {
-            fn borrow(&self) -> &str {
-                &self.0
-            }
+            fn borrow(&self) -> &str { &self.0 }
         }
 
         impl From<String> for $name {
-            fn from(s: String) -> Self {
-                $name(s)
-            }
+            fn from(s: String) -> Self { Self(s) }
         }
 
         impl From<&str> for $name {
-            fn from(s: &str) -> Self {
-                $name(s.to_string())
-            }
+            fn from(s: &str) -> Self { Self(s.to_string()) }
         }
     };
 }
 
-define_id!(
-    /// Unique identifier for a message in the pool.
-    MessageId
-);
-
-define_id!(
-    /// Unique identifier for a step in the history DAG.
-    StepId
-);
-
-define_id!(
-    /// File-stem identifier for a session (e.g. "2026-02-28_120000_fix-login").
-    SessionId
-);
+string_id!(MessageId, "Unique identifier for a message in the pool.");
+string_id!(StepId, "Unique identifier for a step in the history DAG.");
+string_id!(SessionId, "File-stem identifier for a session (e.g. \"2026-02-28_120000_fix-login\").");
 
 // -- Role --
 
