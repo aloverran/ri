@@ -14,8 +14,6 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-// -- ID types --
-//
 // String newtypes for message, step, and session identifiers.
 // Separate types so the compiler catches mix-ups.
 
@@ -57,7 +55,38 @@ string_id!(MessageId, "Unique identifier for a message in the pool.");
 string_id!(StepId, "Unique identifier for a step in the history DAG.");
 string_id!(SessionId, "File-stem identifier for a session (e.g. \"2026-02-28_120000_fix-login\").");
 
-// -- Role --
+/// Immutable content blob. The atomic unit of the system.
+///
+/// Messages live in the pool and are referenced by ID from contexts.
+/// They carry no provenance -- that belongs to the Step that introduced them.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Message {
+    pub id: MessageId,
+    pub role: Role,
+    pub content: Vec<ContentBlock>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub meta: Option<serde_json::Value>,
+}
+
+impl Message {
+    /// Short human-readable summary for git-log style session views.
+    pub fn summarize(&self) -> String {
+        let role_tag = match self.role {
+            Role::System => "system",
+            Role::User => "user",
+            Role::Assistant => "assistant",
+        };
+
+        if self.content.is_empty() {
+            return format!("[{}] (empty)", role_tag);
+        }
+
+        let fixed_len = role_tag.len() + 3;
+        let content_budget = 800usize.saturating_sub(fixed_len);
+        let content_summary = summarize_blocks(&self.content, content_budget);
+        format!("[{}] {}", role_tag, content_summary)
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -66,8 +95,6 @@ pub enum Role {
     User,
     Assistant,
 }
-
-// -- Content blocks --
 
 /// A typed piece of content within a message.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -179,7 +206,21 @@ impl ContentBlock {
     }
 }
 
-// -- Stream events --
+/// Token usage from a single LLM call.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Usage {
+    #[serde(default)]
+    pub input_tokens: u64,
+    #[serde(default)]
+    pub output_tokens: u64,
+    #[serde(default)]
+    pub cache_read_tokens: u64,
+    #[serde(default)]
+    pub cache_write_tokens: u64,
+    /// Raw provider-specific usage data for debug display.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extras: Option<serde_json::Value>,
+}
 
 /// Normalized events emitted by LLM providers during response streaming.
 ///
@@ -202,67 +243,12 @@ pub enum StreamEvent {
     Error(String),
 }
 
-// -- Usage --
-
-/// Token usage from a single LLM call.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct Usage {
-    #[serde(default)]
-    pub input_tokens: u64,
-    #[serde(default)]
-    pub output_tokens: u64,
-    #[serde(default)]
-    pub cache_read_tokens: u64,
-    #[serde(default)]
-    pub cache_write_tokens: u64,
-    /// Raw provider-specific usage data for debug display.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub extras: Option<serde_json::Value>,
-}
-
-// -- Message --
-
-/// Immutable content blob. The atomic unit of the system.
-///
-/// Messages live in the pool and are referenced by ID from contexts.
-/// They carry no provenance -- that belongs to the Step that introduced them.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Message {
-    pub id: MessageId,
-    pub role: Role,
-    pub content: Vec<ContentBlock>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub meta: Option<serde_json::Value>,
-}
-
-impl Message {
-    /// Short human-readable summary for git-log style session views.
-    pub fn summarize(&self) -> String {
-        let role_tag = match self.role {
-            Role::System => "system",
-            Role::User => "user",
-            Role::Assistant => "assistant",
-        };
-
-        if self.content.is_empty() {
-            return format!("[{}] (empty)", role_tag);
-        }
-
-        let fixed_len = role_tag.len() + 3;
-        let content_budget = 800usize.saturating_sub(fixed_len);
-        let content_summary = summarize_blocks(&self.content, content_budget);
-        format!("[{}] {}", role_tag, content_summary)
-    }
-}
-
-// -- ID generation --
-
 /// Generate a globally unique ID (UUID v4, hex, no dashes).
 pub fn gen_id() -> String {
     Uuid::new_v4().simple().to_string()
 }
 
-// -- Summarization helpers --
+// Summarization helpers (private)
 
 fn summarize_blocks(blocks: &[ContentBlock], budget: usize) -> String {
     if blocks.len() == 1 {
