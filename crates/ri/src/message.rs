@@ -240,19 +240,20 @@ fn summarize_blocks(blocks: &[ContentBlock], budget: usize) -> String {
 
 fn truncate_with_ellipsis(s: &str, max_chars: usize) -> String {
     let s = s.trim();
-    if s.len() <= max_chars {
-        if s.is_ascii() {
-            return s.to_string();
-        }
+    // Fast path: for ASCII strings, byte length == char count.
+    if s.len() <= max_chars && s.is_ascii() {
+        return s.to_string();
     }
     let char_count = s.chars().count();
     if char_count <= max_chars {
         return s.to_string();
     }
     let cut: String = s.chars().take(max_chars).collect();
+    // Search the last 30 chars for a space to break at, avoiding mid-word cuts.
+    const WORD_BREAK_WINDOW: usize = 30;
     let search_start = cut.char_indices()
         .rev()
-        .nth(29)
+        .nth(WORD_BREAK_WINDOW - 1)
         .map_or(0, |(i, _)| i);
     if let Some(pos) = cut[search_start..].rfind(' ') {
         format!("{}...", &cut[..search_start + pos])
