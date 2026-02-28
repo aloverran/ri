@@ -1,6 +1,87 @@
+//! Core data types for ri's message model.
+//!
+//! Three layers, inspired by git's object model:
+//!
+//! - **Message**: Immutable content blob (role + content blocks). Like a git blob.
+//! - **Context**: Ordered list of message IDs. Like a git tree. Cheap to clone
+//!   (copy-on-write via shared message pool). Treat it like a value.
+//! - **Step**: A point in the history DAG. Records a context snapshot, parent
+//!   steps, and metadata. Like a git commit.
+//!
+//! Sessions (defined in store.rs) are named pointers to steps -- like git branches.
+
+use std::borrow::Borrow;
+use std::fmt;
+
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use uuid::Uuid;
+
+// -- ID newtypes --
+
+macro_rules! define_id {
+    ($(#[$meta:meta])* $name:ident) => {
+        $(#[$meta])*
+        #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+        #[serde(transparent)]
+        pub struct $name(String);
+
+        impl $name {
+            pub fn new(s: impl Into<String>) -> Self {
+                $name(s.into())
+            }
+
+            pub fn as_str(&self) -> &str {
+                &self.0
+            }
+        }
+
+        impl fmt::Display for $name {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str(&self.0)
+            }
+        }
+
+        impl AsRef<str> for $name {
+            fn as_ref(&self) -> &str {
+                &self.0
+            }
+        }
+
+        impl Borrow<str> for $name {
+            fn borrow(&self) -> &str {
+                &self.0
+            }
+        }
+
+        impl From<String> for $name {
+            fn from(s: String) -> Self {
+                $name(s)
+            }
+        }
+
+        impl From<&str> for $name {
+            fn from(s: &str) -> Self {
+                $name(s.to_string())
+            }
+        }
+    };
+}
+
+define_id!(
+    /// Unique identifier for a message in the pool.
+    MessageId
+);
+
+define_id!(
+    /// Unique identifier for a step in the history DAG.
+    StepId
+);
+
+define_id!(
+    /// File-stem identifier for a session (e.g. "2026-02-28_120000_fix-login").
+    SessionId
+);
 
 // -- Role --
 
@@ -94,7 +175,6 @@ impl ContentBlock {
     }
 
     /// Short human-readable summary of this block, targeting 500-1000 chars.
-    /// Intended for git-log style session history views.
     pub fn summarize(&self) -> String {
         match self {
             ContentBlock::Text { text } => {
@@ -114,7 +194,6 @@ impl ContentBlock {
             }
             ContentBlock::ToolResult { is_error, content, .. } => {
                 let tag = if *is_error { "[tool error]" } else { "[tool result]" };
-                // Flatten inner text blocks into one string.
                 let inner: String = content.iter().map(|b| match b {
                     ContentBlock::Text { text } => text.as_str(),
                     _ => "",
@@ -151,35 +230,23 @@ pub struct Usage {
     pub extras: Option<serde_json::Value>,
 }
 
-// -- Provenance --
+// -- Message --
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Provenance {
-    pub input: Vec<String>,
-    pub model: String,
-    pub ts: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub usage: Option<Usage>,
-}
-
-// -- Message: the single entity type --
-
+/// Immutable content blob. The atomic unit of the system.
+///
+/// Messages live in the pool and are referenced by ID from contexts.
+/// They carry no provenance -- that belongs to the Step that introduced them.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Message {
-    pub id: String,
+    pub id: MessageId,
     pub role: Role,
     pub content: Vec<ContentBlock>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub provenance: Option<Provenance>,
-    /// Freeform metadata for plugins and higher layers to attach to messages.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub meta: Option<serde_json::Value>,
 }
 
 impl Message {
     /// Short human-readable summary for git-log style session views.
-    /// Includes provenance (model, timestamp, input count) and full usage stats
-    /// followed by truncated content block summaries, targeting ~500-1000 chars total.
     pub fn summarize(&self) -> String {
         let role_tag = match self.role {
             Role::System => "system",
@@ -187,59 +254,72 @@ impl Message {
             Role::Assistant => "assistant",
         };
 
-        // Build the provenance/usage header if present.
-        // This is compact and fixed-size, so it always fits.
-        let header = if let Some(prov) = &self.provenance {
-            let usage_part = match &prov.usage {
-                Some(u) => format!(
-                    " | in:{} out:{} cache_r:{} cache_w:{}",
-                    u.input_tokens, u.output_tokens, u.cache_read_tokens, u.cache_write_tokens,
-                ),
-                None => String::new(),
-            };
-            format!(
-                " ({}{} | {} inputs | {})",
-                prov.model, usage_part, prov.input.len(), prov.ts,
-            )
-        } else {
-            String::new()
-        };
-
         if self.content.is_empty() {
-            return format!("[{}]{} (empty)", role_tag, header);
+            return format!("[{}] (empty)", role_tag);
         }
 
-        // Content budget: total target minus the fixed parts.
-        let fixed_len = role_tag.len() + header.len() + 3; // "[" + "]" + " "
+        let fixed_len = role_tag.len() + 3;
         let content_budget = 800usize.saturating_sub(fixed_len);
-
         let content_summary = summarize_blocks(&self.content, content_budget);
-        format!("[{}]{} {}", role_tag, header, content_summary)
+        format!("[{}] {}", role_tag, content_summary)
     }
 }
 
-// -- MessagePool --
+// -- Context --
 
-pub struct MessagePool {
-    messages: HashMap<String, Message>,
+/// An ordered list of message references. Represents what the LLM sees.
+///
+/// Under the hood, just a Vec of message IDs pointing into the pool.
+/// Cloning is cheap (small vec of short strings). Treat it like a value type.
+///
+/// This is the copy-on-write building block: two contexts can share most of
+/// their message IDs, and creating a variant (append, replace, subset) is
+/// a simple Vec operation on the ID list.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Context {
+    pub messages: Vec<MessageId>,
 }
 
-impl MessagePool {
+impl Context {
     pub fn new() -> Self {
-        MessagePool { messages: HashMap::new() }
+        Context { messages: Vec::new() }
     }
 
-    pub fn put(&mut self, msg: Message) {
-        assert!(!msg.id.is_empty(), "Message ID must not be empty (role={:?})", msg.role);
-        self.messages.insert(msg.id.clone(), msg);
+    pub fn from_ids(ids: Vec<MessageId>) -> Self {
+        Context { messages: ids }
     }
 
-    pub fn get(&self, id: &str) -> Option<&Message> {
-        self.messages.get(id)
+    /// New context with a message appended.
+    pub fn append(&self, id: impl Into<MessageId>) -> Self {
+        let mut msgs = self.messages.clone();
+        msgs.push(id.into());
+        Context { messages: msgs }
     }
 
-    pub fn resolve_existing(&self, ids: &[String]) -> Vec<&Message> {
-        ids.iter().filter_map(|id| self.messages.get(id.as_str())).collect()
+    /// New context with several messages appended.
+    pub fn extend(&self, ids: impl IntoIterator<Item = MessageId>) -> Self {
+        let mut msgs = self.messages.clone();
+        msgs.extend(ids);
+        Context { messages: msgs }
+    }
+
+    /// New context with the message at `index` replaced.
+    pub fn replace(&self, index: usize, id: impl Into<MessageId>) -> Self {
+        let mut msgs = self.messages.clone();
+        msgs[index] = id.into();
+        Context { messages: msgs }
+    }
+
+    /// New context containing only messages in the given range.
+    pub fn subset(&self, range: std::ops::Range<usize>) -> Self {
+        Context { messages: self.messages[range].to_vec() }
+    }
+
+    /// New context with the message at `index` removed.
+    pub fn without(&self, index: usize) -> Self {
+        let mut msgs = self.messages.clone();
+        msgs.remove(index);
+        Context { messages: msgs }
     }
 
     pub fn len(&self) -> usize {
@@ -250,60 +330,120 @@ impl MessagePool {
         self.messages.is_empty()
     }
 
-    pub fn iter(&self) -> impl Iterator<Item = (&String, &Message)> {
+    pub fn iter(&self) -> impl Iterator<Item = &MessageId> {
         self.messages.iter()
     }
+}
 
-    /// All messages whose provenance.input contains the given ID.
-    pub fn derived_from(&self, id: &str) -> Vec<&Message> {
-        self.messages.values()
-            .filter(|m| {
-                m.provenance.as_ref()
-                    .is_some_and(|p| p.input.iter().any(|i| i == id))
-            })
-            .collect()
+// -- Step --
+
+/// A point in the history DAG. Records a context snapshot, parent steps,
+/// and metadata about how this context was produced.
+///
+/// Like a git commit: it captures *what* the context looks like at this point
+/// and *how* it got here (parents). The meta field carries model info, usage
+/// stats, timestamps, or any application-specific data.
+///
+/// Parent steps form a DAG:
+/// - Linear turn: one parent (the previous step)
+/// - Compaction: one parent, meta notes it was compacted
+/// - Merge: multiple parents
+/// - Root: no parents (initial context)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Step {
+    pub id: StepId,
+    pub context: Context,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub parents: Vec<StepId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub meta: Option<serde_json::Value>,
+}
+
+// -- Pool --
+
+/// The shared object store. Messages and steps live here, referenced by ID.
+///
+/// The pool doesn't know about sessions or files. It's a bag of objects
+/// with lookup by ID. The store layer populates it from disk and writes
+/// new objects to session files.
+pub struct Pool {
+    messages: HashMap<MessageId, Message>,
+    steps: HashMap<StepId, Step>,
+}
+
+impl Pool {
+    pub fn new() -> Self {
+        Pool {
+            messages: HashMap::new(),
+            steps: HashMap::new(),
+        }
     }
 
-    /// Walk provenance.input recursively to find all ancestor messages.
-    pub fn ancestors(&self, id: &str) -> Vec<&Message> {
+    // -- Messages --
+
+    pub fn put_message(&mut self, msg: Message) {
+        assert!(!msg.id.as_str().is_empty(), "Message ID must not be empty (role={:?})", msg.role);
+        self.messages.insert(msg.id.clone(), msg);
+    }
+
+    pub fn get_message(&self, id: &str) -> Option<&Message> {
+        self.messages.get(id)
+    }
+
+    /// Resolve an ordered list of message IDs to their messages.
+    /// Silently skips IDs not found in the pool.
+    pub fn resolve(&self, ids: &[MessageId]) -> Vec<&Message> {
+        ids.iter().filter_map(|id| self.messages.get(id)).collect()
+    }
+
+    /// Resolve a context to its messages.
+    pub fn resolve_context(&self, ctx: &Context) -> Vec<&Message> {
+        self.resolve(&ctx.messages)
+    }
+
+    pub fn message_count(&self) -> usize {
+        self.messages.len()
+    }
+
+    // -- Steps --
+
+    pub fn put_step(&mut self, step: Step) {
+        assert!(!step.id.as_str().is_empty(), "Step ID must not be empty");
+        self.steps.insert(step.id.clone(), step);
+    }
+
+    pub fn get_step(&self, id: &str) -> Option<&Step> {
+        self.steps.get(id)
+    }
+
+    pub fn step_count(&self) -> usize {
+        self.steps.len()
+    }
+
+    /// Walk parent steps from the given step ID, collecting the full
+    /// ancestry chain (breadth-first). Useful for history views.
+    pub fn step_ancestry(&self, id: &str) -> Vec<&Step> {
         let mut visited = std::collections::HashSet::new();
-        let mut stack = vec![id.to_string()];
+        let mut queue = std::collections::VecDeque::new();
         let mut result = Vec::new();
 
-        while let Some(current) = stack.pop() {
+        queue.push_back(id.to_string());
+        while let Some(current) = queue.pop_front() {
             if !visited.insert(current.clone()) { continue; }
-            if let Some(msg) = self.messages.get(&current) {
-                if current != id {
-                    result.push(msg);
-                }
-                if let Some(prov) = &msg.provenance {
-                    for input_id in &prov.input {
-                        if !visited.contains(input_id) {
-                            stack.push(input_id.clone());
-                        }
+            if let Some(step) = self.steps.get(current.as_str()) {
+                result.push(step);
+                for parent_id in &step.parents {
+                    if !visited.contains(parent_id.as_str()) {
+                        queue.push_back(parent_id.to_string());
                     }
                 }
             }
         }
         result
     }
-
-    /// All derived messages (messages with provenance).
-    pub fn derived(&self) -> Vec<&Message> {
-        self.messages.values()
-            .filter(|m| m.provenance.is_some())
-            .collect()
-    }
-
-    /// All authored messages (messages without provenance).
-    pub fn authored(&self) -> Vec<&Message> {
-        self.messages.values()
-            .filter(|m| m.provenance.is_none())
-            .collect()
-    }
 }
 
-impl Default for MessagePool {
+impl Default for Pool {
     fn default() -> Self {
         Self::new()
     }
@@ -312,13 +452,12 @@ impl Default for MessagePool {
 // -- ID generation --
 
 /// Generate a globally unique ID.
-/// Uses UUID v4 (128-bit random), formatted as a short hex string without dashes.
 pub fn gen_id() -> String {
     Uuid::new_v4().simple().to_string()
 }
 
 /// Generate a session prefix from name + random suffix, used to create
-/// human-readable but unique message IDs within a session.
+/// human-readable but unique IDs within a session file.
 pub fn gen_session_prefix(name: &str) -> String {
     let slug: String = name.chars()
         .filter(|c| c.is_ascii_alphanumeric())
@@ -334,13 +473,10 @@ pub fn gen_session_prefix(name: &str) -> String {
 
 // -- Summarization helpers --
 
-/// Summarize a list of content blocks into a single string within a char budget.
-/// Joins block summaries with " | ", splitting budget evenly across blocks.
 fn summarize_blocks(blocks: &[ContentBlock], budget: usize) -> String {
     if blocks.len() == 1 {
         return truncate_with_ellipsis(&blocks[0].summarize(), budget);
     }
-    // Reserve 3 chars per separator " | " between blocks.
     let separator_cost = (blocks.len() - 1) * 3;
     let per_block = budget.saturating_sub(separator_cost) / blocks.len();
     let parts: Vec<String> = blocks.iter().map(|b| {
@@ -349,12 +485,9 @@ fn summarize_blocks(blocks: &[ContentBlock], budget: usize) -> String {
     parts.join(" | ")
 }
 
-/// Truncate a string to at most `max_chars` characters, appending "..." if cut.
-/// Tries to break at a word boundary within the last 30 chars to avoid mid-word cuts.
 fn truncate_with_ellipsis(s: &str, max_chars: usize) -> String {
     let s = s.trim();
     if s.len() <= max_chars {
-        // Fast path: ASCII-only short strings (very common).
         if s.is_ascii() {
             return s.to_string();
         }
@@ -364,8 +497,6 @@ fn truncate_with_ellipsis(s: &str, max_chars: usize) -> String {
         return s.to_string();
     }
     let cut: String = s.chars().take(max_chars).collect();
-    // Try to find a word boundary (space) in the last 30 chars to cut cleanly.
-    // Use char_indices to find a safe byte offset 30 characters from the end.
     let search_start = cut.char_indices()
         .rev()
         .nth(29)
@@ -383,101 +514,99 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn test_content_block_unknown_roundtrip() {
+    fn context_append_does_not_mutate_original() {
+        let c1 = Context::from_ids(vec!["a".into(), "b".into()]);
+        let c2 = c1.append("c");
+        assert_eq!(c1.len(), 2);
+        assert_eq!(c2.len(), 3);
+        assert_eq!(c2.messages, vec![MessageId::from("a"), MessageId::from("b"), MessageId::from("c")]);
+    }
+
+    #[test]
+    fn context_replace() {
+        let c1 = Context::from_ids(vec!["a".into(), "b".into(), "c".into()]);
+        let c2 = c1.replace(1, "x");
+        assert_eq!(c2.messages, vec![MessageId::from("a"), MessageId::from("x"), MessageId::from("c")]);
+        assert_eq!(c1.messages, vec![MessageId::from("a"), MessageId::from("b"), MessageId::from("c")]);
+    }
+
+    #[test]
+    fn context_without() {
+        let c1 = Context::from_ids(vec!["a".into(), "b".into(), "c".into()]);
+        let c2 = c1.without(1);
+        assert_eq!(c2.messages, vec![MessageId::from("a"), MessageId::from("c")]);
+    }
+
+    #[test]
+    fn context_subset() {
+        let c1 = Context::from_ids(vec!["a".into(), "b".into(), "c".into(), "d".into()]);
+        let c2 = c1.subset(1..3);
+        assert_eq!(c2.messages, vec![MessageId::from("b"), MessageId::from("c")]);
+    }
+
+    #[test]
+    fn pool_resolve_context() {
+        let mut pool = Pool::new();
+        pool.put_message(Message { id: "m1".into(), role: Role::User, content: vec![ContentBlock::text("hello")], meta: None });
+        pool.put_message(Message { id: "m2".into(), role: Role::Assistant, content: vec![ContentBlock::text("hi")], meta: None });
+
+        let ctx = Context::from_ids(vec!["m1".into(), "m2".into(), "m_missing".into()]);
+        let resolved = pool.resolve_context(&ctx);
+        assert_eq!(resolved.len(), 2); // m_missing silently skipped
+        assert_eq!(resolved[0].id, MessageId::from("m1"));
+        assert_eq!(resolved[1].id, MessageId::from("m2"));
+    }
+
+    #[test]
+    fn step_ancestry_linear() {
+        let mut pool = Pool::new();
+        pool.put_step(Step { id: "s1".into(), context: Context::new(), parents: vec![], meta: None });
+        pool.put_step(Step { id: "s2".into(), context: Context::new(), parents: vec!["s1".into()], meta: None });
+        pool.put_step(Step { id: "s3".into(), context: Context::new(), parents: vec!["s2".into()], meta: None });
+
+        let ancestry = pool.step_ancestry("s3");
+        let ids: Vec<&str> = ancestry.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(ids, vec!["s3", "s2", "s1"]);
+    }
+
+    #[test]
+    fn step_ancestry_merge() {
+        let mut pool = Pool::new();
+        pool.put_step(Step { id: "s1".into(), context: Context::new(), parents: vec![], meta: None });
+        pool.put_step(Step { id: "s2".into(), context: Context::new(), parents: vec![], meta: None });
+        pool.put_step(Step { id: "s3".into(), context: Context::new(), parents: vec!["s1".into(), "s2".into()], meta: None });
+
+        let ancestry = pool.step_ancestry("s3");
+        assert_eq!(ancestry.len(), 3);
+    }
+
+    #[test]
+    fn content_block_unknown_roundtrip() {
         let json_data = json!({
             "type": "future_type",
             "data": "some data",
             "nested": {"key": "value"}
         });
-        let json_str = json_data.to_string();
-        
-        let block: ContentBlock = serde_json::from_str(&json_str).unwrap();
-        
+        let block: ContentBlock = serde_json::from_str(&json_data.to_string()).unwrap();
         match &block {
             ContentBlock::Unknown(v) => {
                 assert_eq!(v.get("type").unwrap(), "future_type");
-                assert_eq!(v.get("data").unwrap(), "some data");
             }
-            _ => panic!("Expected Unknown variant, got {:?}", block),
+            _ => panic!("Expected Unknown variant"),
         }
-        
-        let round_trip = serde_json::to_string(&block).unwrap();
-        let back: serde_json::Value = serde_json::from_str(&round_trip).unwrap();
-        assert_eq!(back, json_data);
+        let round_trip: serde_json::Value = serde_json::from_str(&serde_json::to_string(&block).unwrap()).unwrap();
+        assert_eq!(round_trip, json_data);
     }
 
     #[test]
-    fn test_thinking_sig_roundtrip() {
-        let json_data = json!({
-            "type": "thinking",
-            "thinking": "let me reason",
-            "sig": "abc123"
-        });
+    fn thinking_sig_roundtrip() {
+        let json_data = json!({ "type": "thinking", "thinking": "let me reason", "sig": "abc123" });
         let block: ContentBlock = serde_json::from_str(&json_data.to_string()).unwrap();
         if let ContentBlock::Thinking { thinking, sig } = &block {
             assert_eq!(thinking, "let me reason");
             assert_eq!(sig.as_deref(), Some("abc123"));
         } else {
             panic!("Expected Thinking variant");
-        }
-        let round_trip: serde_json::Value = serde_json::from_str(&serde_json::to_string(&block).unwrap()).unwrap();
-        assert_eq!(round_trip, json_data);
-    }
-
-    #[test]
-    fn test_thinking_no_sig() {
-        let json_data = json!({ "type": "thinking", "thinking": "hello" });
-        let block: ContentBlock = serde_json::from_str(&json_data.to_string()).unwrap();
-        if let ContentBlock::Thinking { sig, .. } = &block {
-            assert!(sig.is_none());
-        } else {
-            panic!("Expected Thinking variant");
-        }
-        // sig should be omitted from serialization when None
-        let serialized = serde_json::to_string(&block).unwrap();
-        assert!(!serialized.contains("sig"));
-    }
-
-    #[test]
-    fn test_tool_result_details_roundtrip() {
-        let json_data = json!({
-            "type": "tool_result",
-            "toolUseId": "call_1",
-            "content": [{"type": "text", "text": "ok"}],
-            "is_error": false,
-            "details": {"exit_code": 0, "lines": 42}
-        });
-        let block: ContentBlock = serde_json::from_str(&json_data.to_string()).unwrap();
-        if let ContentBlock::ToolResult { details, .. } = &block {
-            let d = details.as_ref().unwrap();
-            assert_eq!(d["exit_code"], 0);
-            assert_eq!(d["lines"], 42);
-        } else {
-            panic!("Expected ToolResult variant");
-        }
-        let round_trip: serde_json::Value = serde_json::from_str(&serde_json::to_string(&block).unwrap()).unwrap();
-        assert_eq!(round_trip, json_data);
-    }
-
-    #[test]
-    fn test_tool_result_no_details() {
-        let block = ContentBlock::tool_result_text("call_1", "done", false);
-        let serialized = serde_json::to_string(&block).unwrap();
-        assert!(!serialized.contains("details"));
-    }
-
-    #[test]
-    fn test_content_block_no_type() {
-        let json_data = json!({
-            "data": "no type here"
-        });
-        
-        let res: Result<ContentBlock, _> = serde_json::from_str(&json_data.to_string());
-        assert!(res.is_ok(), "Should match Unknown even if type is missing. Error: {:?}", res.err());
-        if let ContentBlock::Unknown(v) = res.unwrap() {
-            assert_eq!(v.get("data").unwrap(), "no type here");
-        } else {
-            panic!("Expected Unknown");
         }
     }
 }

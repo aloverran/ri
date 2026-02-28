@@ -10,11 +10,11 @@ pub type JsonMap = HashMap<String, serde_json::Value>;
 
 // Top-level re-exports for convenience.
 pub use message::{
-    gen_id, ContentBlock, Message, MessagePool, Provenance, Role, Usage,
+    gen_id, ContentBlock, Context, Message, MessageId, Pool, Role, SessionId, Step, StepId, Usage,
 };
 pub use types::{
     ApiError, AuthMethod, EventStream, LlmProvider, Model, ModelCost, RequestOptions,
     StreamEvent, ThinkingLevel, Tool, ToolContext, ToolOutput, ToolSchema,
 };
 pub use accumulator::StreamAccumulator;
-pub use store::{SessionStore, SessionHeader};
+pub use store::{Store, Session, SessionHeader};

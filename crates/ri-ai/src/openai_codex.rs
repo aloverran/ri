@@ -493,7 +493,7 @@ fn derive_prompt_cache_key(messages: &[Message]) -> Option<String> {
         .iter()
         .find(|m| m.role != Role::System)
         .or_else(|| messages.first())
-        .map(|m| m.id.clone())
+        .map(|m| m.id.to_string())
 }
 
 // -- Message conversion (ri messages -> Responses API input) --

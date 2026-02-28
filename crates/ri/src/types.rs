@@ -11,7 +11,7 @@ use async_trait::async_trait;
 use futures::Stream;
 use serde::{Deserialize, Serialize};
 
-use crate::message::{Message, Usage};
+use crate::message::{Message, SessionId, Usage};
 
 // -- Model --
 
@@ -92,7 +92,7 @@ pub struct ToolOutput {
 pub struct ToolContext {
     pub cwd: PathBuf,
     /// File-stem ID of the session that invoked this tool, if known.
-    pub session_id: Option<String>,
+    pub session_id: Option<SessionId>,
 }
 
 /// A tool the agent can invoke. Provides schema (for the LLM API)
