@@ -6,7 +6,7 @@ pub mod stream;
 
 // Top-level re-exports for convenience.
 pub use model::{
-    gen_id, ContentBlock, Context, Message, MessageId, Role, SessionId, Step, StepId, Usage,
+    gen_id, ContentBlock, Context, ContextId, Message, MessageId, Role, SessionId, Usage,
 };
 pub use stream::StreamEvent;
 pub use provider::{

@@ -14,17 +14,15 @@ f(Vec<Message>) -> Response
 
 Every call is independent. The API has no memory. All "memory" is in the caller's hands -- it's whatever the caller chooses to put in `Vec<Message>`.
 
-The fundamental building blocks are **messages** (immutable content blobs) and **contexts** (ordered selections of messages -- what the LLM sees). Messages live in a shared pool. A context resolved against the pool gives you `Vec<Message>`, which is what you hand to the LLM.
+The fundamental building blocks are **messages** (immutable content blobs) and **contexts** (immutable objects -- an ordered list of message references, parent links, and metadata). Messages live in a shared pool. A context resolved against the pool gives you `Vec<Message>`, which is what you hand to the LLM.
 
-A **step** records a context at a point in the history DAG: it's a context + provenance (parent links + metadata). Like a git commit is a tree + parents. Steps track how the context *evolved over time*; the context itself is what matters to the LLM.
-
-"Running a turn" is just: assemble a context, resolve it to messages from the pool, call the LLM, and the output is a new message added back to the pool. Record a new step capturing the updated context. The pool grows. You compose the next call by selecting from the pool again.
+Contexts form a DAG through their parent links. "Running a turn" is: resolve a context's messages, call the LLM, add the output as a new message, and create a new context with the updated message list. The system is just messages, contexts, and the algebra on them.
 
 ## Data model
 
 ### Messages
 
-A message is an immutable content blob (role + content blocks) that lives in the pool. Messages are context-free -- they carry no information about which LLM call produced them or what context they were part of. That information lives in steps.
+A message is an immutable content blob (role + content blocks) that lives in the pool. Messages are context-free -- they carry no information about which LLM call produced them or what context they were part of.
 
 Every message has:
 
@@ -33,99 +31,85 @@ Every message has:
 - **content**: array of typed content blocks (text, thinking, image, tool_use, tool_result, error)
 - **meta**: optional open object for application-defined metadata
 
-Messages are authored (by humans, tools, or code) or derived (produced by an LLM call). Both are the same type -- the distinction, when it matters, is tracked by the step that introduced them.
+Messages are authored (by humans, tools, or code) or derived (produced by an LLM call). Both are the same type.
 
 ### Contexts
 
-A context is an ordered list of message references -- what the LLM sees. It's the second primitive alongside Message: you need messages (the content) and a context (which messages, in what order) to make an LLM call. Nothing more.
+A context is an immutable object: an ordered list of message references, parent links, and metadata. It's the second primitive alongside Message.
 
 ```rust
 pub struct Context {
+    pub id: ContextId,
     pub messages: Vec<MessageId>,
+    pub parents: Vec<ContextId>,
+    pub meta: Option<serde_json::Value>,
 }
 ```
 
-Contexts are value types. They don't have independent identity (no ContextId). A context either lives inside a step (recording what the LLM saw at that point in history) or exists as mutable working state in an agent loop. This matches git exactly: you rarely interact with tree objects directly, but every commit contains one.
-
-### Steps
-
-A step is a context + provenance. It records what the LLM sees at a point in the history DAG, and how it got there.
-
-Every step has:
-
-- **id**: globally unique identifier (`StepId` newtype)
-- **context**: the context snapshot -- exactly what the LLM would see
-- **parents**: zero or more parent step IDs (the DAG edges)
-- **meta**: optional open object (model info, usage, timestamps, thinking level)
-
-Steps are immutable once written. The context is the complete picture -- no chain-walking needed to reconstruct what the LLM saw.
+Contexts form a DAG through their parent links. Resolved against the pool, `messages` gives you `Vec<Message>` -- what you hand to the LLM. A context is a freestanding immutable object. The system is just contexts and the operations that create new ones from old ones.
 
 ### Sessions
 
-A session is a named pointer to a step. Like a git branch, it tells you where you are in the history.
+A session is a named pointer to a context. Like a git branch, it tells you where you are in the history.
 
 Every session has:
 
 - **name**: human-readable label (e.g. "fix-login")
 - **file_id**: the `SessionId` that locates the session file on disk
-- **head**: the `StepId` this session currently points to
+- **head**: the `ContextId` this session currently points to
 - **cwd**: the working directory associated with this session
 - **parent**: optional parent session ID (for sub-agent sessions)
 - **ts**: creation timestamp
 
-Sessions advance by writing new steps and moving the head pointer. This is an atomic append operation (append step line + head line to the JSONL file).
+Sessions advance by writing new contexts and moving the head pointer. This is an atomic append operation (append context line + head line to the JSONL file).
 
 ### The git analogy
+
+A useful reference point, though ri's model is its own thing:
 
 | Git | ri |
 |-----|----|
 | Blob | Message |
-| Tree | Context |
-| Commit | Step |
+| Commit | Context |
 | Branch | Session |
 | Repository | Pool + Store |
 
-A git blob is pure content. A tree is a snapshot of which blobs exist. A commit captures a tree and points to parent commits. A branch is a pointer to a commit. ri follows the same pattern: content is separate from history, and history is a DAG of snapshots.
+The key similarity is that content (messages/blobs) is separate from structure (contexts/commits), and structure forms a DAG. The key difference is that ri's model is simpler -- there's no separate Tree object, just two types and a pointer.
 
 ## Why this model
 
 ### Messages and contexts are the two primitives
 
-You need exactly two things to call an LLM: messages (content) and a context (which messages, in what order). Everything else in ri -- steps, sessions, the DAG, persistence -- is machinery for managing how contexts evolve over time.
+You need exactly two things to call an LLM: messages (content) and a context (which messages, in what order). Everything else in ri -- sessions, the DAG, persistence -- is just algebra on these two types.
 
-By keeping messages as pure content blobs and contexts as simple ordered selections, composition is free:
+By keeping messages as pure content blobs and contexts as freestanding immutable objects, composition is free:
 
 - **Reuse**: Pull any message into any context. A summary from session A works in session B's context. The message doesn't "know" where it came from.
-- **Compaction**: Summarize old messages into a new message. Use it instead of the originals. No provenance to update.
-- **Fan-out**: Send the same context to different models. Each produces a new message. Pick the best. The messages don't carry model-specific baggage.
-
-### Steps track the evolution
-
-The history of *how* the context changed lives in steps, not messages. This separation means:
-
-- **Branching**: Fork the history by creating two steps with the same parent but different contexts. Like branching in git.
-- **Checkpointing**: After each agent turn, record a step. On reload, jump straight to the head step's context -- no replay needed.
-- **Merging**: Create a step whose context combines messages from different branches. The step records the merge; the messages don't change.
+- **Compaction**: Summarize old messages into a new message. Create a new context with the summary replacing the originals.
+- **Fan-out**: Send the same context to different models. Each produces a new message. Pick the best.
+- **Branching**: Create two contexts with the same parent but different message lists.
+- **Checkpointing**: After each agent turn, create a new context. On reload, jump straight to the head context's messages -- no replay needed.
+- **Merging**: Create a context whose message list combines messages from different branches.
 
 ## The pool
 
-The pool is the in-memory store. Messages and steps live here, referenced by ID.
+The pool is the in-memory object store. Messages and contexts live here, referenced by ID.
 
 ```rust
 pub struct Pool {
     messages: HashMap<MessageId, Message>,
-    steps: HashMap<StepId, Step>,
+    contexts: HashMap<ContextId, Context>,
 }
 ```
 
 Core operations:
 
 - `get_message(id)` -- retrieve a message by ID
-- `get_step(id)` -- retrieve a step by ID
+- `get_context(id)` -- retrieve a context by ID
 - `resolve(ids)` -- resolve an ordered list of message IDs to their messages
 - `resolve_context(ctx)` -- resolve a Context to its messages
 - `put_message(msg)` -- add a message (crate-internal)
-- `put_step(step)` -- add a step (crate-internal)
+- `put_context(ctx)` -- add a context (crate-internal)
 
 The pool doesn't know about sessions, files, or agents. It's a bag of objects with lookup by ID. The `Store` layer populates it from disk and writes new objects to session files.
 
@@ -145,26 +129,26 @@ Each file contains five line types:
 
 1. **Session header** (first line): `{"session": "name", "ts": "...", "cwd": "..."}`
 2. **Message lines**: `{"msg": "m1", "role": "user", "content": [...]}`
-3. **Step lines**: `{"step": "s1", "context": ["m1", "m2"], "parents": ["s0"]}`
-4. **Head updates**: `{"head": "s1"}` -- the last one wins
+3. **Context lines**: `{"context": "c1", "messages": ["m1", "m2"], "parents": ["c0"]}`
+4. **Head updates**: `{"head": "c1"}` -- the last one wins
 5. **Title updates**: `{"title": "Fix login crash"}` -- the last one wins
 
-The session's current state is fully determined by the last `{"head": ...}` line. On reload, follow head -> step -> context -> messages. No replay of the full history needed.
+The session's current state is fully determined by the last `{"head": ...}` line. On reload, follow head -> context -> messages. No replay of the full history needed.
 
 ### Loading
 
-On startup, the Store scans all session files and loads every message and step into the pool. Sessions are registered from their headers and head pointers. This is fast -- a year of heavy use produces manageable JSONL volumes that load in under a second.
+On startup, the Store scans all session files and loads every message and context into the pool. Sessions are registered from their headers and head pointers. This is fast -- a year of heavy use produces manageable JSONL volumes that load in under a second.
 
 ### Writing
 
-New messages are appended as `{"msg": ...}` lines. New steps are appended as `{"step": ...}` + `{"head": ...}` pairs. Append-only means crash safety: partial writes only affect the last line.
+New messages are appended as `{"msg": ...}` lines. New contexts are appended as `{"context": ...}` + `{"head": ...}` pairs. Append-only means crash safety: partial writes only affect the last line.
 
 ## Architecture layers
 
 ```
 Layer 0: Foundation (ri)
-  - model: Message, Context, Step (the data model)
-    - MessageId, StepId, SessionId, Role, ContentBlock, Usage
+  - model: Message, Context (the data model)
+    - MessageId, ContextId, SessionId, Role, ContentBlock, Usage
   - store: Pool, Store, Session, SessionHeader (persistence)
   - provider: Model, ThinkingLevel, ModelCost
     - LlmProvider trait, RequestOptions, ApiError
@@ -208,7 +192,7 @@ ri/                          # Workspace root
 
 The foundation crate. Everything the rest of the system depends on:
 
-- `model` -- `Message`, `Context`, `Step` (the core data model), `Role`, `ContentBlock`, `Usage`, `MessageId`, `StepId`, `SessionId`, `gen_id()`
+- `model` -- `Message`, `Context` (the core data model), `Role`, `ContentBlock`, `Usage`, `MessageId`, `ContextId`, `SessionId`, `gen_id()`
 - `store` -- `Pool`, `Store`, `Session`, `SessionHeader` (persistence and filing)
 - `stream` -- `StreamEvent` (normalized incremental events from any provider)
 - `accumulator` -- `StreamAccumulator` (pure state machine: `StreamEvent` -> `ContentBlock` + `Usage`)
@@ -273,35 +257,35 @@ The agent loop is application code, not infrastructure. It lives in ri-cli and r
    a. Execute each tool
    b. Write tool results as a user message
    c. Go to step 2
-8. If no tool calls: checkpoint the context as a new step, done
+8. If no tool calls: checkpoint as a new context, done
 ```
 
 ri-cli's loop returns `impl Stream<Item = AgentEvent>` (one consumer: the TUI/print/RPC handler). ri-web's loop broadcasts through `tokio::sync::broadcast` (multiple SSE consumers). Both are application code composing the same building blocks. The divergence is intentional -- different output shapes for different consumers.
 
-## Context strategy examples
+## Context algebra examples
 
-The step model makes context manipulation first-class. The current strategy is simple (include all session messages in order), but the architecture supports:
+The model makes context manipulation first-class. The current strategy is simple (include all session messages in order), but the architecture supports:
 
 ### Compacting
-Track approximate token usage. When approaching the budget, summarize old messages into a new message, create a new step with the summary replacing the originals.
+Track approximate token usage. When approaching the budget, summarize old messages into a new message, create a new context with the summary replacing the originals.
 
 ### Cross-session
-Pull messages from another session's pool into this session's context. Create a step that references messages from both. The globally unique IDs make this work -- no special cross-session machinery needed.
+Pull messages from another session's pool into a new context. The globally unique IDs make this work -- no special cross-session machinery needed.
 
 ### Branching
-Create two steps with the same parent but different contexts. Explore different approaches, then merge by creating a step that combines insights from both branches.
+Create two contexts with the same parent but different message lists. Explore different approaches, then merge by creating a context that combines insights from both.
 
 ## Error handling
 
 **Crash during write**: Each line is appended independently. Partial writes only affect the last line. On next load: skip malformed lines. All previous objects are intact.
 
-**LLM call failure**: If the call fails, an error content block is written to the assistant message. The step is still checkpointed so the session state is consistent.
+**LLM call failure**: If the call fails, an error content block is written to the assistant message. The context is still checkpointed so the session state is consistent.
 
 **Tool execution failure**: Tool errors produce `tool_result` content blocks with `is_error: true`. This is a normal message -- the LLM sees the error and reacts.
 
 ## What's NOT in this design
 
 - **Extensions / plugins**: Not in v1. The extension point is "write Rust code in your own ri project."
-- **Multi-model orchestration**: Each Turn uses one model. Multi-model workflows are multiple messages with different provenance in their step metadata.
+- **Multi-model orchestration**: Each Turn uses one model. Multi-model workflows are multiple messages with different provenance in their context metadata.
 - **Full-text search**: Grep across session files is sufficient at this scale.
 - **Encryption / access control**: Not needed. Single-user, personal machine.

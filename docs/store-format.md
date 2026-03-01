@@ -2,7 +2,7 @@
 
 ## Overview
 
-The ri store is a pool of messages and steps persisted as JSONL files. Each file groups related objects by session. The pool is the logical model; files are the physical organization.
+The ri store is a pool of messages and contexts persisted as JSONL files. Each file groups related objects by session. The pool is the logical model; files are the physical organization.
 
 **Location**: `~/.ri/sessions/`
 
@@ -11,7 +11,7 @@ The ri store is a pool of messages and steps persisted as JSONL files. Each file
 **Properties**:
 - Append-only: lines are only added, never modified or deleted
 - Self-describing: each line is a JSON object, parseable independently
-- Globally unique IDs: message and step IDs are unique across all files
+- Globally unique IDs: message and context IDs are unique across all files
 - Deterministic recovery: the session's current state is the last `{"head": ...}` line
 
 ## File structure
@@ -20,7 +20,7 @@ Each session file has five kinds of lines, distinguished by their JSON keys:
 
 ### 1. Session header (first line)
 
-Session-level metadata. Has a `session` key but no `msg` or `step` key.
+Session-level metadata. Has a `session` key but no `msg` or `context` key.
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
@@ -48,31 +48,33 @@ Each message is a content blob. Uses `msg` as the ID key (not `id`) to distingui
 {"msg":"fx_m1","role":"user","content":[{"type":"text","text":"Fix the login crash."}]}
 ```
 
-### 3. Step lines
+### 3. Context lines
 
-A step captures a context snapshot and its position in the history DAG. Uses `step` as the ID key.
+A context is an immutable object with an ordered message list and its position in the history DAG. Uses `context` as the ID key.
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| `step` | `string` | yes | Globally unique step ID |
-| `context` | `string[]` | yes | Ordered list of message IDs (what the LLM sees) |
-| `parents` | `string[]` | no | Parent step IDs (the DAG edges) |
+| `context` | `string` | yes | Globally unique context ID |
+| `messages` | `string[]` | yes | Ordered list of message IDs (what the LLM sees) |
+| `parents` | `string[]` | no | Parent context IDs (the DAG edges) |
 | `meta` | `object` | no | Model info, usage, timestamps, etc. |
 
 ```json
-{"step":"fx_s2","context":["fx_m1","fx_m2","fx_m3"],"parents":["fx_s1"],"meta":{"model":"claude-sonnet-4-20250514","ts":"2026-02-09T08:00:15Z","usage":{"input_tokens":534,"output_tokens":156}}}
+{"context":"fx_c2","messages":["fx_m1","fx_m2","fx_m3"],"parents":["fx_c1"],"meta":{"model":"claude-sonnet-4-20250514","ts":"2026-02-09T08:00:15Z","usage":{"input_tokens":534,"output_tokens":156}}}
 ```
+
+**Backward compatibility**: older files use `{"step": ..., "context": [...]}` instead of `{"context": ..., "messages": [...]}`. The loader accepts both formats.
 
 ### 4. Head updates
 
-A head line moves the session's pointer to a new step. The last `{"head": ...}` line in the file wins.
+A head line moves the session's pointer to a new context. The last `{"head": ...}` line in the file wins.
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `head` | `string` | Step ID this session now points to |
+| `head` | `string` | Context ID this session now points to |
 
 ```json
-{"head":"fx_s2"}
+{"head":"fx_c2"}
 ```
 
 ### 5. Title updates
@@ -131,23 +133,23 @@ A coding agent session: user asks to fix a bug, agent reads a file, makes an edi
 
 ```jsonl
 {"session":"fix-login-crash","ts":"2026-02-09T08:00:00Z","cwd":"/Users/john/Projects/myapp"}
-{"step":"fx_s1","context":[],"parents":[],"meta":null}
-{"head":"fx_s1"}
+{"context":"fx_c1","messages":[],"parents":[],"meta":null}
+{"head":"fx_c1"}
 {"msg":"fx_m1","role":"system","content":[{"type":"text","text":"You are ri, a coding agent."}]}
-{"step":"fx_s2","context":["fx_m1"],"parents":["fx_s1"]}
-{"head":"fx_s2"}
+{"context":"fx_c2","messages":["fx_m1"],"parents":["fx_c1"]}
+{"head":"fx_c2"}
 {"msg":"fx_m2","role":"user","content":[{"type":"text","text":"There's a crash in the login handler. Fix it."}]}
 {"msg":"fx_m3","role":"assistant","content":[{"type":"text","text":"I'll look at the login handler."},{"type":"tool_use","id":"tc_1","name":"read","input":{"path":"src/handlers/login.rs"}}],"meta":{"model":"claude-sonnet-4-20250514","ts":"2026-02-09T08:00:05Z","usage":{"input_tokens":245,"output_tokens":89}}}
 {"msg":"fx_m4","role":"user","content":[{"type":"tool_result","toolUseId":"tc_1","content":[{"type":"text","text":"pub fn handle_login(req: Request) -> Response { ... }"}],"is_error":false}]}
 {"msg":"fx_m5","role":"assistant","content":[{"type":"text","text":"Fixed. The crash was caused by an unhandled None from db.find_user."}],"meta":{"model":"claude-sonnet-4-20250514","ts":"2026-02-09T08:00:15Z","usage":{"input_tokens":534,"output_tokens":67}}}
-{"step":"fx_s3","context":["fx_m1","fx_m2","fx_m3","fx_m4","fx_m5"],"parents":["fx_s2"],"meta":{"model":"claude-sonnet-4-20250514","ts":"2026-02-09T08:00:15Z"}}
-{"head":"fx_s3"}
+{"context":"fx_c3","messages":["fx_m1","fx_m2","fx_m3","fx_m4","fx_m5"],"parents":["fx_c2"],"meta":{"model":"claude-sonnet-4-20250514","ts":"2026-02-09T08:00:15Z"}}
+{"head":"fx_c3"}
 {"title":"Fix login null pointer crash"}
 ```
 
 ### Reading this file
 
-The session's current state is always the last `{"head": ...}` line: `fx_s3`. Look up step `fx_s3`, which has context `["fx_m1", "fx_m2", "fx_m3", "fx_m4", "fx_m5"]`. That's the full conversation. No provenance chain-walking needed.
+The session's current state is always the last `{"head": ...}` line: `fx_c3`. Look up context `fx_c3`, which has messages `["fx_m1", "fx_m2", "fx_m3", "fx_m4", "fx_m5"]`. That's the full conversation. No chain-walking needed.
 
 ### Scrutability
 
@@ -161,8 +163,8 @@ cat ~/.ri/sessions/2026-02-09_080000_fix-login-crash.jsonl
 # See only messages
 grep '"msg"' ~/.ri/sessions/2026-02-09_080000_fix-login-crash.jsonl
 
-# See only steps (context snapshots)
-grep '"step"' ~/.ri/sessions/2026-02-09_080000_fix-login-crash.jsonl
+# See only contexts
+grep '"context"' ~/.ri/sessions/2026-02-09_080000_fix-login-crash.jsonl
 
 # Current head
 grep '"head"' ~/.ri/sessions/2026-02-09_080000_fix-login-crash.jsonl | tail -1
@@ -184,13 +186,9 @@ struct Message {
 }
 
 struct Context {
+    pub id: ContextId,
     pub messages: Vec<MessageId>,
-}
-
-struct Step {
-    pub id: StepId,
-    pub context: Context,
-    pub parents: Vec<StepId>,
+    pub parents: Vec<ContextId>,
     pub meta: Option<serde_json::Value>,
 }
 
@@ -198,13 +196,13 @@ struct Step {
 
 struct Pool {
     messages: HashMap<MessageId, Message>,
-    steps: HashMap<StepId, Step>,
+    contexts: HashMap<ContextId, Context>,
 }
 
 struct Session {
     pub name: String,
     pub file_id: SessionId,
-    pub head: StepId,
+    pub head: ContextId,
     pub cwd: Option<String>,
     pub parent: Option<SessionId>,
     pub ts: String,
@@ -218,16 +216,16 @@ impl Store {
     // Load all .jsonl session files into the pool and session map.
     fn load_all(&mut self) -> Result<()>;
 
-    // Create a new session file with header, root step, and head pointer.
+    // Create a new session file with header, root context, and head pointer.
     fn create_session(&mut self, name: &str, cwd: &str, parent: Option<&SessionId>) -> Result<SessionId>;
 
     // Write a message to a session file and add it to the pool.
     fn write_message(&mut self, session_id: &SessionId, role: Role, content: Vec<ContentBlock>, meta: Option<Value>) -> Result<Message>;
 
-    // Snapshot the current context as a new step and update the session's head.
-    fn checkpoint(&mut self, session_id: &SessionId, message_ids: &[MessageId], meta: Option<Value>) -> Result<Step>;
+    // Create a new context from the current message list and update the session's head.
+    fn checkpoint(&mut self, session_id: &SessionId, message_ids: &[MessageId], meta: Option<Value>) -> Result<Context>;
 
-    // Get the current context for a session (from its head step).
+    // Get the current context for a session (from its head).
     fn head_context(&self, session_id: &str) -> Option<&Context>;
 
     // Persist a generated title to the session file.
@@ -246,13 +244,13 @@ By keeping them separate:
 - **Messages are reusable**: The same message can appear in multiple contexts. A summary message works in any context that needs it.
 - **Contexts are composable**: Pull messages from anywhere -- different sessions, different agents, different time periods.
 
-### Why steps exist
+### Why contexts combine messages and history
 
-A step records a context at a point in time, with parent links forming a history DAG. This gives:
+A context is a single immutable object: a message list, parent links, and metadata. There's no separate "tree" type that gets embedded -- the context IS the thing. This keeps the model to two types (Message and Context) plus a pointer (Session).
 
-- **History is explicit**: The step DAG shows exactly how the context evolved. No inference from provenance chains.
-- **Checkpointing is cheap**: Writing a step is just listing message IDs. The messages themselves aren't copied.
-- **Branching is natural**: Two steps can share the same parent but diverge in context.
+- **History is explicit**: The context DAG shows exactly how the conversation evolved.
+- **Checkpointing is cheap**: Creating a context is just listing message IDs + parents. The messages themselves aren't copied.
+- **Branching is natural**: Two contexts can share the same parent but diverge in their message lists.
 
 ### Why per-session files
 

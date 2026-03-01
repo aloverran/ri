@@ -1,18 +1,15 @@
 //! Core data model: messages and contexts.
 //!
-//! These are the two primitives of the system:
+//! Two primitives:
 //!
 //! - **Message**: an immutable content blob (role + content blocks). The atom.
-//! - **Context**: an ordered list of message references. What the LLM sees.
+//! - **Context**: an immutable object -- an ordered list of message
+//!   references, parent links, and metadata. Contexts form a DAG
+//!   through their parents. A session is just a pointer to one.
 //!
-//! Everything else builds on these two. A Step is a context + provenance
-//! (parent links and metadata). A Session is a named pointer to a step.
-//! The LLM API is fundamentally `f(Context) -> Message` -- you need
-//! messages and a context to make a call, nothing more.
-//!
-//! Messages are authored (by humans, tools, or code) or derived (produced
-//! by an LLM call). Both are the same type -- provenance lives in the Step
-//! that introduced a derived message.
+//! The LLM API is `f(context.messages) -> Message`. Everything else
+//! is algebra on contexts: creating them, composing them, pointing
+//! at them.
 
 use std::borrow::Borrow;
 use std::fmt;
@@ -20,7 +17,7 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-// String newtypes for message, step, and session identifiers.
+// String newtypes for message, context, and session identifiers.
 // Separate types so the compiler catches mix-ups.
 
 macro_rules! string_id {
@@ -58,7 +55,7 @@ macro_rules! string_id {
 }
 
 string_id!(MessageId, "Unique identifier for a message in the pool.");
-string_id!(StepId, "Unique identifier for a step in the history DAG.");
+string_id!(ContextId, "Unique identifier for a context in the history DAG.");
 string_id!(SessionId, "File-stem identifier for a session (e.g. \"2026-02-28_120000_fix-login\").");
 
 // -- Message --
@@ -66,7 +63,8 @@ string_id!(SessionId, "File-stem identifier for a session (e.g. \"2026-02-28_120
 /// Immutable content blob. The atomic unit of the system.
 ///
 /// Messages live in the pool and are referenced by ID from contexts.
-/// They carry no provenance -- that belongs to the Step that introduced them.
+/// They carry no provenance -- that belongs to the context that
+/// introduced them.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Message {
     pub id: MessageId,
@@ -217,49 +215,19 @@ impl ContentBlock {
 
 // -- Context --
 
-/// An ordered list of message references. What the LLM sees.
+/// An immutable object: an ordered list of message references, parent
+/// links, and metadata. The fundamental unit of the system alongside
+/// Message.
 ///
-/// One of the two primitives of the system (the other being Message).
-/// A context resolved against the pool gives you `Vec<Message>`, which
-/// is what you hand to the LLM. Steps embed a context to record what
-/// the LLM saw at a particular point in history.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct Context {
-    pub messages: Vec<MessageId>,
-}
-
-impl Context {
-    pub fn new() -> Self {
-        Context { messages: Vec::new() }
-    }
-
-    pub fn from_ids(ids: Vec<MessageId>) -> Self {
-        Context { messages: ids }
-    }
-
-    pub fn len(&self) -> usize {
-        self.messages.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.messages.is_empty()
-    }
-}
-
-// -- Step --
-
-/// A context + provenance. Records what the LLM sees at a point in
-/// the history DAG, and how it got there.
-///
-/// Like a git commit: captures a context snapshot (the tree) and points
-/// to parent steps (the parent commits). The meta field carries model
-/// info, usage, timestamps, or any application-specific data.
+/// Resolved against the pool, `messages` gives you `Vec<Message>` --
+/// what you hand to the LLM. Parent links form a DAG. A session is
+/// just a pointer to a context.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Step {
-    pub id: StepId,
-    pub context: Context,
+pub struct Context {
+    pub id: ContextId,
+    pub messages: Vec<MessageId>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub parents: Vec<StepId>,
+    pub parents: Vec<ContextId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub meta: Option<serde_json::Value>,
 }

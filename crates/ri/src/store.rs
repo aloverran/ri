@@ -1,15 +1,15 @@
 //! Session storage: the pool, sessions, and persistence.
 //!
 //! This module owns the in-memory object store (Pool) and its persistence
-//! layer (Store). The core data types (Message, Context, Step) live in
-//! `model` -- this module handles filing them to disk and looking them up.
+//! layer (Store). The core data types (Message, Context) live in `model`
+//! -- this module handles filing them to disk and looking them up.
 //!
 //! On disk, each session is an append-only JSONL file with five line types:
 //!
 //! - Session header: `{"session": "name", "ts": "...", ...}`
 //! - Message: `{"msg": "m1", "role": "user", "content": [...]}`
-//! - Step: `{"step": "s1", "context": ["m1", "m2"], "parents": [], "meta": {...}}`
-//! - Head update: `{"head": "s2"}`
+//! - Context: `{"context": "c1", "messages": ["m1", "m2"], "parents": [], "meta": {...}}`
+//! - Head update: `{"head": "c1"}`
 //! - Title update: `{"title": "Fix login crash"}`
 //!
 //! The session's current state is the last `{"head": ...}` line.
@@ -23,25 +23,25 @@ use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::model::{ContentBlock, Context, Message, MessageId, Role, SessionId, Step, StepId};
+use crate::model::{ContentBlock, Context, ContextId, Message, MessageId, Role, SessionId};
 
 // -- Pool --
 
-/// The shared object store. Messages and steps live here, referenced by ID.
+/// The shared object store. Messages and contexts live here, referenced by ID.
 ///
 /// The pool doesn't know about sessions or files. It's a bag of objects
 /// with lookup by ID. The Store layer populates it from disk and writes
 /// new objects to session files.
 pub struct Pool {
     messages: HashMap<MessageId, Message>,
-    steps: HashMap<StepId, Step>,
+    contexts: HashMap<ContextId, Context>,
 }
 
 impl Pool {
     pub fn new() -> Self {
         Pool {
             messages: HashMap::new(),
-            steps: HashMap::new(),
+            contexts: HashMap::new(),
         }
     }
 
@@ -73,21 +73,21 @@ impl Pool {
         self.messages.len()
     }
 
-    // -- Steps (read) --
+    // -- Contexts (read) --
 
-    pub fn get_step(&self, id: &str) -> Option<&Step> {
-        self.steps.get(id)
+    pub fn get_context(&self, id: &str) -> Option<&Context> {
+        self.contexts.get(id)
     }
 
-    // -- Steps (write, crate-internal) --
+    // -- Contexts (write, crate-internal) --
 
-    pub(crate) fn put_step(&mut self, step: Step) {
-        assert!(!step.id.as_str().is_empty(), "step ID must not be empty");
-        self.steps.insert(step.id.clone(), step);
+    pub(crate) fn put_context(&mut self, ctx: Context) {
+        assert!(!ctx.id.as_str().is_empty(), "context ID must not be empty");
+        self.contexts.insert(ctx.id.clone(), ctx);
     }
 
-    pub(crate) fn step_count(&self) -> usize {
-        self.steps.len()
+    pub(crate) fn context_count(&self) -> usize {
+        self.contexts.len()
     }
 }
 
@@ -99,7 +99,7 @@ impl Default for Pool {
 
 // -- Session (the pointer) --
 
-/// A named pointer to a step. Like a git branch.
+/// A named pointer to a context. Like a git branch.
 ///
 /// Not stored in the pool -- it's the entry point that references into it.
 /// On disk, the header is the first line and head updates are appended as
@@ -110,8 +110,8 @@ pub struct Session {
     pub name: String,
     /// File-stem ID (e.g. "2026-02-28_120000_fix-login"). Locates the file.
     pub file_id: SessionId,
-    /// Current step this session points to.
-    pub head: StepId,
+    /// Current context this session points to.
+    pub head: ContextId,
     pub cwd: Option<String>,
     /// File-stem ID of the parent session, if spawned by another.
     pub parent: Option<SessionId>,
@@ -142,13 +142,18 @@ struct MessageLine {
     meta: Option<serde_json::Value>,
 }
 
-/// A step line in the JSONL file.
+/// A context line in the JSONL file. Serialized with `"context"` as the
+/// ID key and `"messages"` for the message list.
+///
+/// Old files used `{"step": "...", "context": [...]}`. Those are
+/// handled by the loader's dispatch code since the field name collision
+/// prevents simple serde aliases.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct StepLine {
-    step: StepId,
-    context: Vec<MessageId>,
+struct ContextLine {
+    context: ContextId,
+    messages: Vec<MessageId>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    parents: Vec<StepId>,
+    parents: Vec<ContextId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     meta: Option<serde_json::Value>,
 }
@@ -156,7 +161,7 @@ struct StepLine {
 /// A head-update line. The last one in the file wins.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct HeadLine {
-    head: StepId,
+    head: ContextId,
 }
 
 /// A title-update line. The last one in the file wins. Written by
@@ -170,7 +175,7 @@ struct TitleLine {
 // -- Store --
 
 /// Manages the pool and session files. Loads history from existing JSONL
-/// files and writes new messages, steps, and head updates.
+/// files and writes new messages, contexts, and head updates.
 pub struct Store {
     pub pool: Pool,
     sessions_dir: PathBuf,
@@ -219,8 +224,8 @@ impl Store {
         }
 
         tracing::info!(
-            "Loaded session history ({} files, {} messages, {} steps)",
-            file_count, self.pool.message_count(), self.pool.step_count(),
+            "Loaded session history ({} files, {} messages, {} contexts)",
+            file_count, self.pool.message_count(), self.pool.context_count(),
         );
 
         Ok(())
@@ -236,7 +241,7 @@ impl Store {
         let file = File::open(path)?;
         let reader = BufReader::new(file);
         let mut header: Option<SessionHeader> = None;
-        let mut head: Option<StepId> = None;
+        let mut head: Option<ContextId> = None;
 
         for (line_num, line) in reader.lines().enumerate() {
             let line = match line {
@@ -272,13 +277,21 @@ impl Store {
                         meta: ml.meta,
                     });
                 }
-            } else if obj.get("step").is_some() {
-                if let Ok(sl) = serde_json::from_value::<StepLine>(obj) {
-                    self.pool.put_step(Step {
-                        id: sl.step,
-                        context: Context::from_ids(sl.context),
-                        parents: sl.parents,
-                        meta: sl.meta,
+            } else if obj.get("context").is_some() || obj.get("step").is_some() {
+                // Accept both new "context" lines and old "step" lines.
+                // Old format: {"step":"s1", "context":["m1","m2"], ...}
+                // New format: {"context":"c1", "messages":["m1","m2"], ...}
+                let parsed = if obj.get("step").is_some() {
+                    parse_legacy_step(&obj)
+                } else {
+                    serde_json::from_value::<ContextLine>(obj).ok()
+                };
+                if let Some(cl) = parsed {
+                    self.pool.put_context(Context {
+                        id: cl.context,
+                        messages: cl.messages,
+                        parents: cl.parents,
+                        meta: cl.meta,
                     });
                 }
             } else if obj.get("head").is_some() {
@@ -312,7 +325,7 @@ impl Store {
 
     // -- Writing --
 
-    /// Create a new session file with an initial root step (empty context).
+    /// Create a new session file with an initial root context (empty).
     /// Returns the SessionId (timestamp-based file stem).
     pub fn create_session(
         &mut self,
@@ -342,28 +355,28 @@ impl Store {
             parent: parent.map(|p| p.to_string()),
         };
 
-        // Write header, root step, and head pointer.
-        let root_step_id = StepId::new(scan_next_id(&path, "step"));
-        let root_step = StepLine {
-            step: root_step_id.clone(),
-            context: Vec::new(),
+        // Write header, root context, and head pointer.
+        let root_id = ContextId::new(scan_next_id(&path, "context"));
+        let root_ctx = ContextLine {
+            context: root_id.clone(),
+            messages: Vec::new(),
             parents: Vec::new(),
             meta: None,
         };
-        let head_line = HeadLine { head: root_step_id.clone() };
+        let head_line = HeadLine { head: root_id.clone() };
 
         let mut file = OpenOptions::new()
             .create(true)
             .append(true)
             .open(&path)?;
         writeln!(file, "{}", serde_json::to_string(&header)?)?;
-        writeln!(file, "{}", serde_json::to_string(&root_step)?)?;
+        writeln!(file, "{}", serde_json::to_string(&root_ctx)?)?;
         writeln!(file, "{}", serde_json::to_string(&head_line)?)?;
 
         // Register in pool and session map.
-        self.pool.put_step(Step {
-            id: root_step_id.clone(),
-            context: Context::new(),
+        self.pool.put_context(Context {
+            id: root_id.clone(),
+            messages: Vec::new(),
             parents: Vec::new(),
             meta: None,
         });
@@ -371,7 +384,7 @@ impl Store {
         let session = Session {
             name: name.to_string(),
             file_id: file_id.clone(),
-            head: root_step_id,
+            head: root_id,
             cwd: Some(cwd.to_string()),
             parent: parent.cloned(),
             ts,
@@ -415,30 +428,29 @@ impl Store {
         Ok(msg)
     }
 
-    /// Snapshot the current context as a new step and update the session's head.
+    /// Create a new context from the current message list and update the
+    /// session's head.
     ///
-    /// This is the primary persistence mechanism: after any meaningful change
-    /// to the message list, call checkpoint to record the state. On reload,
-    /// the head step's context gives back exactly this list.
+    /// After any meaningful change to the message list, call checkpoint
+    /// to persist a new context. On reload, the head context's messages
+    /// gives back exactly this list.
     pub fn checkpoint(
         &mut self,
         session_id: &SessionId,
         message_ids: &[MessageId],
         meta: Option<serde_json::Value>,
-    ) -> eyre::Result<Step> {
-        let context = Context::from_ids(message_ids.to_vec());
+    ) -> eyre::Result<Context> {
         let parents = self.sessions.get(session_id.as_str())
             .map(|s| s.head.clone())
             .into_iter()
             .collect();
-        self.write_step(session_id, context, parents, meta)
+        self.write_context(session_id, message_ids.to_vec(), parents, meta)
     }
 
-    /// Convenience: get the current context for a session (from its head step).
+    /// Convenience: get the current context for a session (from its head).
     pub fn head_context(&self, session_id: &str) -> Option<&Context> {
         let session = self.sessions.get(session_id)?;
-        let step = self.pool.get_step(session.head.as_str())?;
-        Some(&step.context)
+        self.pool.get_context(session.head.as_str())
     }
 
     /// Persist a generated title to the session file and update the in-memory
@@ -467,54 +479,62 @@ impl Store {
 
     // -- Internal writing helpers --
 
-    /// Write a step to a session file, add it to the pool, and update the
-    /// session's head pointer.
-    fn write_step(
+    /// Write a context to a session file, add it to the pool, and update
+    /// the session's head pointer.
+    fn write_context(
         &mut self,
         session_id: &SessionId,
-        context: Context,
-        parents: Vec<StepId>,
+        messages: Vec<MessageId>,
+        parents: Vec<ContextId>,
         meta: Option<serde_json::Value>,
-    ) -> eyre::Result<Step> {
+    ) -> eyre::Result<Context> {
         let path = self.sessions_dir.join(format!("{}.jsonl", session_id));
-        let id = StepId::new(scan_next_id(&path, "step"));
+        let id = ContextId::new(scan_next_id(&path, "context"));
 
-        let step = Step { id, context, parents, meta };
+        let ctx = Context { id, messages, parents, meta };
 
-        let step_line = StepLine {
-            step: step.id.clone(),
-            context: step.context.messages.clone(),
-            parents: step.parents.clone(),
-            meta: step.meta.clone(),
+        let ctx_line = ContextLine {
+            context: ctx.id.clone(),
+            messages: ctx.messages.clone(),
+            parents: ctx.parents.clone(),
+            meta: ctx.meta.clone(),
         };
-        let head_line = HeadLine { head: step.id.clone() };
+        let head_line = HeadLine { head: ctx.id.clone() };
 
         let mut file = OpenOptions::new()
             .create(true)
             .append(true)
             .open(&path)?;
-        writeln!(file, "{}", serde_json::to_string(&step_line)?)?;
+        writeln!(file, "{}", serde_json::to_string(&ctx_line)?)?;
         writeln!(file, "{}", serde_json::to_string(&head_line)?)?;
         file.flush()?;
 
-        tracing::debug!("Wrote step [{}] to session [{}] (context: {} messages, {} parents)",
-            step.id, session_id, step.context.len(), step.parents.len());
+        tracing::debug!("Wrote context [{}] to session [{}] ({} messages, {} parents)",
+            ctx.id, session_id, ctx.messages.len(), ctx.parents.len());
 
-        self.pool.put_step(step.clone());
+        self.pool.put_context(ctx.clone());
         if let Some(session) = self.sessions.get_mut(session_id.as_str()) {
-            session.head = step.id.clone();
+            session.head = ctx.id.clone();
         }
 
-        Ok(step)
+        Ok(ctx)
     }
 }
 
 // -- ID scanning --
 
 /// Scan a session file for IDs matching `{prefix}_{N}` pattern and return
-/// the next available ID.
+/// the next available ID. For context IDs, also scans for old "step" keys
+/// to maintain uniqueness when appending to pre-migration files.
 fn scan_next_id(path: &Path, kind: &str) -> String {
     let needle = format!("\"{}\":\"", kind);
+    // Also scan the legacy key when looking for context IDs.
+    let legacy_needle = if kind == "context" {
+        Some("\"step\":\"".to_string())
+    } else {
+        None
+    };
+
     let mut max_counter: u64 = 0;
     let mut prefix: Option<String> = None;
 
@@ -523,9 +543,11 @@ fn scan_next_id(path: &Path, kind: &str) -> String {
         for line in reader.lines().flatten() {
             let trimmed = line.trim();
             if trimmed.is_empty() { continue; }
-            if !trimmed.contains(&needle) { continue; }
 
-            if let Some(id) = extract_field_value(trimmed, &needle) {
+            // Try the primary needle, then the legacy needle.
+            let id = extract_field_value(trimmed, &needle)
+                .or_else(|| legacy_needle.as_ref().and_then(|ln| extract_field_value(trimmed, ln)));
+            if let Some(id) = id {
                 if let Some(pos) = id.rfind('_') {
                     if let Ok(n) = id[pos + 1..].parse::<u64>() {
                         prefix = Some(id[..pos].to_string());
@@ -566,6 +588,29 @@ fn gen_session_prefix(name: &str) -> String {
     } else {
         format!("{}_{}", slug, rand)
     }
+}
+
+/// Parse a legacy `{"step": ..., "context": [...]}` line into a ContextLine.
+fn parse_legacy_step(obj: &serde_json::Value) -> Option<ContextLine> {
+    let id = obj.get("step")?.as_str()?;
+    let messages: Vec<MessageId> = obj.get("context")?
+        .as_array()?
+        .iter()
+        .filter_map(|v| v.as_str().map(MessageId::from))
+        .collect();
+    let parents: Vec<ContextId> = obj.get("parents")
+        .and_then(|v| v.as_array())
+        .map(|arr| arr.iter().filter_map(|v| v.as_str().map(ContextId::from)).collect())
+        .unwrap_or_default();
+    let meta = obj.get("meta").and_then(|v| {
+        if v.is_null() { None } else { Some(v.clone()) }
+    });
+    Some(ContextLine {
+        context: ContextId::from(id),
+        messages,
+        parents,
+        meta,
+    })
 }
 
 fn slugify(name: &str) -> String {

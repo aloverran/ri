@@ -4,9 +4,9 @@ Core types, traits, and storage for ri. This is the foundation crate that all ot
 
 ## Modules
 
-**model** -- The core data model. `Message` and `Context` are the two primitives: a message is an immutable content blob, a context is an ordered selection of messages (what the LLM sees). `Step` is a context + provenance (parent links and metadata, forming a history DAG). Also: `MessageId`, `StepId`, `SessionId` (ID newtypes), `Role`, `ContentBlock`, `Usage`, `gen_id()`.
+**model** -- The core data model. `Message` and `Context` are the two primitives: a message is an immutable content blob, a context is an immutable object (ordered message list + parent links + metadata, forming a DAG). Also: `MessageId`, `ContextId`, `SessionId` (ID newtypes), `Role`, `ContentBlock`, `Usage`, `gen_id()`.
 
-**store** -- Persistence. `Pool` (in-memory message/step store), `Session` (named pointer to a step), `SessionHeader`, `Store` (pool + JSONL file management: load, write, checkpoint).
+**store** -- Persistence. `Pool` (in-memory message/context store), `Session` (named pointer to a context), `SessionHeader`, `Store` (pool + JSONL file management: load, write, checkpoint).
 
 **stream** -- `StreamEvent`: normalized incremental events from any LLM provider during response streaming.
 
