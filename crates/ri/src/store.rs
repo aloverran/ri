@@ -1,13 +1,16 @@
-//! Session storage: the pool, the history DAG, and session files.
+//! Session storage: the pool, sessions, and persistence.
 //!
 //! This module owns the in-memory object store (Pool) and its persistence
-//! layer (Store). On disk, each session is an append-only JSONL file with
-//! four line types:
+//! layer (Store). The core data types (Message, Context, Step) live in
+//! `model` -- this module handles filing them to disk and looking them up.
+//!
+//! On disk, each session is an append-only JSONL file with five line types:
 //!
 //! - Session header: `{"session": "name", "ts": "...", ...}`
 //! - Message: `{"msg": "m1", "role": "user", "content": [...]}`
 //! - Step: `{"step": "s1", "context": ["m1", "m2"], "parents": [], "meta": {...}}`
 //! - Head update: `{"head": "s2"}`
+//! - Title update: `{"title": "Fix login crash"}`
 //!
 //! The session's current state is the last `{"head": ...}` line.
 
@@ -20,52 +23,7 @@ use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::message::{ContentBlock, Message, MessageId, Role, SessionId, StepId};
-
-// -- Context --
-
-/// An ordered list of message references. Represents what the LLM sees.
-///
-/// Just a Vec of message IDs pointing into the pool. Treat it like a value.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct Context {
-    pub messages: Vec<MessageId>,
-}
-
-impl Context {
-    pub fn new() -> Self {
-        Context { messages: Vec::new() }
-    }
-
-    pub fn from_ids(ids: Vec<MessageId>) -> Self {
-        Context { messages: ids }
-    }
-
-    pub fn len(&self) -> usize {
-        self.messages.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.messages.is_empty()
-    }
-}
-
-// -- Step --
-
-/// A point in the history DAG. Records a context snapshot and parent steps.
-///
-/// Like a git commit: captures *what* the context looks like at this point
-/// and *how* it got here (parents). The meta field carries model info, usage,
-/// timestamps, or any application-specific data.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Step {
-    pub id: StepId,
-    pub context: Context,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub parents: Vec<StepId>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub meta: Option<serde_json::Value>,
-}
+use crate::model::{ContentBlock, Context, Message, MessageId, Role, SessionId, Step, StepId};
 
 // -- Pool --
 

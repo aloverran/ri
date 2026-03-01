@@ -1,9 +1,18 @@
-//! The message: ri's atomic building block.
+//! Core data model: messages and contexts.
 //!
-//! A message is an immutable content blob (role + content blocks) that lives
-//! in the pool and is referenced by ID. Messages are authored (by humans,
-//! tools, or code) or derived (produced by an LLM call). Both are the same
-//! type -- provenance lives in the Step that introduced a derived message.
+//! These are the two primitives of the system:
+//!
+//! - **Message**: an immutable content blob (role + content blocks). The atom.
+//! - **Context**: an ordered list of message references. What the LLM sees.
+//!
+//! Everything else builds on these two. A Step is a context + provenance
+//! (parent links and metadata). A Session is a named pointer to a step.
+//! The LLM API is fundamentally `f(Context) -> Message` -- you need
+//! messages and a context to make a call, nothing more.
+//!
+//! Messages are authored (by humans, tools, or code) or derived (produced
+//! by an LLM call). Both are the same type -- provenance lives in the Step
+//! that introduced a derived message.
 
 use std::borrow::Borrow;
 use std::fmt;
@@ -51,6 +60,8 @@ macro_rules! string_id {
 string_id!(MessageId, "Unique identifier for a message in the pool.");
 string_id!(StepId, "Unique identifier for a step in the history DAG.");
 string_id!(SessionId, "File-stem identifier for a session (e.g. \"2026-02-28_120000_fix-login\").");
+
+// -- Message --
 
 /// Immutable content blob. The atomic unit of the system.
 ///
@@ -203,6 +214,57 @@ impl ContentBlock {
         }
     }
 }
+
+// -- Context --
+
+/// An ordered list of message references. What the LLM sees.
+///
+/// One of the two primitives of the system (the other being Message).
+/// A context resolved against the pool gives you `Vec<Message>`, which
+/// is what you hand to the LLM. Steps embed a context to record what
+/// the LLM saw at a particular point in history.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Context {
+    pub messages: Vec<MessageId>,
+}
+
+impl Context {
+    pub fn new() -> Self {
+        Context { messages: Vec::new() }
+    }
+
+    pub fn from_ids(ids: Vec<MessageId>) -> Self {
+        Context { messages: ids }
+    }
+
+    pub fn len(&self) -> usize {
+        self.messages.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.messages.is_empty()
+    }
+}
+
+// -- Step --
+
+/// A context + provenance. Records what the LLM sees at a point in
+/// the history DAG, and how it got there.
+///
+/// Like a git commit: captures a context snapshot (the tree) and points
+/// to parent steps (the parent commits). The meta field carries model
+/// info, usage, timestamps, or any application-specific data.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Step {
+    pub id: StepId,
+    pub context: Context,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub parents: Vec<StepId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub meta: Option<serde_json::Value>,
+}
+
+// -- Supporting types --
 
 /// Token usage from a single LLM call.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

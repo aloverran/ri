@@ -38,11 +38,11 @@ Then restart ri.
 
 ## Message Storage
 
-Ri provides a file-based storage for session history. The data model uses two kinds of objects: **messages** (pure content blobs) and **steps** (context snapshots forming a history DAG).
+Ri provides a file-based storage for session history. The data model has two primitives: **messages** (pure content blobs) and **contexts** (ordered selections of messages -- what the LLM sees). On top of those, a **step** records a context at a point in the history DAG: it's a context + provenance (parent links and metadata), like a git commit is a tree + parents.
 
 A message is just text with a role (user, assistant, system). It carries no information about which LLM call produced it or what context it was part of. Messages live in a shared pool, referenced by globally unique IDs.
 
-A step is like a git commit: it captures a snapshot of which messages the LLM should see (the "context") and points to parent steps. A session is like a git branch -- a named pointer to the latest step.
+A context is an ordered list of message references. Resolved against the pool, it gives you `Vec<Message>` -- exactly what you hand to the LLM. A session is like a git branch -- a named pointer to the latest step.
 
 In the simplest of chats, the history is a linear chain of steps, each adding the latest messages to the context. But because steps form a DAG, advanced workflows are natural:
 

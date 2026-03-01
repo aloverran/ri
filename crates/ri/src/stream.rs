@@ -5,7 +5,7 @@
 //! `ContentBlock::Text`, and so on. The `StreamAccumulator` handles this
 //! conversion.
 
-use crate::message::Usage;
+use crate::model::Usage;
 
 /// Normalized event emitted by LLM providers during response streaming.
 #[derive(Debug, Clone)]

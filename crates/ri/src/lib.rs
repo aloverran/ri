@@ -1,12 +1,12 @@
 pub mod accumulator;
-pub mod message;
+pub mod model;
 pub mod provider;
 pub mod store;
 pub mod stream;
 
 // Top-level re-exports for convenience.
-pub use message::{
-    gen_id, ContentBlock, Message, MessageId, Role, SessionId, StepId, Usage,
+pub use model::{
+    gen_id, ContentBlock, Context, Message, MessageId, Role, SessionId, Step, StepId, Usage,
 };
 pub use stream::StreamEvent;
 pub use provider::{
@@ -14,4 +14,4 @@ pub use provider::{
     ThinkingLevel, Tool, ToolContext, ToolOutput, ToolSchema,
 };
 pub use accumulator::StreamAccumulator;
-pub use store::{Context, Pool, Session, SessionHeader, Step, Store};
+pub use store::{Pool, Session, SessionHeader, Store};

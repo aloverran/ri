@@ -174,16 +174,17 @@ grep '"title"' ~/.ri/sessions/2026-02-09_080000_fix-login-crash.jsonl | tail -1
 ## In-memory representation
 
 ```rust
-struct Pool {
-    messages: HashMap<MessageId, Message>,
-    steps: HashMap<StepId, Step>,
-}
+// -- model.rs: the core data model --
 
 struct Message {
     pub id: MessageId,
     pub role: Role,
     pub content: Vec<ContentBlock>,
     pub meta: Option<serde_json::Value>,
+}
+
+struct Context {
+    pub messages: Vec<MessageId>,
 }
 
 struct Step {
@@ -193,8 +194,11 @@ struct Step {
     pub meta: Option<serde_json::Value>,
 }
 
-struct Context {
-    pub messages: Vec<MessageId>,
+// -- store.rs: persistence --
+
+struct Pool {
+    messages: HashMap<MessageId, Message>,
+    steps: HashMap<StepId, Step>,
 }
 
 struct Session {
@@ -233,11 +237,19 @@ impl Store {
 
 ## Design decisions and rationale
 
-### Why separate messages and steps
+### Why messages and contexts are the primitives
 
-Messages are content. Steps are history. Separating them gives:
+Messages are content. Contexts are selections of content. Together they're the two things you need to call an LLM: `f(Context) -> Message`. Everything else -- steps, sessions, the DAG -- is built on top.
 
-- **Messages are reusable**: The same message can appear in multiple steps' contexts. A summary message works in any context that needs it.
+By keeping them separate:
+
+- **Messages are reusable**: The same message can appear in multiple contexts. A summary message works in any context that needs it.
+- **Contexts are composable**: Pull messages from anywhere -- different sessions, different agents, different time periods.
+
+### Why steps exist
+
+A step records a context at a point in time, with parent links forming a history DAG. This gives:
+
 - **History is explicit**: The step DAG shows exactly how the context evolved. No inference from provenance chains.
 - **Checkpointing is cheap**: Writing a step is just listing message IDs. The messages themselves aren't copied.
 - **Branching is natural**: Two steps can share the same parent but diverge in context.

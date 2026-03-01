@@ -6,7 +6,7 @@
 
 use std::collections::HashMap;
 
-use crate::message::{ContentBlock, Usage};
+use crate::model::{ContentBlock, Usage};
 use crate::stream::StreamEvent;
 
 /// In-progress tool call being assembled from streaming deltas.
