@@ -120,7 +120,7 @@ pub fn get_environment_system_prompt(additional_lines: Option<Vec<String>>) -> S
 pub const BASE_SYSTEM_PROMPT: &str = "\
 You are ri, a helpful agent that lives in the terminal. \
 You help the user with anything that can be performed within your capacity. \
-You have access to tools for reading, writing, and searching files. \
+You have access to tools for reading, writing, searching files, and other tools. \
 Use them to understand before making changes.";
 
 // -- Internal --
