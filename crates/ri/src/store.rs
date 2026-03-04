@@ -62,14 +62,14 @@ impl Pool {
         self.resolve(&ctx.messages)
     }
 
-    // -- Messages (write, crate-internal) --
+    // -- Messages (write) --
 
-    pub(crate) fn put_message(&mut self, msg: Message) {
+    pub fn put_message(&mut self, msg: Message) {
         assert!(!msg.id.as_str().is_empty(), "message ID must not be empty (role={:?})", msg.role);
         self.messages.insert(msg.id.clone(), msg);
     }
 
-    pub(crate) fn message_count(&self) -> usize {
+    pub fn message_count(&self) -> usize {
         self.messages.len()
     }
 
@@ -79,15 +79,23 @@ impl Pool {
         self.contexts.get(id)
     }
 
-    // -- Contexts (write, crate-internal) --
+    // -- Contexts (write) --
 
-    pub(crate) fn put_context(&mut self, ctx: Context) {
+    pub fn put_context(&mut self, ctx: Context) {
         assert!(!ctx.id.as_str().is_empty(), "context ID must not be empty");
         self.contexts.insert(ctx.id.clone(), ctx);
     }
 
-    pub(crate) fn context_count(&self) -> usize {
+    pub fn context_count(&self) -> usize {
         self.contexts.len()
+    }
+
+    /// Find all contexts whose parents include the given ID (forward traversal).
+    /// O(n) scan over all contexts in the pool.
+    pub fn children(&self, id: &str) -> Vec<&Context> {
+        self.contexts.values()
+            .filter(|ctx| ctx.parents.iter().any(|p| p.as_str() == id))
+            .collect()
     }
 }
 
@@ -444,7 +452,9 @@ impl Store {
             .map(|s| s.head.clone())
             .into_iter()
             .collect();
-        self.write_context(session_id, message_ids.to_vec(), parents, meta)
+        let ctx = self.write_context(session_id, message_ids.to_vec(), parents, meta)?;
+        self.update_head(session_id, &ctx.id)?;
+        Ok(ctx)
     }
 
     /// Convenience: get the current context for a session (from its head).
@@ -477,11 +487,14 @@ impl Store {
         Ok(())
     }
 
-    // -- Internal writing helpers --
+    // -- Writing (contexts and head pointer) --
 
-    /// Write a context to a session file, add it to the pool, and update
-    /// the session's head pointer.
-    fn write_context(
+    /// Write a context to a session file and add it to the pool.
+    ///
+    /// Does NOT update the session's head pointer. Call `update_head`
+    /// separately, or use `checkpoint` for the common
+    /// write-context-and-advance-head pattern.
+    pub fn write_context(
         &mut self,
         session_id: &SessionId,
         messages: Vec<MessageId>,
@@ -499,25 +512,45 @@ impl Store {
             parents: ctx.parents.clone(),
             meta: ctx.meta.clone(),
         };
-        let head_line = HeadLine { head: ctx.id.clone() };
 
         let mut file = OpenOptions::new()
             .create(true)
             .append(true)
             .open(&path)?;
         writeln!(file, "{}", serde_json::to_string(&ctx_line)?)?;
-        writeln!(file, "{}", serde_json::to_string(&head_line)?)?;
         file.flush()?;
 
         tracing::debug!("Wrote context [{}] to session [{}] ({} messages, {} parents)",
             ctx.id, session_id, ctx.messages.len(), ctx.parents.len());
 
         self.pool.put_context(ctx.clone());
+        Ok(ctx)
+    }
+
+    /// Update a session's head to point at the given context.
+    /// Writes a `{"head": ...}` line to the session file and updates
+    /// the in-memory session record.
+    pub fn update_head(
+        &mut self,
+        session_id: &SessionId,
+        context_id: &ContextId,
+    ) -> eyre::Result<()> {
+        let path = self.sessions_dir.join(format!("{}.jsonl", session_id));
+        let head_line = HeadLine { head: context_id.clone() };
+
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)?;
+        writeln!(file, "{}", serde_json::to_string(&head_line)?)?;
+        file.flush()?;
+
         if let Some(session) = self.sessions.get_mut(session_id.as_str()) {
-            session.head = ctx.id.clone();
+            session.head = context_id.clone();
         }
 
-        Ok(ctx)
+        tracing::debug!("Updated head of session [{}] to context [{}]", session_id, context_id);
+        Ok(())
     }
 }
 

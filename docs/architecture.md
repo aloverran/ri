@@ -230,7 +230,7 @@ Terminal agent. Wires everything together for interactive use:
 - `interactive` -- TUI with ratatui (inline viewport, scrollback, tui-textarea input, streaming preview)
 - `print_mode` -- Single-shot: run one prompt, print output, exit
 - `rpc_mode` -- JSON-over-stdio for embedding in other tools
-- `meta_tools` -- `runAgent`, `readSession`, `readMessage` tools for sub-agent orchestration
+- `meta_tools` -- `runAgent`, `readContextGraph`, `readMessage`, `appendMessage`, `createContext` tools for sub-agent orchestration
 
 ### ri-web
 

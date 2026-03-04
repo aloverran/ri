@@ -39,7 +39,7 @@ ri-web/
     state.rs              # AppState, SessionState, RunHandle, LoginInProgress
     api.rs                # axum route handlers (REST + SSE + auth)
     agent.rs              # Agent loop + background title generation
-    meta_tools.rs         # runAgent, readSession, readMessage (shared-state variants)
+    meta_tools.rs         # runAgent, readContextGraph, readMessage, appendMessage, createContext
     tracing_broadcast.rs  # Live tracing log forwarding to SSE clients
   frontend/               # SolidJS + Vite project
 ```
