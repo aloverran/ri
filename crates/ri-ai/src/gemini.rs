@@ -414,6 +414,8 @@ fn build_api_key_body(opts: &RequestOptions) -> Value {
             })
         }).collect();
         body["tools"] = json!([{ "functionDeclarations": declarations }]);
+    } else if opts.native_tools {
+        body["tools"] = native_gemini_tools();
     }
 
     body
@@ -465,6 +467,8 @@ fn build_cloud_body(variant: GeminiVariant, project_id: &str, opts: &RequestOpti
             })
         }).collect();
         request["tools"] = json!([{ "functionDeclarations": declarations }]);
+    } else if opts.native_tools {
+        request["tools"] = native_gemini_tools();
     }
 
     let mut body = json!({
@@ -619,6 +623,15 @@ fn build_contents(messages: &[Message], model_id: &str) -> Vec<Value> {
 fn is_gemini3(model_id: &str) -> bool {
     model_id.contains("3-pro") || model_id.contains("3-flash")
         || model_id.contains("3.1-pro") || model_id.contains("3.1-flash")
+}
+
+/// Provider-native tools (search grounding and sandboxed code execution)
+/// enabled when `native_tools` is set and no function-calling tools are present.
+fn native_gemini_tools() -> Value {
+    json!([
+        { "google_search": {} },
+        { "code_execution": {} },
+    ])
 }
 
 fn thinking_level_string(level: ThinkingLevel, model_id: &str) -> Option<&'static str> {

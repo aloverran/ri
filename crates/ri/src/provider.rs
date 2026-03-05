@@ -109,6 +109,8 @@ pub struct RequestOptions {
     pub tools: Vec<ToolSchema>,
     pub thinking: ThinkingLevel,
     pub max_tokens: Option<usize>,
+    /// Whether to enable all of a model's built-in capabilities (e.g. Gemini's google_search + code_execution).
+    pub native_tools: bool,
 }
 
 #[derive(Debug, thiserror::Error)]
