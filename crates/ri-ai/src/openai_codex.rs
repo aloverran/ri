@@ -127,17 +127,17 @@ impl LlmProvider for OpenAICodexProvider {
         vec![
             Model {
                 id: "gpt-5.2".into(), name: "GPT-5.2".into(),
-                reasoning: true, context_window: 272_000, max_tokens: 128_000,
+                reasoning: true, context_window: 400_000, max_tokens: 128_000,
                 cost: ModelCost { input: 1.75, output: 14.0, cache_read: 0.175, cache_write: 0.0 },
             },
             Model {
                 id: "gpt-5.2-codex".into(), name: "GPT-5.2 Codex".into(),
-                reasoning: true, context_window: 272_000, max_tokens: 128_000,
+                reasoning: true, context_window: 400_000, max_tokens: 128_000,
                 cost: ModelCost { input: 1.75, output: 14.0, cache_read: 0.175, cache_write: 0.0 },
             },
             Model {
                 id: "gpt-5.3-codex".into(), name: "GPT-5.3 Codex".into(),
-                reasoning: true, context_window: 272_000, max_tokens: 128_000,
+                reasoning: true, context_window: 400_000, max_tokens: 128_000,
                 cost: ModelCost { input: 1.75, output: 14.0, cache_read: 0.175, cache_write: 0.0 },
             },
         ]

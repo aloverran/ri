@@ -122,7 +122,7 @@ impl LlmProvider for AnthropicProvider {
             },
             Model {
                 id: "claude-sonnet-4-20250514".into(), name: "Claude Sonnet 4".into(),
-                reasoning: false, context_window: 200_000, max_tokens: 16_384,
+                reasoning: true, context_window: 200_000, max_tokens: 64_000,
                 cost: ModelCost { input: 3.0, output: 15.0, cache_read: 0.3, cache_write: 3.75 },
             },
             Model {
@@ -132,12 +132,24 @@ impl LlmProvider for AnthropicProvider {
             },
             Model {
                 id: "claude-sonnet-4-6".into(), name: "Claude Sonnet 4.6".into(),
-                reasoning: true, context_window: 200_000, max_tokens: 64_000,
+                reasoning: true, context_window: 200_000, max_tokens: 128_000,
                 cost: ModelCost { input: 3.0, output: 15.0, cache_read: 0.3, cache_write: 3.75 },
             },
             Model {
                 id: "claude-opus-4-6".into(), name: "Claude Opus 4.6".into(),
                 reasoning: true, context_window: 200_000, max_tokens: 128_000,
+                cost: ModelCost { input: 5.0, output: 25.0, cache_read: 0.5, cache_write: 6.25 },
+            },
+            // Extended context variants -- 1M token input via beta header.
+            // Same models and pricing, but opts into the context-1m-2025-08-07 beta.
+            Model {
+                id: "claude-sonnet-4-6-1m".into(), name: "Claude Sonnet 4.6 (1M)".into(),
+                reasoning: true, context_window: 1_000_000, max_tokens: 128_000,
+                cost: ModelCost { input: 3.0, output: 15.0, cache_read: 0.3, cache_write: 3.75 },
+            },
+            Model {
+                id: "claude-opus-4-6-1m".into(), name: "Claude Opus 4.6 (1M)".into(),
+                reasoning: true, context_window: 1_000_000, max_tokens: 128_000,
                 cost: ModelCost { input: 5.0, output: 25.0, cache_read: 0.5, cache_write: 6.25 },
             },
         ]
@@ -245,11 +257,17 @@ impl LlmProvider for AnthropicProvider {
         Ok(())
     }
 
-    async fn stream(&self, opts: RequestOptions) -> Result<EventStream, ApiError> {
+    async fn stream(&self, mut opts: RequestOptions) -> Result<EventStream, ApiError> {
         let (api_key, is_oauth) = self.ensure_valid_token().await
             .map_err(|e| ApiError::Other(e.to_string()))?;
 
-        let request = build_request(&api_key, &opts);
+        // Strip the -1m suffix (ri-internal) before sending to the API.
+        let extended_context = opts.model.id.ends_with("-1m");
+        if extended_context {
+            opts.model.id = opts.model.id.strip_suffix("-1m").unwrap().to_string();
+        }
+
+        let request = build_request(&api_key, &opts, extended_context);
         let bytes = sse::send(request).await?;
         let state = AnthropicState::new(is_oauth, opts.tools.to_vec());
         Ok(Box::pin(sse::drive_sse_stream(bytes, state)))
@@ -339,7 +357,7 @@ fn from_claude_code_name(name: &str, original_tools: &[ToolSchema]) -> String {
 
 // -- Request building --
 
-fn build_request(api_key: &str, opts: &RequestOptions) -> reqwest::RequestBuilder {
+fn build_request(api_key: &str, opts: &RequestOptions, extended_context: bool) -> reqwest::RequestBuilder {
     let is_oauth = api_key.starts_with("sk-ant-oat");
     let body = build_body(opts, is_oauth);
     let url = "https://api.anthropic.com/v1/messages";
@@ -352,17 +370,23 @@ fn build_request(api_key: &str, opts: &RequestOptions) -> reqwest::RequestBuilde
         .header("content-type", "application/json")
         .header("accept", "text/event-stream");
 
+    let context_1m_beta = if extended_context { ",context-1m-2025-08-07" } else { "" };
+
     if is_oauth {
         builder = builder
             .header("authorization", format!("Bearer {}", api_key))
-            .header("anthropic-beta", "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,fine-grained-tool-streaming-2025-05-14")
+            .header("anthropic-beta", format!(
+                "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,fine-grained-tool-streaming-2025-05-14{context_1m_beta}"
+            ))
             .header("anthropic-dangerous-direct-browser-access", "true")
             .header("user-agent", "claude-cli/2.1.2 (external, cli)")
             .header("x-app", "cli");
     } else {
         builder = builder
             .header("x-api-key", api_key)
-            .header("anthropic-beta", "interleaved-thinking-2025-05-14,fine-grained-tool-streaming-2025-05-14");
+            .header("anthropic-beta", format!(
+                "interleaved-thinking-2025-05-14,fine-grained-tool-streaming-2025-05-14{context_1m_beta}"
+            ));
     }
 
     builder.body(body.to_string())

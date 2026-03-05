@@ -152,41 +152,41 @@ impl LlmProvider for GeminiProvider {
                 Model {
                     id: "gemini-2.5-pro".into(), name: "Gemini 2.5 Pro".into(),
                     reasoning: true, context_window: 1_048_576, max_tokens: 65_536,
-                    cost: ModelCost { input: 1.25, output: 10.0, cache_read: 0.315, cache_write: 0.0 },
+                    cost: ModelCost { input: 1.25, output: 10.0, cache_read: 0.125, cache_write: 0.375 },
                 },
                 Model {
                     id: "gemini-2.5-flash".into(), name: "Gemini 2.5 Flash".into(),
                     reasoning: true, context_window: 1_048_576, max_tokens: 65_536,
-                    cost: ModelCost { input: 0.15, output: 0.6, cache_read: 0.0375, cache_write: 0.0 },
+                    cost: ModelCost { input: 0.3, output: 2.5, cache_read: 0.03, cache_write: 0.0 },
                 },
             ],
             GeminiVariant::Antigravity => vec![
                 Model {
                     id: "gemini-3.1-pro-high".into(), name: "Gemini 3.1 Pro".into(),
                     reasoning: true, context_window: 1_048_576, max_tokens: 65_536,
-                    cost: ModelCost { input: 2.0, output: 12.0, cache_read: 0.2, cache_write: 2.375 },
+                    cost: ModelCost { input: 2.0, output: 12.0, cache_read: 0.2, cache_write: 0.375 },
                 },
                 Model {
                     id: "gemini-3.1-pro-low".into(), name: "Gemini 3.1 Pro (Low)".into(),
                     reasoning: true, context_window: 1_048_576, max_tokens: 65_536,
-                    cost: ModelCost { input: 2.0, output: 12.0, cache_read: 0.2, cache_write: 2.375 },
+                    cost: ModelCost { input: 2.0, output: 12.0, cache_read: 0.2, cache_write: 0.375 },
                 },
                 Model {
                     id: "gemini-3-flash".into(), name: "Gemini 3 Flash".into(),
                     reasoning: true, context_window: 1_048_576, max_tokens: 65_536,
-                    cost: ModelCost { input: 0.5, output: 3.0, cache_read: 0.5, cache_write: 0.0 },
+                    cost: ModelCost { input: 0.5, output: 3.0, cache_read: 0.05, cache_write: 0.0 },
                 },
             ],
             GeminiVariant::ApiKey => vec![
                 Model {
                     id: "gemini-3.1-pro-preview".into(), name: "Gemini 3.1 Pro".into(),
-                    reasoning: true, context_window: 1_000_000, max_tokens: 64_000,
-                    cost: ModelCost { input: 2.0, output: 12.0, cache_read: 0.0, cache_write: 0.0 },
+                    reasoning: true, context_window: 1_048_576, max_tokens: 65_536,
+                    cost: ModelCost { input: 2.0, output: 12.0, cache_read: 0.2, cache_write: 0.375 },
                 },
                 Model {
                     id: "gemini-3-flash-preview".into(), name: "Gemini 3 Flash".into(),
-                    reasoning: true, context_window: 1_000_000, max_tokens: 64_000,
-                    cost: ModelCost { input: 0.5, output: 3.0, cache_read: 0.0, cache_write: 0.0 },
+                    reasoning: true, context_window: 1_048_576, max_tokens: 65_536,
+                    cost: ModelCost { input: 0.5, output: 3.0, cache_read: 0.05, cache_write: 0.0 },
                 },
             ],
         }
