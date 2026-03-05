@@ -178,12 +178,11 @@ impl LlmProvider for GeminiProvider {
                 },
             ],
             GeminiVariant::ApiKey => vec![
-                // Disabled for now until I figure out the pro api key.
-                // Model {
-                //     id: "gemini-3-pro-preview".into(), name: "Gemini 3 Pro".into(),
-                //     reasoning: true, context_window: 1_000_000, max_tokens: 64_000,
-                //     cost: ModelCost { input: 2.0, output: 12.0, cache_read: 0.0, cache_write: 0.0 },
-                // },
+                Model {
+                    id: "gemini-3.1-pro-preview".into(), name: "Gemini 3.1 Pro".into(),
+                    reasoning: true, context_window: 1_000_000, max_tokens: 64_000,
+                    cost: ModelCost { input: 2.0, output: 12.0, cache_read: 0.0, cache_write: 0.0 },
+                },
                 Model {
                     id: "gemini-3-flash-preview".into(), name: "Gemini 3 Flash".into(),
                     reasoning: true, context_window: 1_000_000, max_tokens: 64_000,

@@ -259,7 +259,7 @@ pub fn gen_id() -> String {
 
 /// Target width for single-block summaries. Tagged blocks subtract their
 /// prefix length from this budget so the total stays consistent.
-const SUMMARY_WIDTH: usize = 800;
+const SUMMARY_WIDTH: usize = 150;
 
 fn summarize_blocks(blocks: &[ContentBlock], budget: usize) -> String {
     if blocks.len() == 1 {
