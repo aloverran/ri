@@ -43,10 +43,11 @@ impl StreamAccumulator {
         match event {
             StreamEvent::TextStart => { self.text_buf.clear(); }
             StreamEvent::TextDelta(d) => { self.text_buf.push_str(d); }
-            StreamEvent::TextEnd { .. } => {
+            StreamEvent::TextEnd { sig } => {
                 if !self.text_buf.is_empty() {
                     self.content.push(ContentBlock::Text {
                         text: std::mem::take(&mut self.text_buf),
+                        sig: sig.clone(),
                     });
                 }
             }
@@ -71,7 +72,7 @@ impl StreamAccumulator {
                     tc.json_buf.push_str(json_fragment);
                 }
             }
-            StreamEvent::ToolCallEnd { id, .. } => {
+            StreamEvent::ToolCallEnd { id, sig } => {
                 if let Some(tc) = self.tool_calls.remove(id) {
                     let input: serde_json::Value = serde_json::from_str(&tc.json_buf)
                         .unwrap_or_else(|_| serde_json::json!({
@@ -82,6 +83,7 @@ impl StreamAccumulator {
                         id: id.clone(),
                         name: tc.name,
                         input,
+                        sig: sig.clone(),
                     });
                 }
             }

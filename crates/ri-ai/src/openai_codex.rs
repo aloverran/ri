@@ -509,7 +509,7 @@ fn build_input_messages(messages: &[Message]) -> Vec<Value> {
             Role::User => {
                 let content: Vec<Value> = msg.content.iter().filter_map(|block| {
                     match block {
-                        ContentBlock::Text { text } => {
+                        ContentBlock::Text { text, .. } => {
                             Some(json!({ "type": "input_text", "text": text }))
                         }
                         ContentBlock::Image { media_type, data } => {
@@ -540,7 +540,7 @@ fn build_input_messages(messages: &[Message]) -> Vec<Value> {
                                 }
                             }
                         }
-                        ContentBlock::Text { text } => {
+                        ContentBlock::Text { text, .. } => {
                             let msg_id = format!("msg_{}", text_block_counter);
                             text_block_counter += 1;
                             input.push(json!({
@@ -551,7 +551,7 @@ fn build_input_messages(messages: &[Message]) -> Vec<Value> {
                                 "id": msg_id,
                             }));
                         }
-                        ContentBlock::ToolUse { id, name, input: args } => {
+                        ContentBlock::ToolUse { id, name, input: args, .. } => {
                             let (call_id, item_id) = split_compound_id(id);
                             input.push(json!({
                                 "type": "function_call",
@@ -575,7 +575,7 @@ fn build_input_messages(messages: &[Message]) -> Vec<Value> {
             for block in &msg.content {
                 if let ContentBlock::ToolResult { tool_use_id, content, .. } = block {
                     let text: String = content.iter().filter_map(|b| {
-                        if let ContentBlock::Text { text } = b { Some(text.as_str()) } else { None }
+                        if let ContentBlock::Text { text, .. } = b { Some(text.as_str()) } else { None }
                     }).collect::<Vec<_>>().join("\n");
 
                     let (call_id, _) = split_compound_id(tool_use_id);

@@ -444,7 +444,7 @@ fn convert_message(msg: &Message) -> Value {
 
 fn convert_content(c: &ContentBlock) -> Value {
     match c {
-        ContentBlock::Text { text } => json!({ "type": "text", "text": text }),
+        ContentBlock::Text { text, .. } => json!({ "type": "text", "text": text }),
         ContentBlock::Thinking { thinking, sig } => {
             if let Some(s) = sig {
                 json!({ "type": "thinking", "thinking": thinking, "signature": s })
@@ -456,7 +456,7 @@ fn convert_content(c: &ContentBlock) -> Value {
             "type": "image",
             "source": { "type": "base64", "media_type": media_type, "data": data }
         }),
-        ContentBlock::ToolUse { id, name, input } => json!({
+        ContentBlock::ToolUse { id, name, input, .. } => json!({
             "type": "tool_use", "id": id, "name": name, "input": input
         }),
         ContentBlock::ToolResult { tool_use_id, content, is_error, .. } => {

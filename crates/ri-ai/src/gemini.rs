@@ -571,7 +571,7 @@ fn build_contents(messages: &[Message], model_id: &str) -> Vec<Value> {
         let mut parts: Vec<Value> = Vec::new();
         for block in filtered_content {
             match block {
-                ContentBlock::Text { text } => {
+                ContentBlock::Text { text, .. } => {
                     if text.trim().is_empty() { continue; }
                     parts.push(json!({ "text": text }));
                 }
@@ -587,19 +587,25 @@ fn build_contents(messages: &[Message], model_id: &str) -> Vec<Value> {
                     }
                     parts.push(json!({ "text": thinking }));
                 }
-                ContentBlock::ToolUse { name, input, .. } => {
-                    // Note: sig for ToolUse was previously being read from extra but 
-                    // we've decided only Thinking needs it. Removing sig handling for ToolUse.
-                    if gemini3 {
+                ContentBlock::ToolUse { name, input, sig, .. } => {
+                    // Gemini 3 requires thoughtSignature on function calls when thinking
+                    // is enabled. With a valid signature we can use the native format;
+                    // without one (cross-provider history) we fall back to a text annotation.
+                    let valid_sig = sig.as_deref().filter(|s| is_valid_signature(s));
+                    if gemini3 && valid_sig.is_none() {
                         let args_str = serde_json::to_string_pretty(input).unwrap_or_default();
                         parts.push(json!({
                             "text": format!(
-                                "[Historical context: tool \"{}\" was called with arguments: {}. Do not mimic this format - use proper function calling.]",
+                                "[Historical context: a different model called tool \"{}\" with arguments: {}. Do not mimic this format - use proper function calling.]",
                                 name, args_str
                             )
                         }));
                     } else {
-                        parts.push(json!({ "functionCall": { "name": name, "args": input } }));
+                        let mut part = json!({ "functionCall": { "name": name, "args": input } });
+                        if let Some(s) = valid_sig {
+                            part["thoughtSignature"] = json!(s);
+                        }
+                        parts.push(part);
                     }
                 }
                 ContentBlock::ToolResult { .. } => {}

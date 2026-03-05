@@ -108,10 +108,15 @@ pub enum Role {
 pub enum ContentBlock {
     Text {
         text: String,
+        /// Provider signature for replaying this block to the originating model.
+        /// Gemini: `thoughtSignature`. Anthropic: `signature`. OpenAI: item id.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sig: Option<String>,
     },
     Thinking {
         thinking: String,
-        /// Provider signature for replaying thinking blocks (Anthropic, Gemini).
+        /// Provider signature for replaying this block to the originating model.
+        /// Gemini: `thoughtSignature`. Anthropic: `signature`. OpenAI: encrypted item JSON.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         sig: Option<String>,
     },
@@ -124,6 +129,10 @@ pub enum ContentBlock {
         id: String,
         name: String,
         input: serde_json::Value,
+        /// Provider signature for replaying this block to the originating model.
+        /// Gemini: `thoughtSignature` (required -- 400 error if omitted).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sig: Option<String>,
     },
     ToolResult {
         #[serde(rename = "toolUseId")]
@@ -145,7 +154,7 @@ pub enum ContentBlock {
 
 impl ContentBlock {
     pub fn text(s: impl Into<String>) -> Self {
-        ContentBlock::Text { text: s.into() }
+        ContentBlock::Text { text: s.into(), sig: None }
     }
 
     pub fn thinking(s: impl Into<String>) -> Self {
@@ -153,7 +162,7 @@ impl ContentBlock {
     }
 
     pub fn tool_use(id: impl Into<String>, name: impl Into<String>, input: serde_json::Value) -> Self {
-        ContentBlock::ToolUse { id: id.into(), name: name.into(), input }
+        ContentBlock::ToolUse { id: id.into(), name: name.into(), input, sig: None }
     }
 
     pub fn tool_result(tool_use_id: impl Into<String>, content: Vec<ContentBlock>, is_error: bool, details: Option<serde_json::Value>) -> Self {
@@ -176,7 +185,7 @@ impl ContentBlock {
     /// Short human-readable summary of this block, targeting ~800 chars.
     pub fn summarize(&self) -> String {
         match self {
-            ContentBlock::Text { text } => {
+            ContentBlock::Text { text, .. } => {
                 truncate_with_ellipsis(text, SUMMARY_WIDTH)
             }
             ContentBlock::Thinking { thinking, .. } => {
@@ -195,7 +204,7 @@ impl ContentBlock {
             ContentBlock::ToolResult { is_error, content, .. } => {
                 let tag = if *is_error { "[tool error] " } else { "[tool result] " };
                 let inner: String = content.iter().map(|b| match b {
-                    ContentBlock::Text { text } => text.as_str(),
+                    ContentBlock::Text { text, .. } => text.as_str(),
                     _ => "",
                 }).collect::<Vec<_>>().join(" ");
                 let body = truncate_with_ellipsis(&inner, SUMMARY_WIDTH - tag.len());
@@ -324,7 +333,7 @@ mod tests {
     fn thinking_sig_roundtrip() {
         let json_data = json!({ "type": "thinking", "thinking": "let me reason", "sig": "abc123" });
         let block: ContentBlock = serde_json::from_str(&json_data.to_string()).unwrap();
-        if let ContentBlock::Thinking { thinking, sig } = &block {
+        if let ContentBlock::Thinking { thinking, sig, .. } = &block {
             assert_eq!(thinking, "let me reason");
             assert_eq!(sig.as_deref(), Some("abc123"));
         } else {
