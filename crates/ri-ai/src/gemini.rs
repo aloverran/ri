@@ -307,7 +307,7 @@ impl LlmProvider for GeminiProvider {
 
     async fn stream(&self, opts: RequestOptions) -> Result<EventStream, ApiError> {
         let (token, project_id) = self.ensure_valid_token().await
-            .map_err(|e| ApiError::Other(e.to_string()))?;
+            .map_err(|e| ApiError::other(format!("{e:#}")))?;
 
         let request = build_request(self.variant, &token, &project_id, &opts);
         let bytes = sse::send(request).await?;

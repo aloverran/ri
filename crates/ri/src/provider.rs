@@ -113,25 +113,56 @@ pub struct RequestOptions {
     pub native_tools: bool,
 }
 
+// -- Errors --
+
+type BoxError = Box<dyn std::error::Error + Send + Sync + 'static>;
+
+/// An error from an LLM provider. Actionable variants (`RateLimited`,
+/// `ContextOverflow`) carry structured data for the agent loop to act on.
+/// Everything else flows through `Other` transparently, preserving the
+/// full source chain for diagnostics.
 #[derive(Debug, thiserror::Error)]
 pub enum ApiError {
-    #[error("HTTP error: {0}")]
-    Http(String),
+    #[error("rate limited, retry after {retry_after_ms}ms")]
+    RateLimited {
+        retry_after_ms: u64,
+        source: BoxError,
+    },
 
-    #[error("API error ({status}): {message}")]
-    Api { status: u16, message: String },
+    #[error("context overflow")]
+    ContextOverflow {
+        source: BoxError,
+    },
 
-    #[error("Context overflow: used {used} of {limit} tokens")]
-    ContextOverflow { used: usize, limit: usize },
+    #[error(transparent)]
+    Other(BoxError),
+}
 
-    #[error("Rate limited, retry after {retry_after_ms}ms")]
-    RateLimited { retry_after_ms: u64 },
+impl ApiError {
+    pub fn other(source: impl Into<BoxError>) -> Self {
+        Self::Other(source.into())
+    }
 
-    #[error("Stream parse error: {0}")]
-    StreamParse(String),
+    pub fn rate_limited(retry_after_ms: u64, source: impl Into<BoxError>) -> Self {
+        Self::RateLimited { retry_after_ms, source: source.into() }
+    }
 
-    #[error("{0}")]
-    Other(String),
+    pub fn context_overflow(source: impl Into<BoxError>) -> Self {
+        Self::ContextOverflow { source: source.into() }
+    }
+
+    /// Walk the full source chain into a single string for logging or persistence.
+    pub fn display_chain(&self) -> String {
+        use std::error::Error;
+        let mut chain = self.to_string();
+        let mut current = self.source();
+        while let Some(cause) = current {
+            chain.push_str(": ");
+            chain.push_str(&cause.to_string());
+            current = cause.source();
+        }
+        chain
+    }
 }
 
 pub type EventStream = Pin<Box<dyn Stream<Item = Result<StreamEvent, ApiError>> + Send>>;

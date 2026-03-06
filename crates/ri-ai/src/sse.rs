@@ -18,7 +18,8 @@ use ri::{ApiError, StreamEvent};
 pub async fn send(
     builder: reqwest::RequestBuilder,
 ) -> Result<impl futures::Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Send, ApiError> {
-    let response = builder.send().await.map_err(|e| ApiError::Http(e.to_string()))?;
+    let response = builder.send().await
+        .map_err(|e| ApiError::other(e))?;
     let status = response.status().as_u16();
 
     if status >= 400 {
@@ -31,25 +32,26 @@ pub async fn send(
 
 fn parse_http_error(status: u16, body: &str) -> ApiError {
     let parsed: serde_json::Value = serde_json::from_str(body).unwrap_or_default();
+    let response_msg = |msg: &str| format!("HTTP {status}: {msg}");
 
     if let Some(error) = parsed.get("error") {
         let error_type = error["type"].as_str().unwrap_or("unknown");
-        let message = error["message"].as_str().unwrap_or(body).to_string();
+        let message = error["message"].as_str().unwrap_or(body);
 
         if error_type == "rate_limit_error" || status == 429 {
-            return ApiError::RateLimited { retry_after_ms: 5000 };
+            return ApiError::rate_limited(5000, response_msg(message));
         }
         if message.contains("token") && (message.contains("exceed") || message.contains("limit")) {
-            return ApiError::ContextOverflow { used: 0, limit: 0 };
+            return ApiError::context_overflow(response_msg(message));
         }
-        return ApiError::Api { status, message: format!("{}: {}", error_type, message) };
+        return ApiError::other(response_msg(&format!("{error_type}: {message}")));
     }
 
     if status == 429 || body.contains("RESOURCE_EXHAUSTED") {
-        return ApiError::RateLimited { retry_after_ms: 5000 };
+        return ApiError::rate_limited(5000, response_msg(body));
     }
 
-    ApiError::Api { status, message: body.to_string() }
+    ApiError::other(response_msg(body))
 }
 
 // -- SSE parsing --
@@ -128,7 +130,7 @@ pub fn drive_sse_stream(
                     }
                 }
                 Err(e) => {
-                    yield Err(ApiError::Http(e.to_string()));
+                    yield Err(ApiError::other(e));
                     return;
                 }
             }

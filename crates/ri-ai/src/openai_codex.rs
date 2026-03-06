@@ -225,10 +225,10 @@ impl LlmProvider for OpenAICodexProvider {
 
     async fn stream(&self, opts: RequestOptions) -> Result<EventStream, ApiError> {
         let (token, account_id) = self.ensure_valid_token().await
-            .map_err(|e| ApiError::Other(e.to_string()))?;
+            .map_err(|e| ApiError::other(format!("{e:#}")))?;
 
         if token.is_empty() {
-            return Err(ApiError::Other("Not authenticated with OpenAI Codex".into()));
+            return Err(ApiError::other("Not authenticated with OpenAI Codex"));
         }
 
         let prompt_cache_key = derive_prompt_cache_key(&opts.messages);
@@ -394,10 +394,11 @@ async fn send_with_retry(
                 return Err(parse_codex_error(status, &error_text));
             }
             Err(e) => {
-                last_error = Some(e.to_string());
+                let detail = e.to_string();
+                last_error = Some(Box::new(e) as Box<dyn std::error::Error + Send + Sync>);
                 if attempt < MAX_RETRIES {
                     let delay = BASE_DELAY_MS * 2u64.pow(attempt);
-                    tracing::info!("Codex network error, retrying in {}ms (attempt {})", delay, attempt + 1);
+                    tracing::info!("Codex network error, retrying in {}ms (attempt {}): {detail}", delay, attempt + 1);
                     tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
                     continue;
                 }
@@ -405,7 +406,7 @@ async fn send_with_retry(
         }
     }
 
-    Err(ApiError::Http(last_error.unwrap_or_else(|| "Failed after retries".into())))
+    Err(ApiError::other(last_error.unwrap_or_else(|| "Failed after retries".into())))
 }
 
 fn parse_codex_error(status: u16, body: &str) -> ApiError {
@@ -417,19 +418,20 @@ fn parse_codex_error(status: u16, body: &str) -> ApiError {
 
             // Usage limit / rate limit errors
             if code.contains("usage_limit") || code.contains("rate_limit") || status == 429 {
-                return ApiError::RateLimited { retry_after_ms: 60_000 };
+                let message = err["message"].as_str().unwrap_or(body);
+                return ApiError::rate_limited(60_000, format!("HTTP {status}: {message}"));
             }
 
             let message = err["message"].as_str().unwrap_or(body).to_string();
-            return ApiError::Api { status, message };
+            return ApiError::other(format!("HTTP {status}: {message}"));
         }
     }
 
     if status == 429 {
-        return ApiError::RateLimited { retry_after_ms: 60_000 };
+        return ApiError::rate_limited(60_000, format!("HTTP {status}: {body}"));
     }
 
-    ApiError::Api { status, message: body.to_string() }
+    ApiError::other(format!("HTTP {status}: {body}"))
 }
 
 // -- Request body --
@@ -665,20 +667,14 @@ impl CodexState {
                 let code = event["code"].as_str().unwrap_or("");
                 let message = event["message"].as_str().unwrap_or("");
                 let msg = if !message.is_empty() { message } else { code };
-                out.push(Err(ApiError::Api {
-                    status: 0,
-                    message: format!("Codex error: {}", msg),
-                }));
+                out.push(Err(ApiError::other(format!("Codex error: {msg}"))));
             }
 
             "response.failed" => {
                 let msg = event.pointer("/response/error/message")
                     .and_then(|v| v.as_str())
                     .unwrap_or("Codex response failed");
-                out.push(Err(ApiError::Api {
-                    status: 0,
-                    message: msg.to_string(),
-                }));
+                out.push(Err(ApiError::other(msg)));
             }
 
             // -- Item lifecycle --

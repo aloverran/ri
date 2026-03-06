@@ -259,7 +259,7 @@ impl LlmProvider for AnthropicProvider {
 
     async fn stream(&self, mut opts: RequestOptions) -> Result<EventStream, ApiError> {
         let (api_key, is_oauth) = self.ensure_valid_token().await
-            .map_err(|e| ApiError::Other(e.to_string()))?;
+            .map_err(|e| ApiError::other(format!("{e:#}")))?;
 
         // Strip the -1m suffix (ri-internal) before sending to the API.
         let extended_context = opts.model.id.ends_with("-1m");
@@ -546,7 +546,7 @@ impl SseInterpreter for AnthropicState {
                 let parsed: Value = match serde_json::from_str(&sse.data) {
                     Ok(v) => v,
                     Err(e) => {
-                        out.push(Err(ApiError::StreamParse(format!("content_block_start: {}", e))));
+                        out.push(Err(ApiError::other(format!("stream parse error (content_block_start): {e}"))));
                         return out;
                     }
                 };
@@ -577,7 +577,7 @@ impl SseInterpreter for AnthropicState {
                 let parsed: Value = match serde_json::from_str(&sse.data) {
                     Ok(v) => v,
                     Err(e) => {
-                        out.push(Err(ApiError::StreamParse(format!("content_block_delta: {}", e))));
+                        out.push(Err(ApiError::other(format!("stream parse error (content_block_delta): {e}"))));
                         return out;
                     }
                 };
@@ -614,7 +614,7 @@ impl SseInterpreter for AnthropicState {
                 let parsed: Value = match serde_json::from_str(&sse.data) {
                     Ok(v) => v,
                     Err(e) => {
-                        out.push(Err(ApiError::StreamParse(format!("content_block_stop: {}", e))));
+                        out.push(Err(ApiError::other(format!("stream parse error (content_block_stop): {e}"))));
                         return out;
                     }
                 };
@@ -683,13 +683,10 @@ impl SseInterpreter for AnthropicState {
                 let error_msg = parsed["error"]["message"].as_str().unwrap_or("Unknown error").to_string();
                 match error_type {
                     "rate_limit_error" => {
-                        out.push(Err(ApiError::RateLimited { retry_after_ms: 5000 }));
+                        out.push(Err(ApiError::rate_limited(5000, error_msg)));
                     }
                     _ => {
-                        out.push(Err(ApiError::Api {
-                            status: 0,
-                            message: format!("{}: {}", error_type, error_msg),
-                        }));
+                        out.push(Err(ApiError::other(format!("{error_type}: {error_msg}"))));
                     }
                 }
             }
