@@ -393,9 +393,13 @@ fn build_request(api_key: &str, opts: &RequestOptions, extended_context: bool) -
 }
 
 fn build_body(opts: &RequestOptions, is_oauth: bool) -> Value {
+    // Only emit structured tool protocol for complete call+result pairs.
+    // Orphaned tool blocks from cross-provider contexts are filtered out.
+    let complete = ri::complete_tool_pairs(&opts.messages);
+
     let messages: Vec<Value> = opts.messages.iter()
         .filter(|m| m.role != Role::System)
-        .map(|m| convert_message(m))
+        .map(|m| convert_message(m, &complete))
         .collect();
 
     let max_tokens = opts.max_tokens
@@ -449,18 +453,29 @@ fn build_body(opts: &RequestOptions, is_oauth: bool) -> Value {
     body
 }
 
-fn convert_message(msg: &Message) -> Value {
+fn convert_message(msg: &Message, complete: &std::collections::HashSet<&str>) -> Value {
     let role = match msg.role {
         Role::User => "user",
         Role::Assistant => "assistant",
         Role::System => "user",
     };
 
+    // Convert blocks, downgrading orphaned tool blocks to text.
     let content: Vec<Value> = msg.content.iter()
         .filter(|c| !matches!(c, ContentBlock::Error { .. }))
-        .map(convert_content)
+        .filter_map(|c| match c {
+            ContentBlock::ToolUse { id, .. } if !complete.contains(id.as_str()) => {
+                c.tool_as_text().map(|t| json!({ "type": "text", "text": t }))
+            }
+            ContentBlock::ToolResult { tool_use_id, .. } if !complete.contains(tool_use_id.as_str()) => {
+                c.tool_as_text().map(|t| json!({ "type": "text", "text": t }))
+            }
+            _ => Some(convert_content(c)),
+        })
         .collect();
-    let has_tool_results = msg.content.iter().any(|c| matches!(c, ContentBlock::ToolResult { .. }));
+    let has_tool_results = msg.content.iter().any(|c| {
+        matches!(c, ContentBlock::ToolResult { tool_use_id, .. } if complete.contains(tool_use_id.as_str()))
+    });
     let effective_role = if has_tool_results { "user" } else { role };
 
     json!({ "role": effective_role, "content": content })

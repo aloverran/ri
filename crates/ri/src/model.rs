@@ -12,6 +12,7 @@
 //! at them.
 
 use std::borrow::Borrow;
+use std::collections::HashSet;
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
@@ -182,6 +183,26 @@ impl ContentBlock {
         ContentBlock::Error { message: s.into() }
     }
 
+    /// Text representation of a tool block for contexts where structured
+    /// tool protocol can't be emitted (orphaned call/result pairs crossing
+    /// provider boundaries). Returns None for non-tool blocks.
+    pub fn tool_as_text(&self) -> Option<String> {
+        match self {
+            ContentBlock::ToolUse { name, input, .. } => {
+                Some(format!("[tool call: {}({})]", name, input))
+            }
+            ContentBlock::ToolResult { content, is_error, .. } => {
+                let text: String = content.iter().filter_map(|b| {
+                    if let ContentBlock::Text { text, .. } = b { Some(text.as_str()) } else { None }
+                }).collect::<Vec<_>>().join("\n");
+                if text.is_empty() { return None; }
+                let label = if *is_error { "tool error" } else { "tool output" };
+                Some(format!("[{}: {}]", label, text))
+            }
+            _ => None,
+        }
+    }
+
     /// Short human-readable summary of this block, targeting ~800 chars.
     pub fn summarize(&self) -> String {
         match self {
@@ -220,6 +241,32 @@ impl ContentBlock {
             }
         }
     }
+}
+
+// -- Tool pair analysis --
+
+/// Compute which tool call IDs form complete call+result pairs in a message list.
+///
+/// A ToolUse block in message N depends on a ToolResult block in message N+1.
+/// When messages are cherry-picked or forwarded across provider boundaries,
+/// these pairs can be split. Provider projection layers use this to decide
+/// which tool blocks can be emitted as structured protocol and which must
+/// be demoted or skipped.
+pub fn complete_tool_pairs<'a>(messages: &'a [Message]) -> HashSet<&'a str> {
+    let mut calls = HashSet::new();
+    let mut results = HashSet::new();
+
+    for msg in messages {
+        for block in &msg.content {
+            match block {
+                ContentBlock::ToolUse { id, .. } => { calls.insert(id.as_str()); }
+                ContentBlock::ToolResult { tool_use_id, .. } => { results.insert(tool_use_id.as_str()); }
+                _ => {}
+            }
+        }
+    }
+
+    calls.intersection(&results).copied().collect()
 }
 
 // -- Context --

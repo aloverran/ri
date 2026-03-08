@@ -494,6 +494,9 @@ fn build_cloud_body(variant: GeminiVariant, project_id: &str, opts: &RequestOpti
 fn build_contents(messages: &[Message], model_id: &str) -> Vec<Value> {
     let gemini3 = is_gemini3(model_id);
 
+    // Only emit structured tool protocol for complete call+result pairs.
+    let complete = ri::complete_tool_pairs(messages);
+
     let mut tool_names: HashMap<String, String> = HashMap::new();
     for msg in messages {
         for block in &msg.content {
@@ -519,6 +522,10 @@ fn build_contents(messages: &[Message], model_id: &str) -> Vec<Value> {
         if has_tool_results {
             let parts: Vec<Value> = filtered_content.iter().filter_map(|c| {
                 if let ContentBlock::ToolResult { tool_use_id, content, is_error, .. } = c {
+                    if !complete.contains(tool_use_id.as_str()) {
+                        // Orphaned result -- downgrade to text.
+                        return c.tool_as_text().map(|t| json!({ "text": t }));
+                    }
                     let tool_name = tool_names.get(tool_use_id.as_str())
                         .cloned()
                         .unwrap_or_else(|| {
@@ -587,12 +594,14 @@ fn build_contents(messages: &[Message], model_id: &str) -> Vec<Value> {
                     }
                     parts.push(json!({ "text": thinking }));
                 }
-                ContentBlock::ToolUse { name, input, sig, .. } => {
+                ContentBlock::ToolUse { id, name, input, sig, .. } => {
                     // Gemini 3 requires thoughtSignature on function calls when thinking
-                    // is enabled. With a valid signature we can use the native format;
-                    // without one (cross-provider history) we fall back to a text annotation.
+                    // is enabled. Emit native functionCall only when the pair is complete
+                    // and we have a valid signature; otherwise fall back to a text annotation.
                     let valid_sig = sig.as_deref().filter(|s| is_valid_signature(s));
-                    if gemini3 && valid_sig.is_none() {
+                    let can_emit_native = complete.contains(id.as_str())
+                        && !(gemini3 && valid_sig.is_none());
+                    if !can_emit_native {
                         let args_str = serde_json::to_string_pretty(input).unwrap_or_default();
                         parts.push(json!({
                             "text": format!(

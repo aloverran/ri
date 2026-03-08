@@ -504,6 +504,11 @@ fn build_input_messages(messages: &[Message]) -> Vec<Value> {
     let mut input: Vec<Value> = Vec::new();
     let mut text_block_counter = 0usize;
 
+    // Only emit structured tool protocol (function_call / function_call_output)
+    // for complete call+result pairs. Orphaned tool blocks are skipped -- the
+    // Codex API returns 400 if it sees a function_call without a matching output.
+    let complete = ri::complete_tool_pairs(messages);
+
     for msg in messages {
         if msg.role == Role::System { continue; }
 
@@ -554,6 +559,22 @@ fn build_input_messages(messages: &[Message]) -> Vec<Value> {
                             }));
                         }
                         ContentBlock::ToolUse { id, name, input: args, .. } => {
+                            if !complete.contains(id.as_str()) {
+                                // Orphaned call -- downgrade to text so the model
+                                // still sees what happened without invalid protocol.
+                                if let Some(text) = block.tool_as_text() {
+                                    let msg_id = format!("msg_{}", text_block_counter);
+                                    text_block_counter += 1;
+                                    input.push(json!({
+                                        "type": "message",
+                                        "role": "assistant",
+                                        "content": [{ "type": "output_text", "text": text, "annotations": [] }],
+                                        "status": "completed",
+                                        "id": msg_id,
+                                    }));
+                                }
+                                continue;
+                            }
                             let (call_id, item_id) = split_compound_id(id);
                             input.push(json!({
                                 "type": "function_call",
@@ -576,6 +597,13 @@ fn build_input_messages(messages: &[Message]) -> Vec<Value> {
         if msg.role == Role::User || msg.role == Role::Assistant {
             for block in &msg.content {
                 if let ContentBlock::ToolResult { tool_use_id, content, .. } = block {
+                    if !complete.contains(tool_use_id.as_str()) {
+                        // Orphaned result -- downgrade to user text.
+                        if let Some(text) = block.tool_as_text() {
+                            input.push(json!({ "role": "user", "content": [{ "type": "input_text", "text": text }] }));
+                        }
+                        continue;
+                    }
                     let text: String = content.iter().filter_map(|b| {
                         if let ContentBlock::Text { text, .. } = b { Some(text.as_str()) } else { None }
                     }).collect::<Vec<_>>().join("\n");
