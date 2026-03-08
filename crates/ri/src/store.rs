@@ -49,9 +49,15 @@ impl Pool {
     }
 
     /// Resolve an ordered list of message IDs to their messages.
-    /// Silently skips IDs not found in the pool.
+    /// Skips IDs not found in the pool, but warns so missing data is visible.
     pub fn resolve(&self, ids: &[MessageId]) -> Vec<&Message> {
-        ids.iter().filter_map(|id| self.messages.get(id)).collect()
+        ids.iter().filter_map(|id| {
+            let msg = self.messages.get(id);
+            if msg.is_none() {
+                tracing::warn!("Message [{}] not found during context resolution", id);
+            }
+            msg
+        }).collect()
     }
 
     /// Resolve a context to its messages.
