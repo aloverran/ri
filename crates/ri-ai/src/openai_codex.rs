@@ -538,11 +538,11 @@ fn build_input_messages(messages: &[Message]) -> Vec<Value> {
             Role::Assistant => {
                 for block in &msg.content {
                     match block {
-                        ContentBlock::Thinking { sig, .. } => {
-                            // Reasoning blocks: replay the stored signature (encrypted item JSON).
-                            // If no signature, skip -- we can't fabricate encrypted reasoning.
-                            if let Some(sig) = sig {
-                                if let Ok(item) = serde_json::from_str::<Value>(sig) {
+                        ContentBlock::Thinking { replay, .. } => {
+                            // Reasoning blocks: replay the stored encrypted blob.
+                            // If no replay data, skip -- we can't fabricate encrypted reasoning.
+                            if let Some(ri::ThinkingReplay::Encrypted(blob)) = replay {
+                                if let Ok(item) = serde_json::from_str::<Value>(blob) {
                                     input.push(item);
                                 }
                             }
@@ -805,12 +805,14 @@ impl CodexState {
 
                 match item_type {
                     "reasoning" => {
-                        // Store the full item JSON as the signature for replay.
+                        // Store the full item JSON as the encrypted replay blob.
                         self.reasoning_item = Some(item.clone());
-                        let sig = serde_json::to_string(item).ok();
+                        let replay = serde_json::to_string(item)
+                            .ok()
+                            .map(ri::ThinkingReplay::Encrypted);
                         // Only emit ThinkingEnd if we haven't already (via finish_current).
                         if matches!(&self.current, Some(CodexBlock::Reasoning)) {
-                            out.push(Ok(StreamEvent::ThinkingEnd { sig }));
+                            out.push(Ok(StreamEvent::ThinkingEnd { replay }));
                             self.current = None;
                         }
                     }
@@ -877,9 +879,10 @@ impl CodexState {
     fn finish_current(&mut self, out: &mut Vec<Result<StreamEvent, ApiError>>) {
         match self.current.take() {
             Some(CodexBlock::Reasoning) => {
-                let sig = self.reasoning_item.take()
-                    .and_then(|item| serde_json::to_string(&item).ok());
-                out.push(Ok(StreamEvent::ThinkingEnd { sig }));
+                let replay = self.reasoning_item.take()
+                    .and_then(|item| serde_json::to_string(&item).ok())
+                    .map(ri::ThinkingReplay::Encrypted);
+                out.push(Ok(StreamEvent::ThinkingEnd { replay }));
             }
             Some(CodexBlock::Message) => {
                 out.push(Ok(StreamEvent::TextEnd { sig: None }));

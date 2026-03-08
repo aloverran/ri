@@ -93,6 +93,34 @@ impl Message {
         let content_summary = summarize_blocks(&self.content, content_budget);
         format!("[{}] {}", role_tag, content_summary)
     }
+
+    /// Full human-readable rendering for readMessage output.
+    ///
+    /// Unlike `summarize()` (which targets ~150 chars), this shows the complete
+    /// text content of every block. Opaque replay blobs are replaced with a
+    /// size indicator so they never blow up context windows.
+    pub fn display(&self) -> String {
+        let role_tag = match self.role {
+            Role::System => "system",
+            Role::User => "user",
+            Role::Assistant => "assistant",
+        };
+
+        let mut out = format!("MESSAGE {}\nrole: {}\n", self.id, role_tag);
+
+        if let Some(meta) = &self.meta {
+            out.push_str("meta: ");
+            out.push_str(&serde_json::to_string(meta).unwrap_or_default());
+            out.push('\n');
+        }
+
+        for block in &self.content {
+            out.push('\n');
+            display_block(&mut out, block);
+        }
+
+        out
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -101,6 +129,20 @@ pub enum Role {
     System,
     User,
     Assistant,
+}
+
+/// Provider-specific data needed to replay a thinking block to its originating model.
+///
+/// Claude and Gemini produce compact cryptographic signatures (~1-3KB).
+/// OpenAI produces an encrypted JSON blob containing the full reasoning
+/// content (can be hundreds of KB) which must be sent back verbatim.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", content = "value", rename_all = "snake_case")]
+pub enum ThinkingReplay {
+    /// Compact cryptographic token (Anthropic `signature`, Gemini `thoughtSignature`).
+    Signature(String),
+    /// Full encrypted reasoning item JSON (OpenAI). Opaque and large.
+    Encrypted(String),
 }
 
 /// A typed piece of content within a message.
@@ -116,10 +158,10 @@ pub enum ContentBlock {
     },
     Thinking {
         thinking: String,
-        /// Provider signature for replaying this block to the originating model.
-        /// Gemini: `thoughtSignature`. Anthropic: `signature`. OpenAI: encrypted item JSON.
+        /// Provider-specific replay data. See `ThinkingReplay` for why this
+        /// is an enum rather than a plain string.
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        sig: Option<String>,
+        replay: Option<ThinkingReplay>,
     },
     Image {
         #[serde(rename = "mediaType")]
@@ -159,7 +201,7 @@ impl ContentBlock {
     }
 
     pub fn thinking(s: impl Into<String>) -> Self {
-        ContentBlock::Thinking { thinking: s.into(), sig: None }
+        ContentBlock::Thinking { thinking: s.into(), replay: None }
     }
 
     pub fn tool_use(id: impl Into<String>, name: impl Into<String>, input: serde_json::Value) -> Self {
@@ -243,6 +285,70 @@ impl ContentBlock {
     }
 }
 
+/// Format a content block for full-content readMessage display.
+fn display_block(out: &mut String, block: &ContentBlock) {
+    match block {
+        ContentBlock::Text { text, .. } => {
+            out.push_str("--- text ---\n");
+            out.push_str(text);
+            out.push('\n');
+        }
+        ContentBlock::Thinking { thinking, replay } => {
+            out.push_str("--- thinking ---\n");
+            out.push_str(thinking);
+            out.push('\n');
+            match replay {
+                Some(ThinkingReplay::Signature(s)) => {
+                    let size = format_byte_size(s.len());
+                    out.push_str(&format!("(replay: signature, {})\n", size));
+                }
+                Some(ThinkingReplay::Encrypted(s)) => {
+                    let size = format_byte_size(s.len());
+                    out.push_str(&format!("(replay: encrypted, {} -- not shown)\n", size));
+                }
+                None => {}
+            }
+        }
+        ContentBlock::Image { media_type, data } => {
+            let size = format_byte_size(data.len());
+            out.push_str(&format!("--- image ({}, {}) ---\n", media_type, size));
+        }
+        ContentBlock::ToolUse { name, input, .. } => {
+            out.push_str(&format!("--- tool_use: {} ---\n", name));
+            out.push_str(&serde_json::to_string_pretty(input).unwrap_or_default());
+            out.push('\n');
+        }
+        ContentBlock::ToolResult { tool_use_id, content, is_error, .. } => {
+            let label = if *is_error { "tool_error" } else { "tool_result" };
+            out.push_str(&format!("--- {} (call {}) ---\n", label, tool_use_id));
+            for inner in content {
+                if let ContentBlock::Text { text, .. } = inner {
+                    out.push_str(text);
+                    out.push('\n');
+                }
+            }
+        }
+        ContentBlock::Error { message } => {
+            out.push_str(&format!("--- error ---\n{}\n", message));
+        }
+        ContentBlock::Unknown(v) => {
+            out.push_str("--- unknown ---\n");
+            out.push_str(&serde_json::to_string_pretty(v).unwrap_or_default());
+            out.push('\n');
+        }
+    }
+}
+
+fn format_byte_size(bytes: usize) -> String {
+    if bytes < 1024 {
+        format!("{}B", bytes)
+    } else if bytes < 1024 * 1024 {
+        format!("{:.1}KB", bytes as f64 / 1024.0)
+    } else {
+        format!("{:.1}MB", bytes as f64 / (1024.0 * 1024.0))
+    }
+}
+
 // -- Tool pair analysis --
 
 /// Compute which tool call IDs form complete call+result pairs in a message list.
@@ -311,6 +417,18 @@ pub fn gen_id() -> String {
     Uuid::new_v4().simple().to_string()
 }
 
+/// Generate a compact, human-readable object ID: `{YYMM}_{12 hex}`.
+///
+/// The two-digit year + month prefix gives temporal context at a glance.
+/// Twelve hex characters (48 bits of randomness) are collision-safe to
+/// well beyond 200k objects. No file scanning needed -- globally unique
+/// by construction.
+pub fn gen_obj_id() -> String {
+    let now = chrono::Utc::now();
+    let hex = &Uuid::new_v4().simple().to_string()[..12];
+    format!("{}_{}", now.format("%y%m"), hex)
+}
+
 // Summarization helpers (private)
 
 /// Target width for single-block summaries. Tagged blocks subtract their
@@ -377,12 +495,32 @@ mod tests {
     }
 
     #[test]
-    fn thinking_sig_roundtrip() {
-        let json_data = json!({ "type": "thinking", "thinking": "let me reason", "sig": "abc123" });
+    fn thinking_replay_roundtrip() {
+        let json_data = json!({
+            "type": "thinking",
+            "thinking": "let me reason",
+            "replay": { "type": "signature", "value": "abc123" }
+        });
         let block: ContentBlock = serde_json::from_str(&json_data.to_string()).unwrap();
-        if let ContentBlock::Thinking { thinking, sig, .. } = &block {
+        if let ContentBlock::Thinking { thinking, replay, .. } = &block {
             assert_eq!(thinking, "let me reason");
-            assert_eq!(sig.as_deref(), Some("abc123"));
+            assert!(matches!(replay, Some(ThinkingReplay::Signature(s)) if s == "abc123"));
+        } else {
+            panic!("Expected Thinking variant");
+        }
+    }
+
+    #[test]
+    fn thinking_encrypted_roundtrip() {
+        let json_data = json!({
+            "type": "thinking",
+            "thinking": "summary only",
+            "replay": { "type": "encrypted", "value": "{\"id\":\"item_abc\"}" }
+        });
+        let block: ContentBlock = serde_json::from_str(&json_data.to_string()).unwrap();
+        if let ContentBlock::Thinking { thinking, replay, .. } = &block {
+            assert_eq!(thinking, "summary only");
+            assert!(matches!(replay, Some(ThinkingReplay::Encrypted(s)) if s.contains("item_abc")));
         } else {
             panic!("Expected Thinking variant");
         }

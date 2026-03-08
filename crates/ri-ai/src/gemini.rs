@@ -582,9 +582,9 @@ fn build_contents(messages: &[Message], model_id: &str) -> Vec<Value> {
                     if text.trim().is_empty() { continue; }
                     parts.push(json!({ "text": text }));
                 }
-                ContentBlock::Thinking { thinking, sig } => {
+                ContentBlock::Thinking { thinking, replay } => {
                     if thinking.trim().is_empty() { continue; }
-                    if let Some(s) = sig {
+                    if let Some(ri::ThinkingReplay::Signature(s)) = replay {
                         if is_valid_signature(s) {
                             let mut part = json!({ "text": thinking, "thought": true });
                             part["thoughtSignature"] = json!(s);
@@ -831,7 +831,9 @@ impl GeminiState {
         if let Some(block) = self.current_block.take() {
             match block {
                 GeminiBlock::Text { sig } => out.push(Ok(StreamEvent::TextEnd { sig })),
-                GeminiBlock::Thinking { sig } => out.push(Ok(StreamEvent::ThinkingEnd { sig })),
+                GeminiBlock::Thinking { sig } => out.push(Ok(StreamEvent::ThinkingEnd {
+                    replay: sig.map(ri::ThinkingReplay::Signature),
+                })),
                 GeminiBlock::ToolCall { id, sig } => out.push(Ok(StreamEvent::ToolCallEnd { id, sig })),
             }
         }

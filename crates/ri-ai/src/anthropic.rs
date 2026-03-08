@@ -484,10 +484,11 @@ fn convert_message(msg: &Message, complete: &std::collections::HashSet<&str>) ->
 fn convert_content(c: &ContentBlock) -> Value {
     match c {
         ContentBlock::Text { text, .. } => json!({ "type": "text", "text": text }),
-        ContentBlock::Thinking { thinking, sig } => {
-            if let Some(s) = sig {
+        ContentBlock::Thinking { thinking, replay } => {
+            if let Some(ri::ThinkingReplay::Signature(s)) = replay {
                 json!({ "type": "thinking", "thinking": thinking, "signature": s })
             } else {
+                // No signature or encrypted blob from another provider -- fall back to text.
                 json!({ "type": "text", "text": thinking })
             }
         }
@@ -638,7 +639,9 @@ impl SseInterpreter for AnthropicState {
                 if let Some(block) = self.blocks.get(&index) {
                     match block {
                         AnthropicBlock::Text => out.push(Ok(StreamEvent::TextEnd { sig: sig.clone() })),
-                        AnthropicBlock::Thinking => out.push(Ok(StreamEvent::ThinkingEnd { sig })),
+                        AnthropicBlock::Thinking => out.push(Ok(StreamEvent::ThinkingEnd {
+                            replay: sig.map(ri::ThinkingReplay::Signature),
+                        })),
                         AnthropicBlock::ToolUse { id } => {
                             out.push(Ok(StreamEvent::ToolCallEnd { id: id.clone(), sig }));
                         }

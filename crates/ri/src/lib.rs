@@ -6,8 +6,8 @@ pub mod stream;
 
 // Top-level re-exports for convenience.
 pub use model::{
-    gen_id, complete_tool_pairs, ContentBlock, Context, ContextId, Message, MessageId, Role,
-    SessionId, Usage,
+    gen_id, gen_obj_id, complete_tool_pairs, ContentBlock, Context, ContextId, Message, MessageId, Role,
+    SessionId, ThinkingReplay, Usage,
 };
 pub use stream::StreamEvent;
 pub use provider::{
@@ -15,4 +15,4 @@ pub use provider::{
     ThinkingLevel, Tool, ToolContext, ToolOutput, ToolSchema,
 };
 pub use accumulator::StreamAccumulator;
-pub use store::{Pool, Session, SessionHeader, Store};
+pub use store::{Pool, Session, Store};

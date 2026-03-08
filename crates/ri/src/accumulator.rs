@@ -53,11 +53,11 @@ impl StreamAccumulator {
             }
             StreamEvent::ThinkingStart => { self.thinking_buf.clear(); }
             StreamEvent::ThinkingDelta(d) => { self.thinking_buf.push_str(d); }
-            StreamEvent::ThinkingEnd { sig } => {
+            StreamEvent::ThinkingEnd { replay } => {
                 if !self.thinking_buf.is_empty() {
                     self.content.push(ContentBlock::Thinking {
                         thinking: std::mem::take(&mut self.thinking_buf),
-                        sig: sig.clone(),
+                        replay: replay.clone(),
                     });
                 }
             }

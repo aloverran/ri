@@ -5,7 +5,7 @@
 //! `ContentBlock::Text`, and so on. The `StreamAccumulator` handles this
 //! conversion.
 
-use crate::model::Usage;
+use crate::model::{ThinkingReplay, Usage};
 
 /// Normalized event emitted by LLM providers during response streaming.
 #[derive(Debug, Clone)]
@@ -15,7 +15,7 @@ pub enum StreamEvent {
     TextEnd { sig: Option<String> },
     ThinkingStart,
     ThinkingDelta(String),
-    ThinkingEnd { sig: Option<String> },
+    ThinkingEnd { replay: Option<ThinkingReplay> },
     ToolCallStart { id: String, name: String },
     ToolCallDelta { id: String, json_fragment: String },
     ToolCallEnd { id: String, sig: Option<String> },
