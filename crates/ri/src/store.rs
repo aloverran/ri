@@ -25,8 +25,6 @@ use serde::{Deserialize, Serialize};
 
 use crate::model::{ContentBlock, Context, ContextId, Message, MessageId, Role, SessionId, gen_obj_id};
 
-// -- Pool --
-
 /// The shared object store. Messages, contexts, and sessions live here.
 ///
 /// Three object types, one pool. This is the complete in-memory
@@ -45,8 +43,6 @@ impl Pool {
             sessions: HashMap::new(),
         }
     }
-
-    // -- Messages --
 
     pub fn get_message(&self, id: &str) -> Option<&Message> {
         self.messages.get(id)
@@ -72,8 +68,6 @@ impl Pool {
         self.messages.len()
     }
 
-    // -- Contexts --
-
     pub fn get_context(&self, id: &str) -> Option<&Context> {
         self.contexts.get(id)
     }
@@ -94,8 +88,6 @@ impl Pool {
             .filter(|ctx| ctx.parents.iter().any(|p| p.as_str() == id))
             .collect()
     }
-
-    // -- Sessions --
 
     pub fn get_session(&self, id: &str) -> Option<&Session> {
         self.sessions.get(id)
@@ -183,8 +175,6 @@ struct ContextLine {
     meta: Option<serde_json::Value>,
 }
 
-// -- Store --
-
 /// Manages the pool and JSONL files. Loads history from existing files
 /// and writes new messages, contexts, and session pointer updates.
 pub struct Store {
@@ -224,8 +214,6 @@ impl Store {
     fn file_path(&self, file_stem: &str) -> PathBuf {
         self.sessions_dir.join(format!("{}.jsonl", file_stem))
     }
-
-    // -- Loading --
 
     /// Load all .jsonl files into the pool.
     pub fn load_all(&mut self) -> eyre::Result<()> {
@@ -327,8 +315,6 @@ impl Store {
 
         Ok(())
     }
-
-    // -- Writing --
 
     /// Create a new session, optionally reusing an existing file.
     ///

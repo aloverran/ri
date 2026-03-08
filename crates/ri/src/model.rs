@@ -59,8 +59,6 @@ string_id!(MessageId, "Unique identifier for a message in the pool.");
 string_id!(ContextId, "Unique identifier for a context in the history DAG.");
 string_id!(SessionId, "File-stem identifier for a session (e.g. \"2026-02-28_120000_fix-login\").");
 
-// -- Message --
-
 /// Immutable content blob. The atomic unit of the system.
 ///
 /// Messages live in the pool and are referenced by ID from contexts.
@@ -374,8 +372,6 @@ pub fn complete_tool_pairs<'a>(messages: &'a [Message]) -> HashSet<&'a str> {
 
     calls.intersection(&results).copied().collect()
 }
-
-// -- Context --
 
 /// An immutable object: an ordered list of message references, parent
 /// links, and metadata. The fundamental unit of the system alongside

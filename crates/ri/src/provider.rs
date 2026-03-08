@@ -13,8 +13,6 @@ use serde::{Deserialize, Serialize};
 use crate::model::{Message, SessionId};
 use crate::stream::StreamEvent;
 
-// -- Model --
-
 /// An LLM model with its capabilities and pricing.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Model {
@@ -45,8 +43,6 @@ pub enum ThinkingLevel {
     #[serde(rename = "xhigh")]
     XHigh,
 }
-
-// -- Tools --
 
 /// Tool schema sent to the LLM API so it knows what tools are available.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -99,8 +95,6 @@ pub trait Tool: Send + Sync {
     }
 }
 
-// -- Provider --
-
 /// Provider-agnostic options for a single LLM request.
 pub struct RequestOptions {
     pub model: Model,
@@ -112,8 +106,6 @@ pub struct RequestOptions {
     /// Whether to enable all of a model's built-in capabilities (e.g. Gemini's google_search + code_execution).
     pub native_tools: bool,
 }
-
-// -- Errors --
 
 type BoxError = Box<dyn std::error::Error + Send + Sync + 'static>;
 

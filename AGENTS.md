@@ -39,9 +39,8 @@ Solution: Use #[async_trait], which handles the boxing for you.
 ## Style Guidelines
 * Write Rust code as if it is part of a widely used, high-end idiomatic library (like the Rust std), with a slightly more playful feeling. It must be thoughtful about namespace pollution, naming, modern idioms, and assume the reader does not have the IDE open.
 * We prefer longer files (like c) over separating every component into a file. This follows from the principle of narrative readability. Many small files means you must jump around (losing the narrative of the code).
-* Type comments should speak as describing the thing they are above (ie. singular not plural)
-* Keep tracing macros short where possible by using direct field names. ie '%name' over 'path = %name'.
-* Section comments within files should be used sparingly. 
+* Type comments should speak as describing the thing below them (ie. singular not plural)
+* Section comments and dividers are a smell. It suggests poor narrative ordering or documentation comments. 
 
 ## Clean Code
 
