@@ -6,6 +6,7 @@
 
 use std::path::PathBuf;
 use std::pin::Pin;
+use std::{fmt, str::FromStr};
 use async_trait::async_trait;
 use futures::Stream;
 use serde::{Deserialize, Serialize};
@@ -42,6 +43,32 @@ pub enum ThinkingLevel {
     High,
     #[serde(rename = "xhigh")]
     XHigh,
+}
+
+impl fmt::Display for ThinkingLevel {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Off => "off",
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+            Self::XHigh => "xhigh",
+        })
+    }
+}
+
+impl FromStr for ThinkingLevel {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "off" => Ok(Self::Off),
+            "low" => Ok(Self::Low),
+            "medium" => Ok(Self::Medium),
+            "high" => Ok(Self::High),
+            "xhigh" => Ok(Self::XHigh),
+            other => Err(format!("unknown thinking level '{}'", other)),
+        }
+    }
 }
 
 /// Tool schema sent to the LLM API so it knows what tools are available.
