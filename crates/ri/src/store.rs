@@ -273,14 +273,12 @@ impl Store {
             let obj: serde_json::Value = match serde_json::from_str(trimmed) {
                 Ok(v) => v,
                 Err(e) => {
-                    tracing::debug!("{}:{}: malformed JSON, skipping: {}", path.display(), line_num + 1, e);
+                    tracing::warn!("{}:{}: malformed JSON, skipping: {}", path.display(), line_num + 1, e);
                     continue;
                 }
             };
 
             // Three line types: session (has both "session" + "head"), msg, context.
-            // Anything else is skipped silently -- old format data from before
-            // the storage rework, or genuinely malformed lines.
             if obj.get("session").is_some() && obj.get("head").is_some() {
                 if let Ok(sl) = serde_json::from_value::<SessionLine>(obj) {
                     self.pool.put_session(Session {
@@ -311,12 +309,9 @@ impl Store {
                         meta: cl.meta,
                     });
                 }
+            } else {
+                tracing::warn!("{}:{}: unrecognized line format, skipping", path.display(), line_num + 1);
             }
-            // Everything else (old headers, bare head updates, title lines,
-            // legacy step lines) is silently skipped. Old-format files
-            // simply won't produce sessions -- they'll load any messages
-            // and contexts that happen to match the current schema, but
-            // won't be listed or navigable.
         }
 
         Ok(())
