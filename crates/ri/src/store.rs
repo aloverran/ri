@@ -1,8 +1,8 @@
 //! Session storage: the pool, sessions, and persistence.
 //!
-//! This module owns the in-memory object store (Pool) and its persistence
-//! layer (Store). The core data types (Message, Context) live in `model`
-//! -- this module handles filing them to disk and looking them up.
+//! `Store` is a shared database of messages, contexts, and sessions.
+//! Consumers see a thread-safe store with persistence guarantees:
+//! writes hit disk before becoming visible in memory.
 //!
 //! On disk, each file is an append-only JSONL store with three line types:
 //!
@@ -14,21 +14,25 @@
 //! session ID wins. Files are named by convention after the session that
 //! created them, but the naming is not load-bearing -- any valid JSONL
 //! store file can be loaded from anywhere.
+//!
+//! Designed for sharing via `Arc<Store>` across many concurrent tokio tasks.
+//! Internal locking means all methods take `&self`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, MutexGuard};
 
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 
 use crate::model::{ContentBlock, Context, ContextId, Message, MessageId, Role, SessionId, gen_obj_id};
 
-/// The shared object store. Messages, contexts, and sessions live here.
+/// The in-memory object pool. Messages, contexts, and sessions live here.
 ///
-/// Three object types, one pool. This is the complete in-memory
-/// representation of a store file (or a set of store files).
+/// Three object types, one pool. Accessed through `Store::pool()` for
+/// batch reads, or through convenience methods on `Store` for single lookups.
 pub struct Pool {
     messages: HashMap<MessageId, Message>,
     contexts: HashMap<ContextId, Context>,
@@ -181,19 +185,50 @@ struct ContextLine {
     meta: Option<serde_json::Value>,
 }
 
-/// Manages the pool and JSONL files. Loads history from existing files
-/// and writes new messages, contexts, and session pointer updates.
+/// A shared database of messages, contexts, and sessions.
+///
+/// Thread-safe: all methods take `&self`. Designed to be shared via `Arc<Store>`
+/// across many concurrent tokio tasks. Internal `Mutex<Pool>` protects the
+/// in-memory state; a separate write lock serializes file appends.
+///
+/// Persistence guarantee: writes hit disk (append + flush) before the
+/// in-memory pool is updated. A crash at any point leaves the JSONL files
+/// in a consistent prefix state.
+///
+/// For batch reads (e.g. formatting a context graph), use `pool()` to
+/// acquire the lock once and work with `&Pool` directly. For single
+/// lookups, convenience methods like `get_message()` handle locking
+/// internally.
+///
+/// Invariant: do not call write methods (`write_message`, `write_context`,
+/// etc.) while holding a `pool()` guard. The write methods lock the pool
+/// internally and the Mutex is not reentrant.
 pub struct Store {
-    pub pool: Pool,
+    pool: Mutex<Pool>,
     sessions_dir: PathBuf,
+    /// Serializes all JSONL file appends. Prevents interleaved lines when
+    /// multiple sessions (including sub-agents sharing a parent file)
+    /// write concurrently. Held only during serialize + write + flush.
+    write_lock: Mutex<()>,
+    /// File stems already loaded into the pool. Checked during `refresh()`
+    /// to detect new files from external writers (e.g. ri-cli).
+    loaded_files: Mutex<HashSet<String>>,
 }
 
 impl Store {
-    pub fn new(sessions_dir: PathBuf) -> Self {
-        Store {
-            pool: Pool::new(),
+    /// Open the store, loading all existing JSONL files from disk.
+    ///
+    /// This is the only full disk scan. After this, all reads come from
+    /// the in-memory pool, and writes use write-through semantics.
+    pub fn open(sessions_dir: PathBuf) -> eyre::Result<Self> {
+        let store = Store {
+            pool: Mutex::new(Pool::new()),
             sessions_dir,
-        }
+            write_lock: Mutex::new(()),
+            loaded_files: Mutex::new(HashSet::new()),
+        };
+        store.load_all()?;
+        Ok(store)
     }
 
     pub fn default_dir() -> eyre::Result<PathBuf> {
@@ -202,15 +237,238 @@ impl Store {
         Ok(home.join(".ri").join("sessions"))
     }
 
-    pub fn get_session(&self, id: &str) -> Option<&Session> {
-        self.pool.get_session(id)
+    // -- Read methods (brief pool lock per call) --
+
+    pub fn get_message(&self, id: &str) -> Option<Message> {
+        self.pool.lock().unwrap().get_message(id).cloned()
     }
 
-    /// Resolve which file a session writes to. Returns an error if the
-    /// session isn't in the pool -- this catches misuse (writing before
-    /// creating) instead of silently creating orphan files.
+    pub fn get_context(&self, id: &str) -> Option<Context> {
+        self.pool.lock().unwrap().get_context(id).cloned()
+    }
+
+    pub fn get_session(&self, id: &str) -> Option<Session> {
+        self.pool.lock().unwrap().get_session(id).cloned()
+    }
+
+    /// Get the current head context for a session.
+    pub fn head_context(&self, session_id: &str) -> Option<Context> {
+        let pool = self.pool.lock().unwrap();
+        let session = pool.get_session(session_id)?;
+        pool.get_context(session.head.as_str()).cloned()
+    }
+
+    /// Resolve message IDs to cloned messages (for sending to LLM calls, etc.).
+    pub fn resolve_cloned(&self, ids: &[MessageId]) -> Vec<Message> {
+        let pool = self.pool.lock().unwrap();
+        pool.resolve(ids).into_iter().cloned().collect()
+    }
+
+    /// List all sessions. Also ingests any new JSONL files from external
+    /// writers (e.g. ri-cli) that appeared since the last check.
+    pub fn sessions(&self) -> Vec<Session> {
+        self.refresh_if_needed();
+        self.pool.lock().unwrap().sessions().cloned().collect()
+    }
+
+    /// Direct access to the pool for batch reads. The returned guard holds
+    /// the lock — keep it brief and never call write methods while holding it.
+    pub fn pool(&self) -> MutexGuard<'_, Pool> {
+        self.pool.lock().unwrap()
+    }
+
+    // -- Write methods (disk first, then pool) --
+
+    /// Write a message to the file associated with a session.
+    pub fn write_message(
+        &self,
+        session_id: &SessionId,
+        role: Role,
+        content: Vec<ContentBlock>,
+        meta: Option<serde_json::Value>,
+    ) -> eyre::Result<Message> {
+        let file_stem = self.resolve_file(session_id)?;
+        let id = MessageId::new(gen_obj_id());
+        let msg = Message { id, role, content, meta };
+
+        let line = serde_json::to_string(&MessageLine {
+            msg: msg.id.clone(),
+            role: msg.role,
+            content: msg.content.clone(),
+            meta: msg.meta.clone(),
+        })?;
+
+        self.append_line(&file_stem, &line)?;
+
+        tracing::debug!("Wrote {:?} message [{}] to [{}]", msg.role, msg.id, file_stem);
+        self.pool.lock().unwrap().put_message(msg.clone());
+        Ok(msg)
+    }
+
+    /// Write a context to the file associated with a session.
+    ///
+    /// Does NOT update the session's head pointer. Call `update_head`
+    /// separately, or use `checkpoint` for the common
+    /// write-context-and-advance-head pattern.
+    pub fn write_context(
+        &self,
+        session_id: &SessionId,
+        messages: Vec<MessageId>,
+        parents: Vec<ContextId>,
+        meta: Option<serde_json::Value>,
+    ) -> eyre::Result<Context> {
+        let file_stem = self.resolve_file(session_id)?;
+        let id = ContextId::new(gen_obj_id());
+        let ctx = Context { id, messages, parents, meta };
+
+        let line = serde_json::to_string(&ContextLine {
+            context: ctx.id.clone(),
+            messages: ctx.messages.clone(),
+            parents: ctx.parents.clone(),
+            meta: ctx.meta.clone(),
+        })?;
+
+        self.append_line(&file_stem, &line)?;
+
+        tracing::debug!("Wrote context [{}] to [{}] ({} messages, {} parents)",
+            ctx.id, file_stem, ctx.messages.len(), ctx.parents.len());
+        self.pool.lock().unwrap().put_context(ctx.clone());
+        Ok(ctx)
+    }
+
+    /// Create a new context and update the session's head.
+    pub fn checkpoint(
+        &self,
+        session_id: &SessionId,
+        message_ids: &[MessageId],
+        meta: Option<serde_json::Value>,
+    ) -> eyre::Result<Context> {
+        let parents = self.pool.lock().unwrap()
+            .get_session(session_id.as_str())
+            .map(|s| s.head.clone())
+            .into_iter()
+            .collect();
+        let ctx = self.write_context(session_id, message_ids.to_vec(), parents, meta)?;
+        self.update_head(session_id, &ctx.id)?;
+        Ok(ctx)
+    }
+
+    /// Update a session's head and write a full-snapshot session line.
+    pub fn update_head(
+        &self,
+        session_id: &SessionId,
+        context_id: &ContextId,
+    ) -> eyre::Result<()> {
+        let snapshot = {
+            let mut pool = self.pool.lock().unwrap();
+            let session = pool.sessions.get_mut(session_id.as_str())
+                .ok_or_else(|| eyre::eyre!("session '{}' not found in pool", session_id))?;
+            session.head = context_id.clone();
+            session.clone()
+        };
+        self.write_session_line(&snapshot)
+    }
+
+    /// Update a session's display name and persist it.
+    pub fn write_title(
+        &self,
+        session_id: &SessionId,
+        title: &str,
+    ) -> eyre::Result<()> {
+        let snapshot = {
+            let mut pool = self.pool.lock().unwrap();
+            let session = pool.sessions.get_mut(session_id.as_str())
+                .ok_or_else(|| eyre::eyre!("session '{}' not found in pool", session_id))?;
+            session.name = title.to_string();
+            session.clone()
+        };
+        self.write_session_line(&snapshot)
+    }
+
+    /// Create a new session.
+    ///
+    /// If `parent` is `Some`, the new session shares the parent's JSONL file.
+    /// Otherwise, creates a new file named after the session.
+    ///
+    /// Writes a root context and a session pointer line to the file.
+    pub fn create_session(
+        &self,
+        name: &str,
+        cwd: &str,
+        parent: Option<&SessionId>,
+    ) -> eyre::Result<SessionId> {
+        let now = Utc::now();
+        let ts = now.to_rfc3339();
+
+        // Determine file stem: share parent's file if parented, else new file.
+        let (file_stem, session_id) = if let Some(parent_id) = parent {
+            let parent_file = self.pool.lock().unwrap()
+                .get_session(parent_id.as_str())
+                .map(|s| s.file.clone())
+                .ok_or_else(|| eyre::eyre!(
+                    "parent session '{}' not found in pool", parent_id
+                ))?;
+            let file_ts = now.format("%Y-%m-%d_%H%M%S");
+            let slug = slugify(name);
+            let rand = &uuid::Uuid::new_v4().simple().to_string()[..4];
+            let sid = SessionId::new(format!("{}_{}_{}", file_ts, slug, rand));
+            (parent_file, sid)
+        } else {
+            fs::create_dir_all(&self.sessions_dir)?;
+            let file_ts = now.format("%Y-%m-%d_%H%M%S");
+            let slug = slugify(name);
+            let stem = format!("{}_{}", file_ts, slug);
+            (stem.clone(), SessionId::new(stem))
+        };
+
+        // Build the root context + session pointer lines.
+        let root_id = ContextId::new(gen_obj_id());
+        let root_line = serde_json::to_string(&ContextLine {
+            context: root_id.clone(),
+            messages: Vec::new(),
+            parents: Vec::new(),
+            meta: None,
+        })?;
+        let session_line = serde_json::to_string(&SessionLine {
+            session: session_id.clone(),
+            head: root_id.clone(),
+            name: name.to_string(),
+            ts: ts.clone(),
+            cwd: Some(cwd.to_string()),
+            parent: parent.cloned(),
+        })?;
+
+        // Write both lines atomically (under the same write lock acquisition).
+        self.append_lines(&file_stem, &[&root_line, &session_line])?;
+
+        // Register in pool.
+        let mut pool = self.pool.lock().unwrap();
+        pool.put_context(Context {
+            id: root_id.clone(),
+            messages: Vec::new(),
+            parents: Vec::new(),
+            meta: None,
+        });
+        pool.put_session(Session {
+            name: name.to_string(),
+            id: session_id.clone(),
+            head: root_id,
+            cwd: Some(cwd.to_string()),
+            parent: parent.cloned(),
+            ts,
+            file: file_stem,
+        });
+
+        tracing::info!("Created session [{}] -> [{}]", name, session_id);
+        Ok(session_id)
+    }
+
+    // -- Internal helpers --
+
+    /// Resolve which file stem a session writes to.
     fn resolve_file(&self, session_id: &SessionId) -> eyre::Result<String> {
-        self.pool.get_session(session_id.as_str())
+        self.pool.lock().unwrap()
+            .get_session(session_id.as_str())
             .map(|s| s.file.clone())
             .ok_or_else(|| eyre::eyre!(
                 "session '{}' not found in pool (write before create?)", session_id
@@ -221,8 +479,46 @@ impl Store {
         self.sessions_dir.join(format!("{}.jsonl", file_stem))
     }
 
-    /// Load all .jsonl files into the pool.
-    pub fn load_all(&mut self) -> eyre::Result<()> {
+    /// Append a single JSONL line under the write lock.
+    fn append_line(&self, file_stem: &str, line: &str) -> eyre::Result<()> {
+        self.append_lines(file_stem, &[line])
+    }
+
+    /// Append multiple JSONL lines under a single write lock acquisition.
+    /// Used by create_session to write root context + session pointer atomically.
+    fn append_lines(&self, file_stem: &str, lines: &[&str]) -> eyre::Result<()> {
+        let path = self.file_path(file_stem);
+        let _guard = self.write_lock.lock().unwrap();
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)?;
+        for line in lines {
+            writeln!(file, "{}", line)?;
+        }
+        file.flush()?;
+        Ok(())
+    }
+
+    /// Append a full-snapshot session line to the session's file.
+    fn write_session_line(&self, session: &Session) -> eyre::Result<()> {
+        let line = serde_json::to_string(&SessionLine {
+            session: session.id.clone(),
+            head: session.head.clone(),
+            name: session.name.clone(),
+            ts: session.ts.clone(),
+            cwd: session.cwd.clone(),
+            parent: session.parent.clone(),
+        })?;
+        self.append_line(&session.file, &line)?;
+        tracing::debug!("Wrote session line [{}] to [{}]", session.id, session.file);
+        Ok(())
+    }
+
+    // -- Loading --
+
+    /// Load all .jsonl files into the pool. Called once by `open()`.
+    fn load_all(&self) -> eyre::Result<()> {
         if !self.sessions_dir.exists() {
             return Ok(());
         }
@@ -234,22 +530,27 @@ impl Store {
         entries.sort_by(|a, b| a.file_name().cmp(&b.file_name()));
 
         let file_count = entries.len();
+        let mut loaded = self.loaded_files.lock().unwrap();
         for entry in entries {
             if let Err(e) = self.load_file(&entry.path()) {
                 tracing::warn!("Failed to load store file {}: {}", entry.path().display(), e);
             }
+            if let Some(stem) = entry.path().file_stem().and_then(|s| s.to_str()) {
+                loaded.insert(stem.to_string());
+            }
         }
 
+        let pool = self.pool.lock().unwrap();
         tracing::info!(
             "Loaded store ({} files, {} messages, {} contexts, {} sessions)",
-            file_count, self.pool.message_count(), self.pool.context_count(),
-            self.pool.session_count(),
+            file_count, pool.message_count(), pool.context_count(),
+            pool.session_count(),
         );
 
         Ok(())
     }
 
-    fn load_file(&mut self, path: &Path) -> eyre::Result<()> {
+    fn load_file(&self, path: &Path) -> eyre::Result<()> {
         let file_stem = path.file_stem()
             .and_then(|s| s.to_str())
             .unwrap_or("")
@@ -257,6 +558,7 @@ impl Store {
 
         let file = File::open(path)?;
         let reader = BufReader::new(file);
+        let mut pool = self.pool.lock().unwrap();
 
         for (line_num, line) in reader.lines().enumerate() {
             let line = match line {
@@ -281,7 +583,7 @@ impl Store {
             // Three line types: session (has both "session" + "head"), msg, context.
             if obj.get("session").is_some() && obj.get("head").is_some() {
                 if let Ok(sl) = serde_json::from_value::<SessionLine>(obj) {
-                    self.pool.put_session(Session {
+                    pool.put_session(Session {
                         name: sl.name,
                         id: sl.session,
                         head: sl.head,
@@ -293,7 +595,7 @@ impl Store {
                 }
             } else if obj.get("msg").is_some() {
                 if let Ok(ml) = serde_json::from_value::<MessageLine>(obj) {
-                    self.pool.put_message(Message {
+                    pool.put_message(Message {
                         id: ml.msg,
                         role: ml.role,
                         content: ml.content,
@@ -302,7 +604,7 @@ impl Store {
                 }
             } else if obj.get("context").is_some() {
                 if let Ok(cl) = serde_json::from_value::<ContextLine>(obj) {
-                    self.pool.put_context(Context {
+                    pool.put_context(Context {
                         id: cl.context,
                         messages: cl.messages,
                         parents: cl.parents,
@@ -317,228 +619,37 @@ impl Store {
         Ok(())
     }
 
-    /// Create a new session, optionally reusing an existing file.
-    ///
-    /// If `file` is `None`, creates a new JSONL file named after the session.
-    /// If `file` is `Some(stem)`, writes to the existing file (for sub-agents
-    /// sharing the parent's file).
-    ///
-    /// Either way, writes a root context and a session pointer line to the file.
-    pub fn create_session(
-        &mut self,
-        name: &str,
-        cwd: &str,
-        parent: Option<&SessionId>,
-        file: Option<&str>,
-    ) -> eyre::Result<SessionId> {
-        let now = Utc::now();
-        let ts = now.to_rfc3339();
+    /// Check for new JSONL files that appeared since the last load (from
+    /// external writers like ri-cli). If found, ingest them into the pool.
+    /// Called automatically by `sessions()`.
+    fn refresh_if_needed(&self) {
+        if !self.sessions_dir.exists() { return; }
 
-        // Determine file stem and session ID.
-        let (file_stem, session_id) = if let Some(f) = file {
-            // Sub-agent: reuse existing file, generate a unique session ID.
-            let file_ts = now.format("%Y-%m-%d_%H%M%S");
-            let slug = slugify(name);
-            let rand = &uuid::Uuid::new_v4().simple().to_string()[..4];
-            let sid = SessionId::new(format!("{}_{}_{}", file_ts, slug, rand));
-            (f.to_string(), sid)
-        } else {
-            // Top-level: create a new file named after the session.
-            fs::create_dir_all(&self.sessions_dir)?;
-            let file_ts = now.format("%Y-%m-%d_%H%M%S");
-            let slug = slugify(name);
-            let stem = format!("{}_{}", file_ts, slug);
-            (stem.clone(), SessionId::new(stem))
+        let entries: Vec<_> = match fs::read_dir(&self.sessions_dir) {
+            Ok(rd) => rd.filter_map(|e| e.ok())
+                .filter(|e| e.path().extension().is_some_and(|ext| ext == "jsonl"))
+                .collect(),
+            Err(_) => return,
         };
 
-        let path = self.file_path(&file_stem);
+        let mut loaded = self.loaded_files.lock().unwrap();
+        let mut new_files = Vec::new();
+        for entry in &entries {
+            if let Some(stem) = entry.path().file_stem().and_then(|s| s.to_str()) {
+                if !loaded.contains(stem) {
+                    new_files.push(entry.path());
+                    loaded.insert(stem.to_string());
+                }
+            }
+        }
+        drop(loaded);
 
-        // Write root context + session pointer.
-        let root_id = ContextId::new(gen_obj_id());
-        let root_ctx = ContextLine {
-            context: root_id.clone(),
-            messages: Vec::new(),
-            parents: Vec::new(),
-            meta: None,
-        };
-        let session_line = SessionLine {
-            session: session_id.clone(),
-            head: root_id.clone(),
-            name: name.to_string(),
-            ts: ts.clone(),
-            cwd: Some(cwd.to_string()),
-            parent: parent.cloned(),
-        };
-
-        let mut f = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)?;
-        writeln!(f, "{}", serde_json::to_string(&root_ctx)?)?;
-        writeln!(f, "{}", serde_json::to_string(&session_line)?)?;
-        f.flush()?;
-
-        // Register in pool.
-        self.pool.put_context(Context {
-            id: root_id.clone(),
-            messages: Vec::new(),
-            parents: Vec::new(),
-            meta: None,
-        });
-        self.pool.put_session(Session {
-            name: name.to_string(),
-            id: session_id.clone(),
-            head: root_id,
-            cwd: Some(cwd.to_string()),
-            parent: parent.cloned(),
-            ts,
-            file: file_stem,
-        });
-
-        tracing::info!("Created session [{}] -> [{}]", name, session_id);
-        Ok(session_id)
-    }
-
-    /// Write a message to the file associated with a session.
-    pub fn write_message(
-        &mut self,
-        session_id: &SessionId,
-        role: Role,
-        content: Vec<ContentBlock>,
-        meta: Option<serde_json::Value>,
-    ) -> eyre::Result<Message> {
-        let file_stem = self.resolve_file(session_id)?;
-        let path = self.file_path(&file_stem);
-        let id = MessageId::new(gen_obj_id());
-
-        let msg = Message { id, role, content, meta };
-        let line = MessageLine {
-            msg: msg.id.clone(),
-            role: msg.role,
-            content: msg.content.clone(),
-            meta: msg.meta.clone(),
-        };
-
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)?;
-        writeln!(file, "{}", serde_json::to_string(&line)?)?;
-        file.flush()?;
-
-        tracing::debug!("Wrote {:?} message [{}] to [{}]", msg.role, msg.id, file_stem);
-        self.pool.put_message(msg.clone());
-        Ok(msg)
-    }
-
-    /// Write a context to the file associated with a session.
-    ///
-    /// Does NOT update the session's head pointer. Call `update_head`
-    /// separately, or use `checkpoint` for the common
-    /// write-context-and-advance-head pattern.
-    pub fn write_context(
-        &mut self,
-        session_id: &SessionId,
-        messages: Vec<MessageId>,
-        parents: Vec<ContextId>,
-        meta: Option<serde_json::Value>,
-    ) -> eyre::Result<Context> {
-        let file_stem = self.resolve_file(session_id)?;
-        let path = self.file_path(&file_stem);
-        let id = ContextId::new(gen_obj_id());
-
-        let ctx = Context { id, messages, parents, meta };
-        let ctx_line = ContextLine {
-            context: ctx.id.clone(),
-            messages: ctx.messages.clone(),
-            parents: ctx.parents.clone(),
-            meta: ctx.meta.clone(),
-        };
-
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)?;
-        writeln!(file, "{}", serde_json::to_string(&ctx_line)?)?;
-        file.flush()?;
-
-        tracing::debug!("Wrote context [{}] to [{}] ({} messages, {} parents)",
-            ctx.id, file_stem, ctx.messages.len(), ctx.parents.len());
-        self.pool.put_context(ctx.clone());
-        Ok(ctx)
-    }
-
-    /// Create a new context and update the session's head.
-    pub fn checkpoint(
-        &mut self,
-        session_id: &SessionId,
-        message_ids: &[MessageId],
-        meta: Option<serde_json::Value>,
-    ) -> eyre::Result<Context> {
-        let parents = self.pool.get_session(session_id.as_str())
-            .map(|s| s.head.clone())
-            .into_iter()
-            .collect();
-        let ctx = self.write_context(session_id, message_ids.to_vec(), parents, meta)?;
-        self.update_head(session_id, &ctx.id)?;
-        Ok(ctx)
-    }
-
-    /// Get the current context for a session (from its head).
-    pub fn head_context(&self, session_id: &str) -> Option<&Context> {
-        let session = self.pool.get_session(session_id)?;
-        self.pool.get_context(session.head.as_str())
-    }
-
-    /// Update a session's head and write a full-snapshot session line.
-    pub fn update_head(
-        &mut self,
-        session_id: &SessionId,
-        context_id: &ContextId,
-    ) -> eyre::Result<()> {
-        let session = self.pool.sessions.get_mut(session_id.as_str())
-            .ok_or_else(|| eyre::eyre!("session '{}' not found in pool", session_id))?;
-        session.head = context_id.clone();
-        let snapshot = session.clone();
-
-        self.write_session_line(&snapshot)
-    }
-
-    /// Update a session's display name and persist it.
-    pub fn write_title(
-        &mut self,
-        session_id: &SessionId,
-        title: &str,
-    ) -> eyre::Result<()> {
-        let session = self.pool.sessions.get_mut(session_id.as_str())
-            .ok_or_else(|| eyre::eyre!("session '{}' not found in pool", session_id))?;
-        session.name = title.to_string();
-        let snapshot = session.clone();
-
-        self.write_session_line(&snapshot)
-    }
-
-    /// Append a full-snapshot session line to the session's file.
-    fn write_session_line(&self, session: &Session) -> eyre::Result<()> {
-        let path = self.file_path(&session.file);
-        let line = SessionLine {
-            session: session.id.clone(),
-            head: session.head.clone(),
-            name: session.name.clone(),
-            ts: session.ts.clone(),
-            cwd: session.cwd.clone(),
-            parent: session.parent.clone(),
-        };
-
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)?;
-        writeln!(file, "{}", serde_json::to_string(&line)?)?;
-        file.flush()?;
-
-        tracing::debug!("Wrote session line [{}] to [{}]", session.id, session.file);
-        Ok(())
+        for path in new_files {
+            tracing::info!("Ingesting new store file: {}", path.display());
+            if let Err(e) = self.load_file(&path) {
+                tracing::warn!("Failed to load new store file {}: {}", path.display(), e);
+            }
+        }
     }
 }
 
@@ -567,4 +678,3 @@ fn slugify(name: &str) -> String {
     }
     result.trim_end_matches('-').to_string()
 }
-
