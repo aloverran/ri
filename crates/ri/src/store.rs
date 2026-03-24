@@ -22,7 +22,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, MutexGuard};
+use std::sync::Mutex;
 
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
@@ -31,7 +31,7 @@ use crate::model::{ContentBlock, Context, ContextId, Message, MessageId, Role, S
 
 /// The in-memory object pool. Messages, contexts, and sessions live here.
 ///
-/// Three object types, one pool. Accessed through `Store::pool()` for
+/// Three object types, one pool. Accessed through `Store::with_pool()` for
 /// batch reads, or through convenience methods on `Store` for single lookups.
 pub struct Pool {
     messages: HashMap<MessageId, Message>,
@@ -195,14 +195,10 @@ struct ContextLine {
 /// in-memory pool is updated. A crash at any point leaves the JSONL files
 /// in a consistent prefix state.
 ///
-/// For batch reads (e.g. formatting a context graph), use `pool()` to
-/// acquire the lock once and work with `&Pool` directly. For single
+/// For batch reads (e.g. formatting a context graph), use `with_pool()`
+/// to acquire the lock once and work with `&Pool` directly. For single
 /// lookups, convenience methods like `get_message()` handle locking
 /// internally.
-///
-/// Invariant: do not call write methods (`write_message`, `write_context`,
-/// etc.) while holding a `pool()` guard. The write methods lock the pool
-/// internally and the Mutex is not reentrant.
 pub struct Store {
     pool: Mutex<Pool>,
     sessions_dir: PathBuf,
@@ -271,10 +267,11 @@ impl Store {
         self.pool.lock().unwrap().sessions().cloned().collect()
     }
 
-    /// Direct access to the pool for batch reads. The returned guard holds
-    /// the lock — keep it brief and never call write methods while holding it.
-    pub fn pool(&self) -> MutexGuard<'_, Pool> {
-        self.pool.lock().unwrap()
+    /// Batch read access to the pool. The closure receives `&Pool` for the
+    /// duration of a single lock acquisition — many lookups, one lock.
+    pub fn with_pool<R>(&self, f: impl FnOnce(&Pool) -> R) -> R {
+        let pool = self.pool.lock().unwrap();
+        f(&pool)
     }
 
     // -- Write methods (disk first, then pool) --
