@@ -187,6 +187,10 @@ pub enum ContentBlock {
     },
     Error {
         message: String,
+        /// Structured diagnostic data for UI rendering (model, timestamp, raw API response, etc).
+        /// Same pattern as ToolResult's details: carried for the frontend, not sent to the LLM.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        details: Option<serde_json::Value>,
     },
     // Catch-all for unknown block types -- preserves round-trip.
     #[serde(untagged)]
@@ -220,7 +224,11 @@ impl ContentBlock {
     }
 
     pub fn error(s: impl Into<String>) -> Self {
-        ContentBlock::Error { message: s.into() }
+        ContentBlock::Error { message: s.into(), details: None }
+    }
+
+    pub fn error_with_details(s: impl Into<String>, details: serde_json::Value) -> Self {
+        ContentBlock::Error { message: s.into(), details: Some(details) }
     }
 
     /// Text representation of a tool block for contexts where structured
@@ -271,7 +279,7 @@ impl ContentBlock {
                 let body = truncate_with_ellipsis(&inner, SUMMARY_WIDTH - tag.len());
                 format!("{tag}{body}")
             }
-            ContentBlock::Error { message } => {
+            ContentBlock::Error { message, .. } => {
                 let tag = "[error] ";
                 let body = truncate_with_ellipsis(message, SUMMARY_WIDTH - tag.len());
                 format!("{tag}{body}")
@@ -326,8 +334,11 @@ fn display_block(out: &mut String, block: &ContentBlock) {
                 }
             }
         }
-        ContentBlock::Error { message } => {
+        ContentBlock::Error { message, details } => {
             out.push_str(&format!("--- error ---\n{}\n", message));
+            if let Some(d) = details {
+                out.push_str(&format!("details: {}\n", serde_json::to_string_pretty(d).unwrap_or_default()));
+            }
         }
         ContentBlock::Unknown(v) => {
             out.push_str("--- unknown ---\n");

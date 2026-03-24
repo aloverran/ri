@@ -10,8 +10,49 @@
 // `drive_sse_stream` wires the parser to an interpreter, producing
 // an EventStream.
 
+use std::fmt;
+
 use futures::StreamExt;
 use ri::{ApiError, StreamEvent};
+
+// -- HTTP error type --
+
+/// HTTP-level error from a provider API. Carries the status code and raw
+/// response body so diagnostics survive the `BoxError` journey through `ApiError`.
+///
+/// Shared by all providers that use `sse::send` (Anthropic, Gemini).
+/// Providers with custom HTTP handling (Codex) define their own.
+#[derive(Debug)]
+pub struct HttpApiError {
+    pub status: u16,
+    pub body: String,
+}
+
+impl fmt::Display for HttpApiError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Pretty-print if the body is valid JSON; proxies and CDNs may
+        // return HTML or plain text during outages, so fall back to raw.
+        let pretty = serde_json::from_str::<serde_json::Value>(&self.body)
+            .ok()
+            .and_then(|v| serde_json::to_string_pretty(&v).ok())
+            .unwrap_or_else(|| self.body.clone());
+
+        if let Some(error) = serde_json::from_str::<serde_json::Value>(&self.body)
+            .ok()
+            .as_ref()
+            .and_then(|p| p.get("error"))
+        {
+            let error_type = error["type"].as_str().unwrap_or("unknown");
+            let message = error["message"].as_str().unwrap_or(&self.body);
+            return write!(f, "HTTP {}: {}: {}\n\nRaw response:\n{}",
+                self.status, error_type, message, pretty);
+        }
+
+        write!(f, "HTTP {}\n\nRaw response:\n{}", self.status, pretty)
+    }
+}
+
+impl std::error::Error for HttpApiError {}
 
 // -- HTTP dispatch --
 
@@ -24,34 +65,37 @@ pub async fn send(
 
     if status >= 400 {
         let body = response.text().await.unwrap_or_default();
-        return Err(parse_http_error(status, &body));
+        return Err(classify_http_error(status, &body));
     }
 
     Ok(response.bytes_stream())
 }
 
-fn parse_http_error(status: u16, body: &str) -> ApiError {
-    let parsed: serde_json::Value = serde_json::from_str(body).unwrap_or_default();
-    let response_msg = |msg: &str| format!("HTTP {status}: {msg}");
+/// Wrap an HTTP error response in the appropriate `ApiError` variant.
+/// Classification reads from the raw body; formatting lives in `HttpApiError::Display`.
+fn classify_http_error(status: u16, body: &str) -> ApiError {
+    let err = HttpApiError { status, body: body.to_string() };
 
-    if let Some(error) = parsed.get("error") {
-        let error_type = error["type"].as_str().unwrap_or("unknown");
-        let message = error["message"].as_str().unwrap_or(body);
+    if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(body) {
+        if let Some(error) = parsed.get("error") {
+            let error_type = error["type"].as_str().unwrap_or("unknown");
+            let message = error["message"].as_str().unwrap_or("");
 
-        if error_type == "rate_limit_error" || status == 429 {
-            return ApiError::rate_limited(5000, response_msg(message));
+            if error_type == "rate_limit_error" || status == 429 {
+                return ApiError::rate_limited(5000, err);
+            }
+            if message.contains("token") && (message.contains("exceed") || message.contains("limit")) {
+                return ApiError::context_overflow(err);
+            }
+            return ApiError::other(err);
         }
-        if message.contains("token") && (message.contains("exceed") || message.contains("limit")) {
-            return ApiError::context_overflow(response_msg(message));
-        }
-        return ApiError::other(response_msg(&format!("{error_type}: {message}")));
     }
 
     if status == 429 || body.contains("RESOURCE_EXHAUSTED") {
-        return ApiError::rate_limited(5000, response_msg(body));
+        return ApiError::rate_limited(5000, err);
     }
 
-    ApiError::other(response_msg(body))
+    ApiError::other(err)
 }
 
 // -- SSE parsing --

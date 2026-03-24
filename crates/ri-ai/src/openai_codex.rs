@@ -13,6 +13,7 @@
 //   - Tool call IDs are compound: `call_id|item_id`
 //   - SSE events carry their type inside the JSON `data` payload, not in `event:`
 
+use std::fmt;
 use std::path::PathBuf;
 use async_trait::async_trait;
 use serde_json::{json, Value};
@@ -409,29 +410,84 @@ async fn send_with_retry(
     Err(ApiError::other(last_error.unwrap_or_else(|| "Failed after retries".into())))
 }
 
+// -- Codex error types --
+
+/// HTTP-level error from the Codex API. Codex uses `error.code` or
+/// `error.type` for classification (distinct from Anthropic's `error.type`).
+#[derive(Debug)]
+struct CodexHttpError {
+    status: u16,
+    body: String,
+}
+
+impl fmt::Display for CodexHttpError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let pretty = serde_json::from_str::<Value>(&self.body)
+            .ok()
+            .and_then(|v| serde_json::to_string_pretty(&v).ok())
+            .unwrap_or_else(|| self.body.clone());
+
+        if let Some(message) = serde_json::from_str::<Value>(&self.body)
+            .ok()
+            .as_ref()
+            .and_then(|p| p.get("error"))
+            .and_then(|e| e["message"].as_str())
+        {
+            return write!(f, "HTTP {}: {}\n\nRaw response:\n{}", self.status, message, pretty);
+        }
+
+        write!(f, "HTTP {}\n\nRaw response:\n{}", self.status, pretty)
+    }
+}
+
+impl std::error::Error for CodexHttpError {}
+
+/// Error received during a Codex SSE stream (`error` or `response.failed` events).
+/// Stores the parsed event since Codex SSE payloads are already JSON.
+#[derive(Debug)]
+struct CodexStreamError {
+    event: Value,
+}
+
+impl fmt::Display for CodexStreamError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Try "error" event shape: { message, code }
+        // Then "response.failed" shape: { response: { error: { message } } }
+        let message = self.event["message"].as_str()
+            .or_else(|| self.event.pointer("/response/error/message").and_then(|v| v.as_str()))
+            .or_else(|| self.event["code"].as_str())
+            .unwrap_or("Codex error");
+
+        let pretty = serde_json::to_string_pretty(&self.event)
+            .unwrap_or_else(|_| format!("{:?}", self.event));
+        write!(f, "{}\n\nRaw event:\n{}", message, pretty)
+    }
+}
+
+impl std::error::Error for CodexStreamError {}
+
 fn parse_codex_error(status: u16, body: &str) -> ApiError {
+    let err = CodexHttpError { status, body: body.to_string() };
+
     if let Ok(parsed) = serde_json::from_str::<Value>(body) {
-        if let Some(err) = parsed.get("error") {
-            let code = err["code"].as_str()
-                .or_else(|| err["type"].as_str())
+        if let Some(error) = parsed.get("error") {
+            let code = error["code"].as_str()
+                .or_else(|| error["type"].as_str())
                 .unwrap_or("");
 
-            // Usage limit / rate limit errors
             if code.contains("usage_limit") || code.contains("rate_limit") || status == 429 {
-                let message = err["message"].as_str().unwrap_or(body);
-                return ApiError::rate_limited(60_000, format!("HTTP {status}: {message}"));
+                return ApiError::rate_limited(60_000, err);
             }
 
-            let message = err["message"].as_str().unwrap_or(body).to_string();
-            return ApiError::other(format!("HTTP {status}: {message}"));
+            return ApiError::other(err);
         }
     }
 
     if status == 429 {
-        return ApiError::rate_limited(60_000, format!("HTTP {status}: {body}"));
+        return ApiError::rate_limited(60_000, err);
     }
 
-    ApiError::other(format!("HTTP {status}: {body}"))
+    ApiError::other(err)
 }
 
 // -- Request body --
@@ -691,18 +747,8 @@ impl CodexState {
 
         match event_type {
             // -- Error events --
-            "error" => {
-                let code = event["code"].as_str().unwrap_or("");
-                let message = event["message"].as_str().unwrap_or("");
-                let msg = if !message.is_empty() { message } else { code };
-                out.push(Err(ApiError::other(format!("Codex error: {msg}"))));
-            }
-
-            "response.failed" => {
-                let msg = event.pointer("/response/error/message")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("Codex response failed");
-                out.push(Err(ApiError::other(msg)));
+            "error" | "response.failed" => {
+                out.push(Err(ApiError::other(CodexStreamError { event: event.clone() })));
             }
 
             // -- Item lifecycle --

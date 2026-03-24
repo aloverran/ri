@@ -4,6 +4,7 @@
 // SSE interpretation, and login flow.
 
 use std::collections::HashMap;
+use std::fmt;
 use std::path::PathBuf;
 use async_trait::async_trait;
 use serde_json::{json, Value};
@@ -508,13 +509,40 @@ fn convert_content(c: &ContentBlock) -> Value {
                 "is_error": is_error,
             })
         }
-        ContentBlock::Error { message } => json!({
+        ContentBlock::Error { message, .. } => json!({
             "type": "text",
             "text": format!("[Error: {}]", message)
         }),
         ContentBlock::Unknown(v) => v.clone(),
     }
 }
+
+// -- SSE error type --
+
+/// Error received during an Anthropic SSE stream (the `error` event type).
+/// Carries the raw event data since Anthropic has sent non-JSON errors
+/// (like "Bad Gateway") during outages.
+#[derive(Debug)]
+struct AnthropicStreamError {
+    raw: String,
+}
+
+impl fmt::Display for AnthropicStreamError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match serde_json::from_str::<Value>(&self.raw) {
+            Ok(parsed) => {
+                let error_type = parsed["error"]["type"].as_str().unwrap_or("unknown");
+                let message = parsed["error"]["message"].as_str().unwrap_or("Unknown error");
+                let pretty = serde_json::to_string_pretty(&parsed)
+                    .unwrap_or_else(|_| self.raw.clone());
+                write!(f, "{}: {}\n\nRaw API response:\n{}", error_type, message, pretty)
+            }
+            Err(_) => write!(f, "{}", self.raw),
+        }
+    }
+}
+
+impl std::error::Error for AnthropicStreamError {}
 
 // -- SSE interpretation --
 
@@ -696,16 +724,17 @@ impl SseInterpreter for AnthropicState {
             }
 
             "error" => {
-                let parsed: Value = serde_json::from_str(&sse.data).unwrap_or_default();
-                let error_type = parsed["error"]["type"].as_str().unwrap_or("unknown");
-                let error_msg = parsed["error"]["message"].as_str().unwrap_or("Unknown error").to_string();
-                match error_type {
-                    "rate_limit_error" => {
-                        out.push(Err(ApiError::rate_limited(5000, error_msg)));
-                    }
-                    _ => {
-                        out.push(Err(ApiError::other(format!("{error_type}: {error_msg}"))));
-                    }
+                let is_rate_limit = serde_json::from_str::<Value>(&sse.data)
+                    .ok()
+                    .and_then(|p| p["error"]["type"].as_str().map(|s| s == "rate_limit_error"))
+                    .unwrap_or(false);
+
+                let err = AnthropicStreamError { raw: sse.data.clone() };
+
+                if is_rate_limit {
+                    out.push(Err(ApiError::rate_limited(5000, err)));
+                } else {
+                    out.push(Err(ApiError::other(err)));
                 }
             }
 

@@ -726,8 +726,12 @@ impl GeminiState {
 
         if let Some(error) = chunk.get("error").or_else(|| response.get("error")) {
             let message = error["message"].as_str().unwrap_or("Unknown API error").to_string();
+            let verbose = format!(
+                "{message}\n\nRaw API response:\n{}",
+                serde_json::to_string_pretty(error).unwrap_or_default(),
+            );
             self.finish_block(&mut out);
-            out.push(Ok(StreamEvent::Error(message)));
+            out.push(Ok(StreamEvent::Error(verbose)));
             out.push(Ok(StreamEvent::Done));
             self.done = true;
             return out;
