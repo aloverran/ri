@@ -4,6 +4,7 @@
 //! model metadata, the LLM provider trait, the tool trait, request/error
 //! types, and auth flow descriptions.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::{fmt, str::FromStr};
@@ -89,13 +90,17 @@ pub struct ToolOutput {
 }
 
 /// Ambient context passed to every tool invocation by the agent loop.
-/// Carries the working directory and the identity of the calling session
-/// so that meta-tools (e.g. runAgent) can establish parent relationships.
+/// Carries the working directory, the identity of the calling session,
+/// and any extra environment variables to inject into spawned processes.
 #[derive(Debug, Clone)]
 pub struct ToolContext {
     pub cwd: PathBuf,
     /// File-stem ID of the session that invoked this tool, if known.
     pub session_id: Option<SessionId>,
+    /// Extra environment variables injected into bash processes.
+    /// Domain-agnostic: the agent loop populates this with whatever
+    /// the harness needs (gatekeeper grants, API tokens, etc).
+    pub env_vars: HashMap<String, String>,
 }
 
 /// A tool the agent can invoke. Provides schema (for the LLM API)

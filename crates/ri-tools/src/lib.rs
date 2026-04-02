@@ -3,6 +3,7 @@
 pub mod prompts;
 pub mod resources;
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
@@ -30,7 +31,7 @@ impl Tool for BashTool {
         })
     }
     async fn run(&self, input: serde_json::Value, ctx: ToolContext, cancel: tokio_util::sync::CancellationToken) -> ToolOutput {
-        run_bash(input, ctx.cwd, cancel)
+        run_bash(input, ctx.cwd, &ctx.env_vars, cancel)
             .instrument(tracing::info_span!("tool", name = "bash"))
             .await
     }
@@ -112,6 +113,7 @@ impl Tool for EditTool {
 async fn run_bash(
     input: serde_json::Value,
     cwd: PathBuf,
+    env_vars: &HashMap<String, String>,
     cancel: tokio_util::sync::CancellationToken,
 ) -> ToolOutput {
     use command_group::AsyncCommandGroup;
@@ -131,7 +133,8 @@ async fn run_bash(
         .arg(command)
         .current_dir(&cwd)
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped());
+        .stderr(std::process::Stdio::piped())
+        .envs(env_vars);
 
     // group_spawn creates a process group (Unix) or job object (Windows)
     // so we can kill the entire tree on cleanup.
