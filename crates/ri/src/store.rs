@@ -139,6 +139,8 @@ pub struct Session {
     /// Current context this session points to.
     pub head: ContextId,
     pub cwd: Option<String>,
+    /// SSH target (e.g. "john@laptop.tailnet") for remote sessions.
+    pub host: Option<String>,
     /// ID of the parent session, if spawned by another.
     pub parent: Option<SessionId>,
     pub ts: String,
@@ -160,6 +162,8 @@ struct SessionLine {
     ts: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     cwd: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    host: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     parent: Option<SessionId>,
 }
@@ -393,6 +397,7 @@ impl Store {
         name: &str,
         cwd: &str,
         parent: Option<&SessionId>,
+        host: Option<&str>,
     ) -> eyre::Result<SessionId> {
         let now = Utc::now();
         let ts = now.to_rfc3339();
@@ -432,6 +437,7 @@ impl Store {
             name: name.to_string(),
             ts: ts.clone(),
             cwd: Some(cwd.to_string()),
+            host: host.map(str::to_string),
             parent: parent.cloned(),
         })?;
 
@@ -451,6 +457,7 @@ impl Store {
             id: session_id.clone(),
             head: root_id,
             cwd: Some(cwd.to_string()),
+            host: host.map(str::to_string),
             parent: parent.cloned(),
             ts,
             file: file_stem,
@@ -505,6 +512,7 @@ impl Store {
             name: session.name.clone(),
             ts: session.ts.clone(),
             cwd: session.cwd.clone(),
+            host: session.host.clone(),
             parent: session.parent.clone(),
         })?;
         self.append_line(&session.file, &line)?;
@@ -585,6 +593,7 @@ impl Store {
                         id: sl.session,
                         head: sl.head,
                         cwd: sl.cwd,
+                        host: sl.host,
                         parent: sl.parent,
                         ts: sl.ts,
                         file: file_stem.clone(),
