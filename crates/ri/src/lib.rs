@@ -3,6 +3,7 @@ pub mod model;
 pub mod provider;
 pub mod store;
 pub mod stream;
+pub mod tool;
 
 // Top-level re-exports for convenience.
 pub use model::{
@@ -12,7 +13,8 @@ pub use model::{
 pub use stream::StreamEvent;
 pub use provider::{
     ApiError, AuthMethod, EventStream, LlmProvider, Model, ModelCost, RequestOptions,
-    ThinkingLevel, Tool, ToolContext, ToolOutput, ToolSchema,
+    ThinkingLevel,
 };
+pub use tool::{Tool, ToolContext, ToolOutput, ToolSchema};
 pub use accumulator::StreamAccumulator;
 pub use store::{Pool, Session, Store};
