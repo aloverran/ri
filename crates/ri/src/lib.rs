@@ -17,4 +17,4 @@ pub use provider::{
 };
 pub use tool::{Tool, ToolContext, ToolOutput, ToolSchema};
 pub use accumulator::StreamAccumulator;
-pub use store::{Pool, Session, Store};
+pub use store::{Session, Store};

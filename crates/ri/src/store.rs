@@ -30,10 +30,9 @@ use serde::{Deserialize, Serialize};
 use crate::model::{ContentBlock, Context, ContextId, Message, MessageId, Role, SessionId, gen_obj_id};
 
 /// The in-memory object pool. Messages, contexts, and sessions live here.
-///
-/// Three object types, one pool. Accessed through `Store::with_pool()` for
-/// batch reads, or through convenience methods on `Store` for single lookups.
-pub struct Pool {
+/// Not directly accessible -- all reads go through `Store` methods which
+/// handle locking internally.
+pub(crate) struct Pool {
     messages: HashMap<MessageId, Message>,
     contexts: HashMap<ContextId, Context>,
     sessions: HashMap<SessionId, Session>,
@@ -199,10 +198,10 @@ struct ContextLine {
 /// in-memory pool is updated. A crash at any point leaves the JSONL files
 /// in a consistent prefix state.
 ///
-/// For batch reads (e.g. formatting a context graph), use `with_pool()`
-/// to acquire the lock once and work with `&Pool` directly. For single
-/// lookups, convenience methods like `get_message()` handle locking
-/// internally.
+/// Every public read method follows the same pattern: acquire the pool lock,
+/// do work, release the lock, return owned data. The lock is never held
+/// across caller-provided code (no closures, no returned guards). This
+/// makes single-mutex deadlocks statically impossible.
 pub struct Store {
     pool: Mutex<Pool>,
     sessions_dir: PathBuf,
@@ -271,11 +270,9 @@ impl Store {
         self.pool.lock().unwrap().sessions().cloned().collect()
     }
 
-    /// Batch read access to the pool. The closure receives `&Pool` for the
-    /// duration of a single lock acquisition — many lookups, one lock.
-    pub fn with_pool<R>(&self, f: impl FnOnce(&Pool) -> R) -> R {
-        let pool = self.pool.lock().unwrap();
-        f(&pool)
+    /// Find all contexts whose parents include the given ID.
+    pub fn children(&self, id: &str) -> Vec<Context> {
+        self.pool.lock().unwrap().children(id).into_iter().cloned().collect()
     }
 
     // -- Write methods (disk first, then pool) --
