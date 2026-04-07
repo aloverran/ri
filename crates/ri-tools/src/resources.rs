@@ -13,6 +13,10 @@ use serde::{Deserialize, Serialize};
 
 const CONTEXT_FILE_NAMES: &[&str] = &["AGENTS.md", "CLAUDE.md"];
 
+/// Maximum directory levels to walk upward before stopping. Prevents
+/// unbounded traversal when the starting directory is deeply nested.
+pub const MAX_WALK_DEPTH: usize = 25;
+
 /// A context file discovered on disk.
 pub struct ContextFile {
     pub path: PathBuf,
@@ -42,9 +46,30 @@ pub fn load_settings() -> Settings {
         .unwrap_or_default()
 }
 
+/// Walk up from `dir`, yielding each ancestor directory (closest first)
+/// up to `MAX_WALK_DEPTH` levels. Warns if the depth limit is reached.
+pub fn walk_ancestors(dir: &Path) -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    let mut current = Some(dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf()));
+    while let Some(d) = current {
+        if dirs.len() >= MAX_WALK_DEPTH {
+            tracing::warn!(
+                "upward directory walk from [{}] hit the depth limit of {} at [{}]",
+                dir.display(),
+                MAX_WALK_DEPTH,
+                d.display(),
+            );
+            break;
+        }
+        dirs.push(d.clone());
+        current = d.parent().map(|p| p.to_path_buf());
+    }
+    dirs
+}
+
 /// Walk up from `dir`, collecting context files (AGENTS.md, CLAUDE.md).
 /// At each level checks `.agents/` subdirectory then the directory itself.
-/// Stops at a `.git` boundary. Returns files in walk order (closest first).
+/// Returns files in walk order (closest first).
 pub fn find_context_files(dir: &Path) -> Vec<ContextFile> {
     let mut files = Vec::new();
     let mut seen = HashSet::new();
@@ -127,12 +152,9 @@ You have access to tools for manipulating llms and their context, reading, writi
 /// Walk up from `dir`, scanning at each level. Shared by find_context_files
 /// and discover_context_files (which seeds `seen` with global files first).
 fn collect_walk(dir: &Path, files: &mut Vec<ContextFile>, seen: &mut HashSet<PathBuf>) {
-    let mut current = Some(dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf()));
-    while let Some(d) = current {
+    for d in walk_ancestors(dir) {
         scan_dir(&d.join(".agents"), files, seen);
         scan_dir(&d, files, seen);
-        if d.join(".git").exists() { break; }
-        current = d.parent().map(|p| p.to_path_buf());
     }
 }
 
