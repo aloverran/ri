@@ -8,13 +8,20 @@ use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
 use tracing::Instrument;
-use ri::{Tool, ToolContext, ToolOutput};
+use ri::{Tool, ToolOutput};
 
-pub fn all_tools() -> Vec<Box<dyn Tool>> {
-    vec![Box::new(BashTool), Box::new(ReadTool), Box::new(WriteTool), Box::new(EditTool)]
+pub fn all_tools(cwd: PathBuf) -> Vec<Box<dyn Tool>> {
+    vec![
+        Box::new(BashTool { cwd: cwd.clone() }),
+        Box::new(ReadTool { cwd: cwd.clone() }),
+        Box::new(WriteTool { cwd: cwd.clone() }),
+        Box::new(EditTool { cwd }),
+    ]
 }
 
-struct BashTool;
+struct BashTool {
+    cwd: PathBuf,
+}
 
 #[async_trait]
 impl Tool for BashTool {
@@ -30,14 +37,16 @@ impl Tool for BashTool {
             "required": ["command"]
         })
     }
-    async fn run(&self, input: serde_json::Value, ctx: ToolContext, cancel: tokio_util::sync::CancellationToken) -> ToolOutput {
-        run_bash(input, ctx.cwd, &ctx.env_vars, cancel)
+    async fn run(&self, input: serde_json::Value, cancel: tokio_util::sync::CancellationToken) -> ToolOutput {
+        run_bash(input, &self.cwd, &HashMap::new(), cancel)
             .instrument(tracing::info_span!("tool", name = "bash"))
             .await
     }
 }
 
-struct ReadTool;
+struct ReadTool {
+    cwd: PathBuf,
+}
 
 #[async_trait]
 impl Tool for ReadTool {
@@ -54,14 +63,16 @@ impl Tool for ReadTool {
             "required": ["path"]
         })
     }
-    async fn run(&self, input: serde_json::Value, ctx: ToolContext, _cancel: tokio_util::sync::CancellationToken) -> ToolOutput {
-        run_read(input, ctx.cwd)
+    async fn run(&self, input: serde_json::Value, _cancel: tokio_util::sync::CancellationToken) -> ToolOutput {
+        run_read(input, &self.cwd)
             .instrument(tracing::info_span!("tool", name = "read"))
             .await
     }
 }
 
-struct WriteTool;
+struct WriteTool {
+    cwd: PathBuf,
+}
 
 #[async_trait]
 impl Tool for WriteTool {
@@ -77,14 +88,16 @@ impl Tool for WriteTool {
             "required": ["path", "content"]
         })
     }
-    async fn run(&self, input: serde_json::Value, ctx: ToolContext, _cancel: tokio_util::sync::CancellationToken) -> ToolOutput {
-        run_write(input, ctx.cwd)
+    async fn run(&self, input: serde_json::Value, _cancel: tokio_util::sync::CancellationToken) -> ToolOutput {
+        run_write(input, &self.cwd)
             .instrument(tracing::info_span!("tool", name = "write"))
             .await
     }
 }
 
-struct EditTool;
+struct EditTool {
+    cwd: PathBuf,
+}
 
 #[async_trait]
 impl Tool for EditTool {
@@ -101,8 +114,8 @@ impl Tool for EditTool {
             "required": ["path", "old_text", "new_text"]
         })
     }
-    async fn run(&self, input: serde_json::Value, ctx: ToolContext, _cancel: tokio_util::sync::CancellationToken) -> ToolOutput {
-        run_edit(input, ctx.cwd)
+    async fn run(&self, input: serde_json::Value, _cancel: tokio_util::sync::CancellationToken) -> ToolOutput {
+        run_edit(input, &self.cwd)
             .instrument(tracing::info_span!("tool", name = "edit"))
             .await
     }
@@ -112,7 +125,7 @@ impl Tool for EditTool {
 
 async fn run_bash(
     input: serde_json::Value,
-    cwd: PathBuf,
+    cwd: &Path,
     env_vars: &HashMap<String, String>,
     cancel: tokio_util::sync::CancellationToken,
 ) -> ToolOutput {
@@ -131,7 +144,7 @@ async fn run_bash(
     let mut cmd = tokio::process::Command::new("sh");
     cmd.arg("-c")
         .arg(command)
-        .current_dir(&cwd)
+        .current_dir(cwd)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .envs(env_vars);
@@ -236,7 +249,7 @@ async fn run_bash(
     }
 }
 
-async fn run_read(input: serde_json::Value, cwd: PathBuf) -> ToolOutput {
+async fn run_read(input: serde_json::Value, cwd: &Path) -> ToolOutput {
     let path_str = match input["path"].as_str() {
         Some(p) => p,
         None => return ToolOutput {
@@ -246,7 +259,7 @@ async fn run_read(input: serde_json::Value, cwd: PathBuf) -> ToolOutput {
         },
     };
 
-    let path = resolve_path(path_str, &cwd);
+    let path = resolve_path(path_str, cwd);
     let content = match tokio::fs::read_to_string(&path).await {
         Ok(c) => c,
         Err(e) => return ToolOutput {
@@ -287,7 +300,7 @@ async fn run_read(input: serde_json::Value, cwd: PathBuf) -> ToolOutput {
     }
 }
 
-async fn run_write(input: serde_json::Value, cwd: PathBuf) -> ToolOutput {
+async fn run_write(input: serde_json::Value, cwd: &Path) -> ToolOutput {
     let path_str = match input["path"].as_str() {
         Some(p) => p,
         None => return ToolOutput {
@@ -305,7 +318,7 @@ async fn run_write(input: serde_json::Value, cwd: PathBuf) -> ToolOutput {
         },
     };
 
-    let path = resolve_path(path_str, &cwd);
+    let path = resolve_path(path_str, cwd);
     if let Some(parent) = path.parent() {
         if let Err(e) = tokio::fs::create_dir_all(parent).await {
             return ToolOutput {
@@ -333,7 +346,7 @@ async fn run_write(input: serde_json::Value, cwd: PathBuf) -> ToolOutput {
     }
 }
 
-async fn run_edit(input: serde_json::Value, cwd: PathBuf) -> ToolOutput {
+async fn run_edit(input: serde_json::Value, cwd: &Path) -> ToolOutput {
     let path_str = match input["path"].as_str() {
         Some(p) => p,
         None => return ToolOutput {
@@ -359,7 +372,7 @@ async fn run_edit(input: serde_json::Value, cwd: PathBuf) -> ToolOutput {
         },
     };
 
-    let path = resolve_path(path_str, &cwd);
+    let path = resolve_path(path_str, cwd);
     let content = match tokio::fs::read_to_string(&path).await {
         Ok(c) => c,
         Err(e) => return ToolOutput {

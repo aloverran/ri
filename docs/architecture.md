@@ -152,7 +152,7 @@ Layer 0: Foundation (ri)
   - store: Pool, Store, Session, SessionHeader (persistence)
   - provider: Model, ThinkingLevel, ModelCost
     - LlmProvider trait, RequestOptions, ApiError
-    - Tool trait, ToolSchema, ToolOutput, ToolContext
+    - Tool trait, ToolSchema, ToolOutput
   - stream: StreamEvent
   - accumulator: StreamAccumulator
 
@@ -196,7 +196,7 @@ The foundation crate. Everything the rest of the system depends on:
 - `store` -- `Pool`, `Store`, `Session`, `SessionHeader` (persistence and filing)
 - `stream` -- `StreamEvent` (normalized incremental events from any provider)
 - `accumulator` -- `StreamAccumulator` (pure state machine: `StreamEvent` -> `ContentBlock` + `Usage`)
-- `provider` -- `Model`, `ModelCost`, `ThinkingLevel`, `LlmProvider` trait, `RequestOptions`, `ApiError`, `Tool` trait, `ToolSchema`, `ToolOutput`, `ToolContext`, `AuthMethod`
+- `provider` -- `Model`, `ModelCost`, `ThinkingLevel`, `LlmProvider` trait, `RequestOptions`, `ApiError`, `Tool` trait, `ToolSchema`, `ToolOutput`, `AuthMethod`
 
 Does NOT handle: LLM API calls, tool execution, agent loop logic.
 

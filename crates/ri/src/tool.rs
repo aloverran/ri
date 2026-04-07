@@ -1,16 +1,12 @@
 //! Tool execution contract.
 //!
 //! Defines the trait and data types for tools that agents can invoke:
-//! schema (what the LLM sees), context (ambient state from the agent loop),
-//! output (what flows back), and the async execution trait itself.
-
-use std::collections::HashMap;
-use std::path::PathBuf;
+//! schema (what the LLM sees), output (what flows back), and the async
+//! execution trait itself. Tools capture their own ambient state in their
+//! struct -- ri-core defines the contract, not the context.
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-
-use crate::model::SessionId;
 
 /// Tool schema sent to the LLM API so it knows what tools are available.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -35,22 +31,12 @@ impl ToolOutput {
     }
 }
 
-/// Ambient context passed to every tool invocation by the agent loop.
-/// Carries the working directory, the identity of the calling session,
-/// and any extra environment variables to inject into spawned processes.
-#[derive(Debug, Clone)]
-pub struct ToolContext {
-    pub cwd: PathBuf,
-    /// File-stem ID of the session that invoked this tool, if known.
-    pub session_id: Option<SessionId>,
-    /// Extra environment variables injected into bash processes.
-    /// Domain-agnostic: the agent loop populates this with whatever
-    /// the harness needs (gatekeeper grants, API tokens, etc).
-    pub env_vars: HashMap<String, String>,
-}
-
 /// A tool the agent can invoke. Provides schema (for the LLM API)
 /// and an async execution function.
+///
+/// Each tool captures whatever ambient state it needs (cwd, SSH
+/// connection, session references) in its own struct at construction
+/// time. The trait itself is environment-agnostic.
 #[async_trait]
 pub trait Tool: Send + Sync {
     fn name(&self) -> &str;
@@ -60,7 +46,6 @@ pub trait Tool: Send + Sync {
     async fn run(
         &self,
         input: serde_json::Value,
-        ctx: ToolContext,
         cancel: tokio_util::sync::CancellationToken,
     ) -> ToolOutput;
 

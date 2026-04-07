@@ -15,6 +15,6 @@ pub use provider::{
     ApiError, AuthMethod, EventStream, LlmProvider, Model, ModelCost, RequestOptions,
     ThinkingLevel,
 };
-pub use tool::{Tool, ToolContext, ToolOutput, ToolSchema};
+pub use tool::{Tool, ToolOutput, ToolSchema};
 pub use accumulator::StreamAccumulator;
 pub use store::{Session, Store};
