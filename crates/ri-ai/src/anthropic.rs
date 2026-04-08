@@ -415,11 +415,14 @@ fn build_body(opts: &RequestOptions, is_oauth: bool) -> Value {
     });
 
     if is_oauth {
-        body["system"] = json!([
-            { "type": "text", "text": "You are Claude Code, Anthropic's official CLI for Claude." },
-            { "type": "text", "text": opts.system_prompt },
-        ]);
-    } else {
+        let mut system_blocks = vec![
+            json!({ "type": "text", "text": "You are Claude Code, Anthropic's official CLI for Claude." }),
+        ];
+        if !opts.system_prompt.trim().is_empty() {
+            system_blocks.push(json!({ "type": "text", "text": opts.system_prompt }));
+        }
+        body["system"] = json!(system_blocks);
+    } else if !opts.system_prompt.trim().is_empty() {
         body["system"] = json!([{ "type": "text", "text": opts.system_prompt }]);
     }
 
