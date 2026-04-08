@@ -587,35 +587,50 @@ impl Store {
 
             // Three line types: session (has both "session" + "head"), msg, context.
             if obj.get("session").is_some() && obj.get("head").is_some() {
-                if let Ok(sl) = serde_json::from_value::<SessionLine>(obj) {
-                    pool.put_session(Session {
-                        name: sl.name,
-                        id: sl.session,
-                        head: sl.head,
-                        cwd: sl.cwd,
-                        host: sl.host,
-                        parent: sl.parent,
-                        ts: sl.ts,
-                        file: file_stem.clone(),
-                    });
+                match serde_json::from_value::<SessionLine>(obj) {
+                    Ok(sl) => {
+                        pool.put_session(Session {
+                            name: sl.name,
+                            id: sl.session,
+                            head: sl.head,
+                            cwd: sl.cwd,
+                            host: sl.host,
+                            parent: sl.parent,
+                            ts: sl.ts,
+                            file: file_stem.clone(),
+                        });
+                    }
+                    Err(e) => {
+                        tracing::warn!("{}:{}: session line failed to deserialize, skipping: {}", path.display(), line_num + 1, e);
+                    }
                 }
             } else if obj.get("msg").is_some() {
-                if let Ok(ml) = serde_json::from_value::<MessageLine>(obj) {
-                    pool.put_message(Message {
-                        id: ml.msg,
-                        role: ml.role,
-                        content: ml.content,
-                        meta: ml.meta,
-                    });
+                match serde_json::from_value::<MessageLine>(obj) {
+                    Ok(ml) => {
+                        pool.put_message(Message {
+                            id: ml.msg,
+                            role: ml.role,
+                            content: ml.content,
+                            meta: ml.meta,
+                        });
+                    }
+                    Err(e) => {
+                        tracing::warn!("{}:{}: message line failed to deserialize, skipping: {}", path.display(), line_num + 1, e);
+                    }
                 }
             } else if obj.get("context").is_some() {
-                if let Ok(cl) = serde_json::from_value::<ContextLine>(obj) {
-                    pool.put_context(Context {
-                        id: cl.context,
-                        messages: cl.messages,
-                        parents: cl.parents,
-                        meta: cl.meta,
-                    });
+                match serde_json::from_value::<ContextLine>(obj) {
+                    Ok(cl) => {
+                        pool.put_context(Context {
+                            id: cl.context,
+                            messages: cl.messages,
+                            parents: cl.parents,
+                            meta: cl.meta,
+                        });
+                    }
+                    Err(e) => {
+                        tracing::warn!("{}:{}: context line failed to deserialize, skipping: {}", path.display(), line_num + 1, e);
+                    }
                 }
             } else {
                 tracing::warn!("{}:{}: unrecognized line format, skipping", path.display(), line_num + 1);
