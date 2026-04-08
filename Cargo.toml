@@ -2,7 +2,7 @@
 members = [
     "crates/ri",
     "crates/ri-ai",
-    "crates/ri-tools",
+    "crates/ri-kit",
 ]
 resolver = "2"
 
@@ -36,5 +36,5 @@ command-group = { version = "5", features = ["with-tokio"] }
 async-stream = "0.3"
 ri = { path = "crates/ri" }
 ri-ai = { path = "crates/ri-ai" }
-ri-tools = { path = "crates/ri-tools" }
+ri-kit = { path = "crates/ri-kit" }
 

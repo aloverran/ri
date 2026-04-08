@@ -15,7 +15,7 @@ git clone https://github.com/aloverran/my-ri ri-example
 cd ri-example/ri-tui && cargo run --release 
 ```
 
-From here you can simply instruct Ri to modify itself however you like. There are a bunch of building blocks in the `ri-tools` crate.
+From here you can simply instruct Ri to modify itself however you like. There are a bunch of building blocks in the `ri-kit` crate.
 
 If you want to start your Ri build from the example, we recommending forking the example repo. Or if you want to start fresh, just use the ri crates directly!
 

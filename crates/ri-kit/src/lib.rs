@@ -1,4 +1,4 @@
-// Built-in tools for ri.
+// Building blocks for ri agent applications.
 
 pub mod prompts;
 pub mod resources;

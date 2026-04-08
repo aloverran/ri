@@ -1,9 +1,9 @@
 [package]
-name = "ri-tools"
+name = "ri-kit"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Built-in coding tools (bash, read, write, edit) for ri"
+description = "Building blocks for ri agent applications: coding tools, prompt templates, and context discovery"
 
 [dependencies]
 ri.workspace = true

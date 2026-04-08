@@ -1,4 +1,4 @@
-# ri-tools
+# ri-kit
 
 Building blocks for agent applications. Think of it like a warehouse of car parts.
 

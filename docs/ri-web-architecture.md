@@ -2,7 +2,7 @@
 
 ## What ri-web is
 
-ri-web is a web interface for ri. It is a Layer 2 application (like ri-cli) that composes the same foundation crates -- `ri`, `ri-ai`, `ri-tools` -- to provide a browser-based interface for LLM sessions. It replaces the terminal TUI for daily use and is accessible over a tailnet from a phone.
+ri-web is a web interface for ri. It is a Layer 2 application (like ri-cli) that composes the same foundation crates -- `ri`, `ri-ai`, `ri-kit` -- to provide a browser-based interface for LLM sessions. It replaces the terminal TUI for daily use and is accessible over a tailnet from a phone.
 
 ri-web is not a wrapper around ri-cli. It composes the same primitives directly: `Turn` for LLM calls, `Store` for persistence, `Pool` for message/step management, and the standard tool implementations. The agent loop in ri-web is its own application code, shaped for a multi-session web context.
 
@@ -24,7 +24,7 @@ ri-web (axum)
   |
   +-- ri       (Pool, Store, types)
   +-- ri-ai    (Turn, providers, registry)
-  +-- ri-tools (bash, read, write, edit, prompts, resources)
+  +-- ri-kit  (bash, read, write, edit, prompts, resources)
 ```
 
 The browser talks only to the axum server. All LLM calls, tool execution, and message persistence happen server-side.

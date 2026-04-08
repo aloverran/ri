@@ -156,12 +156,12 @@ Layer 0: Foundation (ri)
   - stream: StreamEvent
   - accumulator: StreamAccumulator
 
-Layer 1: I/O (ri-ai, ri-tools)
+Layer 1: I/O (ri-ai, ri-kit)
   - ri-ai: LLM provider implementations (Anthropic, Gemini, OpenAI Codex)
     - Streaming SSE, OAuth, API keys
     - Turn: call provider + accumulate response
     - Provider registry and model catalog
-  - ri-tools: Building blocks for agent applications
+  - ri-kit: Building blocks for agent applications
     - Coding tools: bash, read, write, edit
     - Prompt template system (load, parse, expand)
     - Context file discovery (AGENTS.md, settings.json)
@@ -183,7 +183,7 @@ ri/                          # Workspace root
     crates/
       ri/                    # Layer 0: types, pool, store, traits
       ri-ai/                 # Layer 1: LLM providers, Turn, auth
-      ri-tools/              # Layer 1: coding tools, prompts, resources
+      ri-kit/               # Layer 1: coding tools, prompts, resources
   ri-cli/                    # Layer 2: terminal agent
   ri-web/                    # Layer 2: web agent
 ```
@@ -214,7 +214,7 @@ LLM provider implementations:
 
 Does NOT handle: message storage, tool execution, agent loop.
 
-### ri-tools
+### ri-kit
 
 Building blocks for agent applications:
 
