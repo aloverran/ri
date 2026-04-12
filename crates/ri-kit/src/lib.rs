@@ -26,7 +26,7 @@ struct BashTool {
 #[async_trait]
 impl Tool for BashTool {
     fn name(&self) -> &str { "bash" }
-    fn description(&self) -> &str { "Execute a shell command" }
+    fn description(&self) -> &str { "Execute a shell command. Runs non-interactively. Output is returned after the command completes." }
     fn parameters(&self) -> serde_json::Value {
         serde_json::json!({
             "type": "object",
