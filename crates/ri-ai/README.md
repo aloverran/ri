@@ -6,7 +6,7 @@ Currently supports Anthropic (Messages API), Google Gemini (Cloud Code Assist AP
 
 ## What's here
 
-**anthropic** -- Builds Anthropic Messages API requests. Handles two auth modes: API key (`x-api-key` header) and OAuth (`Bearer` token with claude-code beta headers). For OAuth, tool names are mapped to/from Claude Code's PascalCase convention. Supports thinking configuration: adaptive mode for Opus 4.6, budget-based for other reasoning models.
+**anthropic** -- Builds Anthropic Messages API requests. Handles two auth modes: API key (`x-api-key` header) and OAuth (`Bearer` token with claude-code beta headers). For OAuth, tool names are mapped to/from Claude Code's PascalCase convention. Thinking configuration tracks Anthropic's split API: adaptive-effort mode for Opus 4.6+ and Sonnet 4.6+, budget-tokens mode for older reasoning models (Haiku 4.5, Sonnet 4, Sonnet 4.5).
 
 **gemini** -- Builds Google Cloud Code Assist requests. Three variants: `Cli` (cloudcode-pa.googleapis.com), `Antigravity` (daily sandbox endpoint for Gemini 3), and `ApiKey` (generativelanguage.googleapis.com). Handles Gemini's `thoughtSignature` requirement -- tool calls from other providers without valid signatures are converted to descriptive text. Thinking levels map to Gemini's `thinkingLevel` strings for Gemini 3, or `thinkingBudget` tokens for older models.
 

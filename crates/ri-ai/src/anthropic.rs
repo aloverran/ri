@@ -141,6 +141,11 @@ impl LlmProvider for AnthropicProvider {
                 reasoning: true, context_window: 200_000, max_tokens: 128_000,
                 cost: ModelCost { input: 5.0, output: 25.0, cache_read: 0.5, cache_write: 6.25 },
             },
+            Model {
+                id: "claude-opus-4-7".into(), name: "Claude Opus 4.7".into(),
+                reasoning: true, context_window: 200_000, max_tokens: 128_000,
+                cost: ModelCost { input: 5.0, output: 25.0, cache_read: 0.5, cache_write: 6.25 },
+            },
             // Extended context variants -- 1M token input via beta header.
             // Same models and pricing, but opts into the context-1m-2025-08-07 beta.
             Model {
@@ -150,6 +155,11 @@ impl LlmProvider for AnthropicProvider {
             },
             Model {
                 id: "claude-opus-4-6-1m".into(), name: "Claude Opus 4.6 (1M)".into(),
+                reasoning: true, context_window: 1_000_000, max_tokens: 128_000,
+                cost: ModelCost { input: 5.0, output: 25.0, cache_read: 0.5, cache_write: 6.25 },
+            },
+            Model {
+                id: "claude-opus-4-7-1m".into(), name: "Claude Opus 4.7 (1M)".into(),
                 reasoning: true, context_window: 1_000_000, max_tokens: 128_000,
                 cost: ModelCost { input: 5.0, output: 25.0, cache_read: 0.5, cache_write: 6.25 },
             },
@@ -443,18 +453,57 @@ fn build_body(opts: &RequestOptions, is_oauth: bool) -> Value {
     }
 
     if opts.thinking != ThinkingLevel::Off && opts.model.reasoning {
-        body["thinking"] = json!({ "type": "adaptive" });
-        let effort = match opts.thinking {
-            ThinkingLevel::Low => "low",
-            ThinkingLevel::Medium => "medium",
-            ThinkingLevel::High => "high",
-            ThinkingLevel::XHigh => "max",
-            ThinkingLevel::Off => unreachable!(),
-        };
-        body["output_config"] = json!({ "effort": effort });
+        apply_thinking(&mut body, opts.thinking, thinking_mode(&opts.model.id));
     }
 
     body
+}
+
+/// Which thinking-config shape a model accepts. Anthropic split the API
+/// in February 2026: newer hybrid-reasoning models (Opus 4.6+, Sonnet 4.6+)
+/// take an adaptive mode with an effort suggestion and decide for themselves
+/// how much to think; older ones still require a hard `budget_tokens` ceiling.
+enum ThinkingMode {
+    Adaptive,
+    Budget,
+}
+
+fn thinking_mode(model_id: &str) -> ThinkingMode {
+    // `-1m` suffix is stripped upstream, so we see canonical ids only.
+    // New Anthropic models must be added here; anything unknown defaults
+    // to budget mode, which the older reasoning models require.
+    match model_id {
+        "claude-opus-4-6"
+        | "claude-opus-4-7"
+        | "claude-sonnet-4-6" => ThinkingMode::Adaptive,
+        _ => ThinkingMode::Budget,
+    }
+}
+
+fn apply_thinking(body: &mut Value, level: ThinkingLevel, mode: ThinkingMode) {
+    match mode {
+        ThinkingMode::Adaptive => {
+            let effort = match level {
+                ThinkingLevel::Low => "low",
+                ThinkingLevel::Medium => "medium",
+                ThinkingLevel::High => "high",
+                ThinkingLevel::XHigh => "max",
+                ThinkingLevel::Off => unreachable!("guarded by caller"),
+            };
+            body["thinking"] = json!({ "type": "adaptive" });
+            body["output_config"] = json!({ "effort": effort });
+        }
+        ThinkingMode::Budget => {
+            let budget = match level {
+                ThinkingLevel::Low => 1024,
+                ThinkingLevel::Medium => 4096,
+                ThinkingLevel::High => 16384,
+                ThinkingLevel::XHigh => 32768,
+                ThinkingLevel::Off => unreachable!("guarded by caller"),
+            };
+            body["thinking"] = json!({ "type": "enabled", "budget_tokens": budget });
+        }
+    }
 }
 
 fn convert_message(msg: &Message, complete: &std::collections::HashSet<&str>) -> Value {
