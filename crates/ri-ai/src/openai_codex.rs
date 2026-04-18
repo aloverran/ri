@@ -55,67 +55,55 @@ fn load_creds() -> Option<Credentials> {
     creds::load(&creds_path().ok()?)
 }
 
-fn save_creds(c: &Credentials) -> eyre::Result<()> {
-    creds::save(&creds_path()?, c)
-}
-
 // -- Provider --
 
 pub struct OpenAICodexProvider {
-    state: Mutex<ProviderState>,
+    /// PKCE verifier and state live here across the `begin_login` ->
+    /// `complete_login` HTTP round trip. Access tokens and account IDs are
+    /// read fresh from disk via `load_creds` (the account ID is embedded in
+    /// the JWT so re-deriving it is free).
+    login: Mutex<LoginInProgress>,
 }
 
-struct ProviderState {
-    access_token: String,
-    account_id: String,
-    // PKCE for in-progress login
-    login_verifier: Option<String>,
-    login_state: Option<String>,
+#[derive(Default)]
+struct LoginInProgress {
+    verifier: Option<String>,
+    state: Option<String>,
 }
 
 impl OpenAICodexProvider {
     pub fn new() -> Self {
-        let (access_token, account_id) = if let Some(creds) = load_creds() {
-            let account_id = extract_account_id(&creds.access_token).unwrap_or_default();
-            (creds.access_token, account_id)
-        } else {
-            (String::new(), String::new())
-        };
-
-        Self {
-            state: Mutex::new(ProviderState {
-                access_token,
-                account_id,
-                login_verifier: None,
-                login_state: None,
-            }),
-        }
+        Self { login: Mutex::new(LoginInProgress::default()) }
     }
 
-    /// Ensure we have a valid (non-expired) token, refreshing if needed.
+    /// Return `(access_token, account_id)`. Refreshes under the shared
+    /// credential lock if the on-disk token is past its expiry buffer.
     async fn ensure_valid_token(&self) -> eyre::Result<(String, String)> {
-        let mut state = self.state.lock().await;
-        if state.access_token.is_empty() {
-            return Ok((String::new(), String::new()));
+        let creds = match load_creds() {
+            Some(c) => c,
+            None => return Ok((String::new(), String::new())),
+        };
+        if !creds.is_expired() {
+            let account_id = extract_account_id(&creds.access_token).unwrap_or_default();
+            return Ok((creds.access_token, account_id));
         }
 
-        if let Some(creds) = load_creds() {
-            if creds.is_expired() {
-                match refresh_token(&creds).await {
-                    Ok(refreshed) => {
-                        state.access_token = refreshed.access_token.clone();
-                        state.account_id = extract_account_id(&refreshed.access_token)
-                            .unwrap_or_default();
-                        let _ = save_creds(&refreshed);
-                    }
-                    Err(e) => {
-                        tracing::warn!("OpenAI Codex token refresh failed: {}", e);
-                    }
-                }
+        let guard = crate::creds::CredsGuard::acquire(creds_path()?).await?;
+        let mut current = creds;
+        if let Some(fresh) = guard.read() {
+            if !fresh.is_expired() {
+                let account_id = extract_account_id(&fresh.access_token).unwrap_or_default();
+                return Ok((fresh.access_token, account_id));
             }
+            current = fresh;
         }
-
-        Ok((state.access_token.clone(), state.account_id.clone()))
+        let refreshed = refresh_token(&current).await
+            .map_err(|e| eyre::eyre!(
+                "OpenAI Codex OAuth refresh failed -- re-login required ({e})"
+            ))?;
+        guard.write(&refreshed).await?;
+        let account_id = extract_account_id(&refreshed.access_token).unwrap_or_default();
+        Ok((refreshed.access_token, account_id))
     }
 }
 
@@ -145,7 +133,7 @@ impl LlmProvider for OpenAICodexProvider {
     }
 
     fn is_authenticated(&self) -> bool {
-        self.state.try_lock().map(|s| !s.access_token.is_empty()).unwrap_or(false)
+        load_creds().is_some()
     }
 
     fn can_logout(&self) -> bool {
@@ -170,10 +158,9 @@ impl LlmProvider for OpenAICodexProvider {
             .append_pair("codex_cli_simplified_flow", "true")
             .append_pair("originator", "ri");
 
-        let mut state = self.state.lock().await;
-        state.login_verifier = Some(verifier);
-        state.login_state = Some(login_state);
-        drop(state);
+        let mut login = self.login.lock().await;
+        login.verifier = Some(verifier);
+        login.state = Some(login_state);
 
         Ok(Some(AuthMethod::LocalCallback {
             url: url.to_string(),
@@ -184,10 +171,10 @@ impl LlmProvider for OpenAICodexProvider {
 
     async fn complete_login(&self, code: &str) -> eyre::Result<()> {
         let (verifier, login_state) = {
-            let mut state = self.state.lock().await;
-            let v = state.login_verifier.take()
+            let mut login = self.login.lock().await;
+            let v = login.verifier.take()
                 .ok_or_else(|| eyre::eyre!("No login in progress"))?;
-            let s = state.login_state.take()
+            let s = login.state.take()
                 .ok_or_else(|| eyre::eyre!("No login state"))?;
             (v, s)
         };
@@ -202,15 +189,12 @@ impl LlmProvider for OpenAICodexProvider {
         }
 
         let creds = exchange_code(&actual_code, &verifier).await?;
-        let account_id = extract_account_id(&creds.access_token)
+        // Validate that we can extract an account ID before persisting, so a
+        // malformed JWT surfaces as a login failure rather than a stream error.
+        extract_account_id(&creds.access_token)
             .ok_or_else(|| eyre::eyre!("Failed to extract account ID from token"))?;
-
-        save_creds(&creds)?;
-
-        let mut state = self.state.lock().await;
-        state.access_token = creds.access_token;
-        state.account_id = account_id;
-
+        let guard = crate::creds::CredsGuard::acquire(creds_path()?).await?;
+        guard.write(&creds).await?;
         Ok(())
     }
 
@@ -218,9 +202,6 @@ impl LlmProvider for OpenAICodexProvider {
         if let Ok(path) = creds_path() {
             let _ = std::fs::remove_file(&path);
         }
-        let mut state = self.state.lock().await;
-        state.access_token.clear();
-        state.account_id.clear();
         Ok(())
     }
 
@@ -249,9 +230,16 @@ impl LlmProvider for OpenAICodexProvider {
 
 // -- Token exchange & refresh --
 
+/// Hard cap on any OAuth token HTTP call. Refresh typically completes in
+/// under a second; the cap exists so a stalled endpoint cannot hold the
+/// cross-process refresh lock indefinitely.
+const TOKEN_HTTP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// Exchange an authorization code for tokens. Uses form-urlencoded (not JSON).
 async fn exchange_code(code: &str, verifier: &str) -> eyre::Result<Credentials> {
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .timeout(TOKEN_HTTP_TIMEOUT)
+        .build()?;
     let response = client
         .post(TOKEN_URL)
         .form(&[
@@ -275,7 +263,9 @@ async fn exchange_code(code: &str, verifier: &str) -> eyre::Result<Credentials> 
 }
 
 async fn refresh_token(credentials: &Credentials) -> eyre::Result<Credentials> {
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .timeout(TOKEN_HTTP_TIMEOUT)
+        .build()?;
     let response = client
         .post(TOKEN_URL)
         .form(&[

@@ -24,10 +24,6 @@ pub fn load_creds(variant: GeminiVariant) -> Option<Credentials> {
     creds::load(&creds_path(variant).ok()?)
 }
 
-pub fn save_creds(variant: GeminiVariant, creds: &Credentials) -> eyre::Result<()> {
-    creds::save(&creds_path(variant)?, creds)
-}
-
 // -- OAuth constants --
 
 fn decode_b64(s: &str) -> String {
@@ -121,13 +117,20 @@ pub fn build_auth_url(variant: GeminiVariant, challenge: &str, login_state: &str
 
 // -- Token exchange and refresh --
 
+/// Hard cap on any OAuth token HTTP call. Refresh typically completes in
+/// under a second; the cap exists so a stalled endpoint cannot hold the
+/// cross-process refresh lock indefinitely.
+const TOKEN_HTTP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 pub async fn exchange_code(
     variant: GeminiVariant,
     code: &str,
     verifier: &str,
 ) -> eyre::Result<Credentials> {
     let cfg = config_for(variant);
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .timeout(TOKEN_HTTP_TIMEOUT)
+        .build()?;
     let response = client
         .post(TOKEN_URL)
         .form(&[
@@ -166,7 +169,9 @@ pub async fn exchange_code(
 
 pub async fn refresh_token(credentials: &Credentials, variant: GeminiVariant) -> eyre::Result<Credentials> {
     let cfg = config_for(variant);
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .timeout(TOKEN_HTTP_TIMEOUT)
+        .build()?;
 
     let response = client
         .post(TOKEN_URL)

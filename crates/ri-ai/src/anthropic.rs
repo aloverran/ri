@@ -6,6 +6,7 @@
 use std::collections::HashMap;
 use std::fmt;
 use std::path::PathBuf;
+use std::time::Duration;
 use async_trait::async_trait;
 use serde_json::{json, Value};
 use tokio::sync::Mutex;
@@ -16,7 +17,7 @@ use ri::{
     RequestOptions, Role, StreamEvent, ThinkingLevel, ToolSchema, Usage,
 };
 use crate::sse::{self, SseEvent, SseInterpreter};
-use crate::creds::{self, Credentials};
+use crate::creds::{self, CredsGuard, Credentials};
 
 fn creds_path() -> eyre::Result<PathBuf> {
     Ok(creds::ri_dir()?.join("anthropic_auth.json"))
@@ -26,8 +27,24 @@ fn load_creds() -> Option<Credentials> {
     creds::load(&creds_path().ok()?)
 }
 
-fn save_creds(creds: &Credentials) -> eyre::Result<()> {
-    creds::save(&creds_path()?, creds)
+/// Read the Anthropic API key. `ANTHROPIC_API_KEY` wins; otherwise the OAuth
+/// access token from disk. Returns `(key, is_oauth)` where `is_oauth` says
+/// whether we should use the OAuth-specific headers and beta flags.
+///
+/// Always consults the source of truth (env + disk). There is no in-memory
+/// cache to fossilize, so this is the only place that needs updating when
+/// credentials change on disk.
+fn read_api_key() -> (String, bool) {
+    let env = std::env::var("ANTHROPIC_API_KEY").unwrap_or_default();
+    if !env.is_empty() {
+        let is_oauth = env.starts_with("sk-ant-oat");
+        return (env, is_oauth);
+    }
+    if let Some(creds) = load_creds() {
+        let is_oauth = creds.access_token.starts_with("sk-ant-oat");
+        return (creds.access_token, is_oauth);
+    }
+    (String::new(), false)
 }
 
 // -- PKCE + OAuth constants --
@@ -38,69 +55,71 @@ const TOKEN_URL: &str = "https://console.anthropic.com/v1/oauth/token";
 const REDIRECT_URI: &str = "https://console.anthropic.com/oauth/code/callback";
 const SCOPES: &str = "org:create_api_key user:profile user:inference";
 
+/// Hard cap on any OAuth token HTTP call. Refresh typically completes in
+/// under a second; the cap exists so a stalled endpoint cannot hold the
+/// cross-process refresh lock indefinitely.
+const TOKEN_HTTP_TIMEOUT: Duration = Duration::from_secs(30);
+
 // -- Provider struct --
 
 pub struct AnthropicProvider {
-    state: Mutex<ProviderState>,
+    /// PKCE verifier and state live here across the `begin_login` ->
+    /// `complete_login` HTTP round trip. Everything else -- the current
+    /// access token, whether we're OAuth -- is read fresh from disk or env,
+    /// so there is nothing else worth caching.
+    login: Mutex<LoginInProgress>,
 }
 
-struct ProviderState {
-    api_key: String,
-    is_oauth: bool,
-    // PKCE verifier + state for in-progress login
-    login_verifier: Option<String>,
-    login_state: Option<String>,
+#[derive(Default)]
+struct LoginInProgress {
+    verifier: Option<String>,
+    state: Option<String>,
 }
 
 impl AnthropicProvider {
     pub fn new() -> Self {
-        let mut api_key = std::env::var("ANTHROPIC_API_KEY").unwrap_or_default();
-        let mut is_oauth = false;
-
-        if api_key.is_empty() {
-            if let Some(creds) = load_creds() {
-                api_key = creds.access_token.clone();
-                is_oauth = api_key.starts_with("sk-ant-oat");
-            }
-        } else {
-            is_oauth = api_key.starts_with("sk-ant-oat");
-        }
-
-        Self {
-            state: Mutex::new(ProviderState {
-                api_key,
-                is_oauth,
-                login_verifier: None,
-                login_state: None,
-            }),
-        }
+        Self { login: Mutex::new(LoginInProgress::default()) }
     }
 
+    /// Return a usable Anthropic API key plus whether it's an OAuth token.
+    /// If the on-disk OAuth token is past its expiry buffer, refreshes it
+    /// under the shared credential lock before returning.
     async fn ensure_valid_token(&self) -> eyre::Result<(String, bool)> {
-        let mut state = self.state.lock().await;
-        if state.api_key.is_empty() {
-            return Ok((String::new(), false));
+        let (api_key, is_oauth) = read_api_key();
+        if api_key.is_empty() || !is_oauth {
+            return Ok((api_key, is_oauth));
         }
 
-        // If we have stored creds and they're expired, try refresh
-        if state.is_oauth {
-            if let Some(creds) = load_creds() {
-                if creds.is_expired() {
-                    match refresh_token(&creds).await {
-                        Ok(refreshed) => {
-                            state.api_key = refreshed.access_token.clone();
-                            state.is_oauth = true;
-                            let _ = save_creds(&refreshed);
-                        }
-                        Err(e) => {
-                            tracing::warn!("Anthropic token refresh failed: {}", e);
-                        }
-                    }
-                }
+        let creds = match load_creds() {
+            Some(c) => c,
+            None => return Ok((api_key, true)),
+        };
+        if !creds.is_expired() {
+            return Ok((creds.access_token, true));
+        }
+
+        // Slow path: token is past its buffer. Serialize with other refreshers
+        // via a file lock on `<creds>.json.lock`, re-check disk (a sibling may
+        // have refreshed while we waited), then refresh exactly once.
+        //
+        // If `fresh` exists but is also expired, it means another holder wrote
+        // a fresh token that has since expired -- we must refresh with that
+        // (newest) refresh token, not the one we originally loaded, because
+        // the one we loaded may have been consumed and rotated away.
+        let guard = CredsGuard::acquire(creds_path()?).await?;
+        let mut current = creds;
+        if let Some(fresh) = guard.read() {
+            if !fresh.is_expired() {
+                return Ok((fresh.access_token, true));
             }
+            current = fresh;
         }
-
-        Ok((state.api_key.clone(), state.is_oauth))
+        let refreshed = refresh_token(&current).await
+            .map_err(|e| eyre::eyre!(
+                "Anthropic OAuth refresh failed -- re-login required ({e})"
+            ))?;
+        guard.write(&refreshed).await?;
+        Ok((refreshed.access_token, true))
     }
 }
 
@@ -167,8 +186,7 @@ impl LlmProvider for AnthropicProvider {
     }
 
     fn is_authenticated(&self) -> bool {
-        // Best-effort sync check.
-        self.state.try_lock().map(|s| !s.api_key.is_empty()).unwrap_or(false)
+        !read_api_key().0.is_empty()
     }
 
     fn can_logout(&self) -> bool {
@@ -192,20 +210,19 @@ impl LlmProvider for AnthropicProvider {
             .append_pair("code_challenge_method", "S256")
             .append_pair("state", &login_state);
 
-        let mut state = self.state.lock().await;
-        state.login_verifier = Some(verifier);
-        state.login_state = Some(login_state);
-        drop(state);
+        let mut login = self.login.lock().await;
+        login.verifier = Some(verifier);
+        login.state = Some(login_state);
 
         Ok(Some(AuthMethod::PasteCode { url: url.to_string() }))
     }
 
     async fn complete_login(&self, code: &str) -> eyre::Result<()> {
         let (verifier, login_state) = {
-            let mut state = self.state.lock().await;
-            let v = state.login_verifier.take()
+            let mut login = self.login.lock().await;
+            let v = login.verifier.take()
                 .ok_or_else(|| eyre::eyre!("No login in progress"))?;
-            let s = state.login_state.take()
+            let s = login.state.take()
                 .ok_or_else(|| eyre::eyre!("No login state"))?;
             (v, s)
         };
@@ -221,7 +238,9 @@ impl LlmProvider for AnthropicProvider {
             }
         }
 
-        let client = reqwest::Client::new();
+        let client = reqwest::Client::builder()
+            .timeout(TOKEN_HTTP_TIMEOUT)
+            .build()?;
         let response = client
             .post(TOKEN_URL)
             .json(&json!({
@@ -243,13 +262,8 @@ impl LlmProvider for AnthropicProvider {
 
         let body: Value = response.json().await?;
         let creds = parse_token_response(&body)?;
-        let key = creds.access_token.clone();
-        save_creds(&creds)?;
-
-        let mut state = self.state.lock().await;
-        state.api_key = key;
-        state.is_oauth = true;
-
+        let guard = CredsGuard::acquire(creds_path()?).await?;
+        guard.write(&creds).await?;
         Ok(())
     }
 
@@ -262,9 +276,6 @@ impl LlmProvider for AnthropicProvider {
         if let Ok(path) = creds_path() {
             let _ = std::fs::remove_file(&path);
         }
-        let mut state = self.state.lock().await;
-        state.api_key.clear();
-        state.is_oauth = false;
         Ok(())
     }
 
@@ -288,7 +299,9 @@ impl LlmProvider for AnthropicProvider {
 // -- Token handling --
 
 async fn refresh_token(credentials: &Credentials) -> eyre::Result<Credentials> {
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .timeout(TOKEN_HTTP_TIMEOUT)
+        .build()?;
     let response = client
         .post(TOKEN_URL)
         .json(&json!({

@@ -60,71 +60,55 @@ fn save_api_key(key: &str) -> eyre::Result<()> {
 
 pub struct GeminiProvider {
     variant: GeminiVariant,
-    state: Mutex<ProviderState>,
+    /// PKCE verifier and state live here across the `begin_login` ->
+    /// `complete_login` HTTP round trip. Access tokens and project IDs are
+    /// read fresh from disk via `gemini_auth::load_creds` on each call.
+    login: Mutex<LoginInProgress>,
 }
 
-struct ProviderState {
-    token: String,
-    project_id: String,
-    // PKCE for in-progress login
-    login_verifier: Option<String>,
-    login_state: Option<String>,
+#[derive(Default)]
+struct LoginInProgress {
+    verifier: Option<String>,
+    state: Option<String>,
 }
 
 impl GeminiProvider {
     pub fn new(variant: GeminiVariant) -> Self {
-        let (token, project_id) = match variant {
-            GeminiVariant::ApiKey => {
-                let key = load_api_key().unwrap_or_default();
-                (key, String::new())
-            }
-            _ => {
-                if let Some(creds) = gemini_auth::load_creds(variant) {
-                    (creds.access_token, creds.project_id.unwrap_or_default())
-                } else {
-                    (String::new(), String::new())
-                }
-            }
-        };
-
-        Self {
-            variant,
-            state: Mutex::new(ProviderState {
-                token,
-                project_id,
-                login_verifier: None,
-                login_state: None,
-            }),
-        }
+        Self { variant, login: Mutex::new(LoginInProgress::default()) }
     }
 
+    /// Return `(access_token, project_id)` for this provider. For OAuth
+    /// variants, refreshes under the shared credential lock if the on-disk
+    /// token is past its expiry buffer. For the API-key variant, just reads
+    /// the key.
     async fn ensure_valid_token(&self) -> eyre::Result<(String, String)> {
-        let mut state = self.state.lock().await;
-        if state.token.is_empty() {
-            return Ok((String::new(), String::new()));
-        }
-
-        // API key auth doesn't expire or refresh.
         if self.variant == GeminiVariant::ApiKey {
-            return Ok((state.token.clone(), String::new()));
+            return Ok((load_api_key().unwrap_or_default(), String::new()));
         }
 
-        if let Some(creds) = gemini_auth::load_creds(self.variant) {
-            if creds.is_expired() {
-                match gemini_auth::refresh_token(&creds, self.variant).await {
-                    Ok(refreshed) => {
-                        state.token = refreshed.access_token.clone();
-                        state.project_id = refreshed.project_id.clone().unwrap_or_default();
-                        let _ = gemini_auth::save_creds(self.variant, &refreshed);
-                    }
-                    Err(e) => {
-                        tracing::warn!("Google token refresh failed: {}", e);
-                    }
-                }
+        let creds = match gemini_auth::load_creds(self.variant) {
+            Some(c) => c,
+            None => return Ok((String::new(), String::new())),
+        };
+        if !creds.is_expired() {
+            return Ok((creds.access_token, creds.project_id.unwrap_or_default()));
+        }
+
+        let path = gemini_auth::creds_path(self.variant)?;
+        let guard = crate::creds::CredsGuard::acquire(path).await?;
+        let mut current = creds;
+        if let Some(fresh) = guard.read() {
+            if !fresh.is_expired() {
+                return Ok((fresh.access_token, fresh.project_id.unwrap_or_default()));
             }
+            current = fresh;
         }
-
-        Ok((state.token.clone(), state.project_id.clone()))
+        let refreshed = gemini_auth::refresh_token(&current, self.variant).await
+            .map_err(|e| eyre::eyre!(
+                "Google OAuth refresh failed -- re-login required ({e})"
+            ))?;
+        guard.write(&refreshed).await?;
+        Ok((refreshed.access_token, refreshed.project_id.unwrap_or_default()))
     }
 }
 
@@ -193,17 +177,16 @@ impl LlmProvider for GeminiProvider {
     }
 
     fn is_authenticated(&self) -> bool {
-        self.state.try_lock().map(|s| !s.token.is_empty()).unwrap_or(false)
+        match self.variant {
+            GeminiVariant::ApiKey => load_api_key().is_some(),
+            _ => gemini_auth::load_creds(self.variant).is_some(),
+        }
     }
 
     fn account_label(&self) -> Option<String> {
         match self.variant {
             GeminiVariant::ApiKey => {
-                if self.state.try_lock().map(|s| !s.token.is_empty()).unwrap_or(false) {
-                    Some("API key".to_string())
-                } else {
-                    None
-                }
+                if load_api_key().is_some() { Some("API key".to_string()) } else { None }
             }
             _ => gemini_auth::load_creds(self.variant).and_then(|c| c.email),
         }
@@ -233,10 +216,9 @@ impl LlmProvider for GeminiProvider {
 
         let auth_url = gemini_auth::build_auth_url(self.variant, &challenge, &login_state);
 
-        let mut state = self.state.lock().await;
-        state.login_verifier = Some(verifier);
-        state.login_state = Some(login_state);
-        drop(state);
+        let mut login = self.login.lock().await;
+        login.verifier = Some(verifier);
+        login.state = Some(login_state);
 
         Ok(Some(AuthMethod::LocalCallback {
             url: auth_url,
@@ -252,15 +234,13 @@ impl LlmProvider for GeminiProvider {
                 return Err(eyre::eyre!("API key cannot be empty"));
             }
             save_api_key(key)?;
-            let mut state = self.state.lock().await;
-            state.token = key.to_string();
             return Ok(());
         }
         let (verifier, login_state) = {
-            let mut state = self.state.lock().await;
-            let v = state.login_verifier.take()
+            let mut login = self.login.lock().await;
+            let v = login.verifier.take()
                 .ok_or_else(|| eyre::eyre!("No login in progress"))?;
-            let s = state.login_state.take()
+            let s = login.state.take()
                 .ok_or_else(|| eyre::eyre!("No login state"))?;
             (v, s)
         };
@@ -275,33 +255,17 @@ impl LlmProvider for GeminiProvider {
         }
 
         let creds = gemini_auth::exchange_code(self.variant, &actual_code, &verifier).await?;
-        let token = creds.access_token.clone();
-        let project_id = creds.project_id.clone().unwrap_or_default();
-        gemini_auth::save_creds(self.variant, &creds)?;
-
-        let mut state = self.state.lock().await;
-        state.token = token;
-        state.project_id = project_id;
-
+        let guard = crate::creds::CredsGuard::acquire(gemini_auth::creds_path(self.variant)?).await?;
+        guard.write(&creds).await?;
         Ok(())
     }
 
     async fn logout(&self) -> eyre::Result<()> {
-        if self.variant == GeminiVariant::ApiKey {
-            if let Ok(path) = api_key_path() {
-                let _ = std::fs::remove_file(&path);
-            }
-            let mut state = self.state.lock().await;
-            // Fall back to env var if present, otherwise clear.
-            state.token = std::env::var("GEMINI_API_KEY").unwrap_or_default();
-            return Ok(());
-        }
-        if let Ok(path) = gemini_auth::creds_path(self.variant) {
-            let _ = std::fs::remove_file(&path);
-        }
-        let mut state = self.state.lock().await;
-        state.token.clear();
-        state.project_id.clear();
+        let path = match self.variant {
+            GeminiVariant::ApiKey => api_key_path()?,
+            _ => gemini_auth::creds_path(self.variant)?,
+        };
+        let _ = std::fs::remove_file(&path);
         Ok(())
     }
 

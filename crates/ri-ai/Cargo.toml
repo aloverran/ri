@@ -26,3 +26,4 @@ async-trait.workspace = true
 async-stream.workspace = true
 dirs.workspace = true
 urlencoding.workspace = true
+fs4.workspace = true

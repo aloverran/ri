@@ -34,6 +34,7 @@ urlencoding = "2"
 async-trait = "0.1"
 command-group = { version = "5", features = ["with-tokio"] }
 async-stream = "0.3"
+fs4 = "0.13"
 ri = { path = "crates/ri" }
 ri-ai = { path = "crates/ri-ai" }
 ri-kit = { path = "crates/ri-kit" }
