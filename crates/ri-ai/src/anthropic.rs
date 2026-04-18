@@ -490,7 +490,10 @@ fn apply_thinking(body: &mut Value, level: ThinkingLevel, mode: ThinkingMode) {
                 ThinkingLevel::XHigh => "max",
                 ThinkingLevel::Off => unreachable!("guarded by caller"),
             };
-            body["thinking"] = json!({ "type": "adaptive" });
+            // `display: "summarized"` opts in to the server-side reasoning
+            // summary. Required for Opus 4.7 thinking to stream at all;
+            // older adaptive models accept it verbatim.
+            body["thinking"] = json!({ "type": "adaptive", "display": "summarized" });
             body["output_config"] = json!({ "effort": effort });
         }
         ThinkingMode::Budget => {
