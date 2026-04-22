@@ -4,7 +4,7 @@ Core types, traits, and storage for ri. This is the foundation crate that all ot
 
 ## Modules
 
-**model** -- The core data model. `Message` and `Context` are the two primitives: a message is an immutable content blob, a context is an immutable object (ordered message list + parent links + metadata, forming a DAG). Also: `MessageId`, `ContextId`, `SessionId` (ID newtypes), `Role`, `ContentBlock`, `Usage`, `gen_id()`.
+**model** -- The core data model. `Message` and `Context` are the two primitives: a message is an immutable content blob, a context is an immutable object (ordered message list + parent links + metadata, forming a DAG). Also: `MessageId`, `ContextId`, `SessionId` (ID newtypes), `Role`, `ContentBlock`, `Usage`. Freshly generated IDs are prefixed by type (`msg_`, `ctx_`) so they're distinguishable at a glance; the prefix is a convention applied at generation time, not a parsed structure.
 
 **store** -- Persistence. `Pool` (in-memory message/context store), `Session` (named pointer to a context), `SessionHeader`, `Store` (pool + JSONL file management: load, write, checkpoint).
 

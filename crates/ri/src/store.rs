@@ -6,8 +6,8 @@
 //!
 //! On disk, each file is an append-only JSONL store with three line types:
 //!
-//! - Message: `{"msg": "2603_a1b2c3d4e5f6", "role": "user", "content": [...]}`
-//! - Context: `{"context": "2603_c1d2e3f4a5b6", "messages": [...], "parents": [...]}`
+//! - Message: `{"msg": "msg_2603_a1b2c3d4e5f6", "role": "user", "content": [...]}`
+//! - Context: `{"context": "ctx_2603_c1d2e3f4a5b6", "messages": [...], "parents": [...]}`
 //! - Session: `{"session": "2026-03-08_120000_fix-login", "head": "...", "name": "...", ...}`
 //!
 //! A single file can contain multiple sessions. The last session line per
@@ -27,7 +27,7 @@ use std::sync::Mutex;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 
-use crate::model::{ContentBlock, Context, ContextId, Message, MessageId, Role, SessionId, gen_obj_id};
+use crate::model::{ContentBlock, Context, ContextId, Message, MessageId, Role, SessionId};
 
 /// The in-memory object pool. Messages, contexts, and sessions live here.
 /// Not directly accessible -- all reads go through `Store` methods which
@@ -286,7 +286,7 @@ impl Store {
         meta: Option<serde_json::Value>,
     ) -> eyre::Result<Message> {
         let file_stem = self.resolve_file(session_id)?;
-        let id = MessageId::new(gen_obj_id());
+        let id = MessageId::generate();
         let msg = Message { id, role, content, meta };
 
         let line = serde_json::to_string(&MessageLine {
@@ -316,7 +316,7 @@ impl Store {
         meta: Option<serde_json::Value>,
     ) -> eyre::Result<Context> {
         let file_stem = self.resolve_file(session_id)?;
-        let id = ContextId::new(gen_obj_id());
+        let id = ContextId::generate();
         let ctx = Context { id, messages, parents, meta };
 
         let line = serde_json::to_string(&ContextLine {
@@ -421,7 +421,7 @@ impl Store {
         };
 
         // Build the root context + session pointer lines.
-        let root_id = ContextId::new(gen_obj_id());
+        let root_id = ContextId::generate();
         let root_line = serde_json::to_string(&ContextLine {
             context: root_id.clone(),
             messages: Vec::new(),

@@ -55,9 +55,23 @@ macro_rules! string_id {
     };
 }
 
-string_id!(MessageId, "Unique identifier for a message in the pool.");
-string_id!(ContextId, "Unique identifier for a context in the history DAG.");
-string_id!(SessionId, "File-stem identifier for a session (e.g. \"2026-02-28_120000_fix-login\").");
+string_id!(MessageId, "Unique identifier for a message in the pool. Generated IDs carry a `msg_` type prefix (e.g. `msg_2604_b31b6d48c79e`); the prefix is purely a generation-time convention, leaving the ID opaque to the rest of the system.");
+string_id!(ContextId, "Unique identifier for a context in the history DAG. Generated IDs carry a `ctx_` type prefix (e.g. `ctx_2604_ef8acc68fb72`); the prefix is purely a generation-time convention, leaving the ID opaque to the rest of the system.");
+string_id!(SessionId, "File-stem identifier for a session. Human-slugged with a timestamp (e.g. `2026-02-28_120000_fix-login`); also used as the JSONL file name.");
+
+impl MessageId {
+    /// Mint a fresh message ID with the `msg_` type prefix.
+    pub fn generate() -> Self {
+        Self::new(format!("msg_{}", gen_obj_body()))
+    }
+}
+
+impl ContextId {
+    /// Mint a fresh context ID with the `ctx_` type prefix.
+    pub fn generate() -> Self {
+        Self::new(format!("ctx_{}", gen_obj_body()))
+    }
+}
 
 /// Immutable content blob. The atomic unit of the system.
 ///
@@ -419,18 +433,12 @@ pub struct Usage {
     pub extras: Option<serde_json::Value>,
 }
 
-/// Generate a globally unique ID (UUID v4, hex, no dashes).
-pub fn gen_id() -> String {
-    Uuid::new_v4().simple().to_string()
-}
-
-/// Generate a compact, human-readable object ID: `{YYMM}_{12 hex}`.
+/// Build the body shared by all type-prefixed object IDs: `{YYMM}_{12 hex}`.
 ///
 /// The two-digit year + month prefix gives temporal context at a glance.
 /// Twelve hex characters (48 bits of randomness) are collision-safe to
-/// well beyond 200k objects. No file scanning needed -- globally unique
-/// by construction.
-pub fn gen_obj_id() -> String {
+/// well beyond 200k objects per month.
+fn gen_obj_body() -> String {
     let now = chrono::Utc::now();
     let hex = &Uuid::new_v4().simple().to_string()[..12];
     format!("{}_{}", now.format("%y%m"), hex)

@@ -192,7 +192,7 @@ ri/                          # Workspace root
 
 The foundation crate. Everything the rest of the system depends on:
 
-- `model` -- `Message`, `Context` (the core data model), `Role`, `ContentBlock`, `Usage`, `MessageId`, `ContextId`, `SessionId`, `gen_id()`
+- `model` -- `Message`, `Context` (the core data model), `Role`, `ContentBlock`, `Usage`, `MessageId`, `ContextId`, `SessionId`
 - `store` -- `Pool`, `Store`, `Session`, `SessionHeader` (persistence and filing)
 - `stream` -- `StreamEvent` (normalized incremental events from any provider)
 - `accumulator` -- `StreamAccumulator` (pure state machine: `StreamEvent` -> `ContentBlock` + `Usage`)

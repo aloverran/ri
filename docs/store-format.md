@@ -45,7 +45,7 @@ Each message is a content blob. Uses `msg` as the ID key (not `id`) to distingui
 | `meta` | `object` | no | Application-defined metadata |
 
 ```json
-{"msg":"fx_m1","role":"user","content":[{"type":"text","text":"Fix the login crash."}]}
+{"msg":"msg_2602_4a1b3c5d7e9f","role":"user","content":[{"type":"text","text":"Fix the login crash."}]}
 ```
 
 ### 3. Context lines
@@ -60,7 +60,7 @@ A context is an immutable object with an ordered message list and its position i
 | `meta` | `object` | no | Model info, usage, timestamps, etc. |
 
 ```json
-{"context":"fx_c2","messages":["fx_m1","fx_m2","fx_m3"],"parents":["fx_c1"],"meta":{"model":"claude-sonnet-4-20250514","ts":"2026-02-09T08:00:15Z","usage":{"input_tokens":534,"output_tokens":156}}}
+{"context":"ctx_2602_2b4d6f8a0c1e","messages":["msg_2602_4a1b3c5d7e9f","msg_2602_5b2c4d6e8fa0","msg_2602_6c3d5e7fa0b1"],"parents":["ctx_2602_1a3b5c7d9e0f"],"meta":{"model":"claude-sonnet-4-20250514","ts":"2026-02-09T08:00:15Z","usage":{"input_tokens":534,"output_tokens":156}}}
 ```
 
 **Backward compatibility**: older files use `{"step": ..., "context": [...]}` instead of `{"context": ..., "messages": [...]}`. The loader accepts both formats.
@@ -74,7 +74,7 @@ A head line moves the session's pointer to a new context. The last `{"head": ...
 | `head` | `string` | Context ID this session now points to |
 
 ```json
-{"head":"fx_c2"}
+{"head":"ctx_2602_2b4d6f8a0c1e"}
 ```
 
 ### 5. Title updates
@@ -121,11 +121,14 @@ Step metadata mirrors this when meaningful (model, usage, timestamps).
 
 ## Message IDs
 
-IDs must be globally unique across all files. The implementation generates them from a session prefix plus a sequential counter:
+Messages and contexts live in a global pool. IDs must be globally unique so any context can reference any message across sessions. Generated IDs carry a type prefix so they're distinguishable at a glance:
 
-- `fx_abc123_1`, `fx_abc123_2` -- prefixed with session slug + random suffix
+- `msg_<YYMM>_<12 hex>` -- e.g. `msg_2604_b31b6d48c79e`
+- `ctx_<YYMM>_<12 hex>` -- e.g. `ctx_2604_ef8acc68fb72`
 
-The prefix is derived from the session name (first 6 alphanumeric chars) plus 6 random hex chars, making IDs human-readable while staying unique. The system never parses ID structure -- they are opaque strings.
+The `YYMM` block is a two-digit year + month stamp for at-a-glance temporal context; the 12 hex characters (48 bits of randomness) are collision-safe well past 200k objects per month. Session IDs remain `YYYY-MM-DD_HHMMSS_<slug>` -- they're more like git branch names and double as filenames.
+
+The prefix is a convention applied at generation time. IDs are opaque strings everywhere else, so older unprefixed IDs (pre-prefix sessions) resolve normally alongside new ones.
 
 ## Complete example
 
@@ -133,23 +136,23 @@ A coding agent session: user asks to fix a bug, agent reads a file, makes an edi
 
 ```jsonl
 {"session":"fix-login-crash","ts":"2026-02-09T08:00:00Z","cwd":"/Users/john/Projects/myapp"}
-{"context":"fx_c1","messages":[],"parents":[],"meta":null}
-{"head":"fx_c1"}
-{"msg":"fx_m1","role":"system","content":[{"type":"text","text":"You are ri, a coding agent."}]}
-{"context":"fx_c2","messages":["fx_m1"],"parents":["fx_c1"]}
-{"head":"fx_c2"}
-{"msg":"fx_m2","role":"user","content":[{"type":"text","text":"There's a crash in the login handler. Fix it."}]}
-{"msg":"fx_m3","role":"assistant","content":[{"type":"text","text":"I'll look at the login handler."},{"type":"tool_use","id":"tc_1","name":"read","input":{"path":"src/handlers/login.rs"}}],"meta":{"model":"claude-sonnet-4-20250514","ts":"2026-02-09T08:00:05Z","usage":{"input_tokens":245,"output_tokens":89}}}
-{"msg":"fx_m4","role":"user","content":[{"type":"tool_result","toolUseId":"tc_1","content":[{"type":"text","text":"pub fn handle_login(req: Request) -> Response { ... }"}],"is_error":false}]}
-{"msg":"fx_m5","role":"assistant","content":[{"type":"text","text":"Fixed. The crash was caused by an unhandled None from db.find_user."}],"meta":{"model":"claude-sonnet-4-20250514","ts":"2026-02-09T08:00:15Z","usage":{"input_tokens":534,"output_tokens":67}}}
-{"context":"fx_c3","messages":["fx_m1","fx_m2","fx_m3","fx_m4","fx_m5"],"parents":["fx_c2"],"meta":{"model":"claude-sonnet-4-20250514","ts":"2026-02-09T08:00:15Z"}}
-{"head":"fx_c3"}
+{"context":"ctx_2602_1a3b5c7d9e0f","messages":[],"parents":[],"meta":null}
+{"head":"ctx_2602_1a3b5c7d9e0f"}
+{"msg":"msg_2602_4a1b3c5d7e9f","role":"system","content":[{"type":"text","text":"You are ri, a coding agent."}]}
+{"context":"ctx_2602_2b4d6f8a0c1e","messages":["msg_2602_4a1b3c5d7e9f"],"parents":["ctx_2602_1a3b5c7d9e0f"]}
+{"head":"ctx_2602_2b4d6f8a0c1e"}
+{"msg":"msg_2602_5b2c4d6e8fa0","role":"user","content":[{"type":"text","text":"There's a crash in the login handler. Fix it."}]}
+{"msg":"msg_2602_6c3d5e7fa0b1","role":"assistant","content":[{"type":"text","text":"I'll look at the login handler."},{"type":"tool_use","id":"tc_1","name":"read","input":{"path":"src/handlers/login.rs"}}],"meta":{"model":"claude-sonnet-4-20250514","ts":"2026-02-09T08:00:05Z","usage":{"input_tokens":245,"output_tokens":89}}}
+{"msg":"msg_2602_7d4e6f80b1c2","role":"user","content":[{"type":"tool_result","toolUseId":"tc_1","content":[{"type":"text","text":"pub fn handle_login(req: Request) -> Response { ... }"}],"is_error":false}]}
+{"msg":"msg_2602_8e5f70a1c2d3","role":"assistant","content":[{"type":"text","text":"Fixed. The crash was caused by an unhandled None from db.find_user."}],"meta":{"model":"claude-sonnet-4-20250514","ts":"2026-02-09T08:00:15Z","usage":{"input_tokens":534,"output_tokens":67}}}
+{"context":"ctx_2602_3c5e7f9b1d2f","messages":["msg_2602_4a1b3c5d7e9f","msg_2602_5b2c4d6e8fa0","msg_2602_6c3d5e7fa0b1","msg_2602_7d4e6f80b1c2","msg_2602_8e5f70a1c2d3"],"parents":["ctx_2602_2b4d6f8a0c1e"],"meta":{"model":"claude-sonnet-4-20250514","ts":"2026-02-09T08:00:15Z"}}
+{"head":"ctx_2602_3c5e7f9b1d2f"}
 {"title":"Fix login null pointer crash"}
 ```
 
 ### Reading this file
 
-The session's current state is always the last `{"head": ...}` line: `fx_c3`. Look up context `fx_c3`, which has messages `["fx_m1", "fx_m2", "fx_m3", "fx_m4", "fx_m5"]`. That's the full conversation. No chain-walking needed.
+The session's current state is always the last `{"head": ...}` line: `ctx_2602_3c5e7f9b1d2f`. Look up context `ctx_2602_3c5e7f9b1d2f`, which has messages `["msg_2602_4a1b3c5d7e9f", "msg_2602_5b2c4d6e8fa0", "msg_2602_6c3d5e7fa0b1", "msg_2602_7d4e6f80b1c2", "msg_2602_8e5f70a1c2d3"]`. That's the full conversation. No chain-walking needed.
 
 ### Scrutability
 
@@ -268,7 +271,7 @@ The tradeoff: cross-session references require loading multiple files. The globa
 
 ### Why globally unique IDs
 
-File-local IDs prevent cross-file references. Since the pool enables composition across sessions, IDs must be globally unique. The prefixed format (`fx_abc123_1`) keeps them human-readable while staying unique.
+File-local IDs prevent cross-file references. Since the pool enables composition across sessions, IDs must be globally unique. The type-prefixed format (`msg_2604_b31b6d48c79e`, `ctx_2604_ef8acc68fb72`) keeps them distinguishable at a glance while staying unique.
 
 ### Why append-only files
 
