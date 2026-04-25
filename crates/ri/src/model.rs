@@ -1,28 +1,35 @@
-//! Core data model: messages and contexts.
+//! Core data model: the three primitive atoms.
 //!
-//! Two primitives:
+//! ri-core is a database. Its primitives are pure in-memory atoms with no
+//! knowledge of storage:
 //!
-//! - **Message**: an immutable content blob (role + content blocks). The atom.
-//! - **Context**: an immutable object -- an ordered list of message
-//!   references, parent links, and metadata. Contexts form a DAG
-//!   through their parents. A session is just a pointer to one.
+//! - **Message**: an immutable content blob (role + content blocks).
+//! - **Context**: an immutable ordered list of message references plus
+//!   parent links. Contexts form a DAG through their parents.
+//! - **Ref**: a mutable named pointer to a context. The branch analog.
 //!
-//! The LLM API is `f(context.messages) -> Message`. Everything else
-//! is algebra on contexts: creating them, composing them, pointing
-//! at them.
+//! All three share the same shape: `{id, structural essentials, meta}`.
+//! `meta` is an open JSON payload accessed through the `Facet` trait --
+//! applications attach their own typed schemas without negotiating with
+//! core.
+//!
+//! The LLM API is `f(context.messages) -> Message`. Everything else is
+//! algebra on contexts: creating them, composing them, pointing refs at
+//! them.
 
 use std::borrow::Borrow;
 use std::collections::HashSet;
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
+use serde::de::DeserializeOwned;
 use uuid::Uuid;
 
-// String newtypes for message, context, and session identifiers.
+// String newtypes for message, context, and ref identifiers.
 // Separate types so the compiler catches mix-ups.
 
 macro_rules! string_id {
-    ($name:ident, $doc:expr) => {
+    ($name:ident, $prefix:expr, $doc:expr) => {
         #[doc = $doc]
         #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
         #[serde(transparent)]
@@ -31,6 +38,9 @@ macro_rules! string_id {
         impl $name {
             pub fn new(s: impl Into<String>) -> Self { Self(s.into()) }
             pub fn as_str(&self) -> &str { &self.0 }
+
+            /// Mint a fresh id with this primitive's type prefix.
+            pub fn generate() -> Self { Self(format!("{}_{}", $prefix, gen_obj_body())) }
         }
 
         impl fmt::Display for $name {
@@ -52,26 +62,16 @@ macro_rules! string_id {
         impl From<&str> for $name {
             fn from(s: &str) -> Self { Self(s.to_string()) }
         }
+
+        impl From<&String> for $name {
+            fn from(s: &String) -> Self { Self(s.clone()) }
+        }
     };
 }
 
-string_id!(MessageId, "Unique identifier for a message in the pool. Generated IDs carry a `msg_` type prefix (e.g. `msg_2604_b31b6d48c79e`); the prefix is purely a generation-time convention, leaving the ID opaque to the rest of the system.");
-string_id!(ContextId, "Unique identifier for a context in the history DAG. Generated IDs carry a `ctx_` type prefix (e.g. `ctx_2604_ef8acc68fb72`); the prefix is purely a generation-time convention, leaving the ID opaque to the rest of the system.");
-string_id!(SessionId, "File-stem identifier for a session. Human-slugged with a timestamp (e.g. `2026-02-28_120000_fix-login`); also used as the JSONL file name.");
-
-impl MessageId {
-    /// Mint a fresh message ID with the `msg_` type prefix.
-    pub fn generate() -> Self {
-        Self::new(format!("msg_{}", gen_obj_body()))
-    }
-}
-
-impl ContextId {
-    /// Mint a fresh context ID with the `ctx_` type prefix.
-    pub fn generate() -> Self {
-        Self::new(format!("ctx_{}", gen_obj_body()))
-    }
-}
+string_id!(MessageId, "msg", "Unique identifier for a message in the pool. Generated IDs carry a `msg_` type prefix (e.g. `msg_2604_b31b6d48c79e`); the prefix is generation-time convention, leaving the ID opaque to the rest of the system.");
+string_id!(ContextId, "ctx", "Unique identifier for a context in the history DAG. Generated IDs carry a `ctx_` type prefix (e.g. `ctx_2604_ef8acc68fb72`); the prefix is generation-time convention, leaving the ID opaque to the rest of the system.");
+string_id!(RefId, "ref", "Unique identifier for a ref (named pointer to a context). Generated IDs carry a `ref_` type prefix (e.g. `ref_2604_ef8acc68fb72`). Legacy session files load with their original slug as the RefId; the prefix is generation-time convention, not a parse target.");
 
 /// Immutable content blob. The atomic unit of the system.
 ///
@@ -88,6 +88,11 @@ pub struct Message {
 }
 
 impl Message {
+    /// Build a new message with a freshly minted id.
+    pub fn new(role: Role, content: Vec<ContentBlock>, meta: Option<serde_json::Value>) -> Self {
+        Self { id: MessageId::generate(), role, content, meta }
+    }
+
     /// Short human-readable summary for git-log style session views.
     pub fn summarize(&self) -> String {
         let role_tag = match self.role {
@@ -413,6 +418,122 @@ pub struct Context {
     pub parents: Vec<ContextId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub meta: Option<serde_json::Value>,
+}
+
+impl Context {
+    /// Build a new context with a freshly minted id.
+    pub fn new(
+        messages: Vec<MessageId>,
+        parents: Vec<ContextId>,
+        meta: Option<serde_json::Value>,
+    ) -> Self {
+        Self { id: ContextId::generate(), messages, parents, meta }
+    }
+}
+
+/// A named mutable pointer to a context. Refs are the branch analog:
+/// where a message/context is immutable content, a ref is a moving
+/// target you point at whatever context is "current". The application
+/// decides what "current" means.
+///
+/// Refs are the minimum viable pointer. Everything else -- display name,
+/// creation timestamp, cwd, parent ref, host -- lives in `meta` via
+/// facets. This keeps the primitive neutral: chat, memory banks, and
+/// whatever comes next all attach their own typed payloads without
+/// touching core.
+///
+/// On disk, every write appends a full snapshot line. Last line per
+/// RefId wins on load.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Ref {
+    pub id: RefId,
+    pub head: ContextId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub meta: Option<serde_json::Value>,
+}
+
+impl Ref {
+    /// Build a new ref with a freshly minted id.
+    pub fn new(head: ContextId, meta: Option<serde_json::Value>) -> Self {
+        Self { id: RefId::generate(), head, meta }
+    }
+
+    /// Swap the head pointer, keeping id and meta unchanged. Useful in
+    /// read-modify-write update flows: `store.get_ref(&id)?.with_head(ctx)`.
+    pub fn with_head(mut self, head: ContextId) -> Self {
+        self.head = head;
+        self
+    }
+
+    /// Attach or replace a facet payload.
+    pub fn with_facet<F: Facet>(mut self, f: &F) -> Result<Self, serde_json::Error> {
+        self.set_facet(f)?;
+        Ok(self)
+    }
+}
+
+/// Typed access layer over `meta`. A facet is a strongly-typed payload
+/// an application attaches under its own key -- ri-core never knows or
+/// cares what's in there.
+///
+/// Keys form private namespaces owned by the defining crate. Two
+/// applications can attach independent facets to the same atom without
+/// negotiating with each other.
+pub trait Facet: Serialize + DeserializeOwned + Sized {
+    /// Key under `meta` where this facet's data lives.
+    const KEY: &'static str;
+}
+
+/// Atoms that carry an optional `meta` payload. Messages, contexts, and
+/// refs all qualify; typed facet access is via `facet::<F>()` / `set_facet`.
+///
+/// The `meta` shape on disk is an open JSON object. Facet extraction
+/// returns `Option<Result<F, _>>`: outer `None` means the facet key
+/// isn't present; `Some(Err)` means the key is present but can't be
+/// parsed as `F` (a canary worth surfacing rather than swallowing).
+pub trait HasMeta {
+    fn meta(&self) -> Option<&serde_json::Value>;
+    fn meta_mut(&mut self) -> &mut Option<serde_json::Value>;
+
+    /// Pull a facet out of meta. Returns `None` if the key isn't
+    /// present; `Some(Err)` if the key is present but malformed.
+    fn facet<F: Facet>(&self) -> Option<Result<F, serde_json::Error>> {
+        let v = self.meta()?.get(F::KEY)?;
+        Some(serde_json::from_value(v.clone()))
+    }
+
+    /// Store a facet under its key, replacing any previous value at
+    /// that key. Other keys are preserved.
+    fn set_facet<F: Facet>(&mut self, f: &F) -> Result<(), serde_json::Error> {
+        let value = serde_json::to_value(f)?;
+        let meta = self.meta_mut();
+        match meta {
+            Some(serde_json::Value::Object(map)) => {
+                map.insert(F::KEY.to_string(), value);
+            }
+            _ => {
+                let mut map = serde_json::Map::new();
+                map.insert(F::KEY.to_string(), value);
+                *meta = Some(serde_json::Value::Object(map));
+            }
+        }
+        Ok(())
+    }
+}
+
+impl HasMeta for Message {
+    fn meta(&self) -> Option<&serde_json::Value> { self.meta.as_ref() }
+    fn meta_mut(&mut self) -> &mut Option<serde_json::Value> { &mut self.meta }
+}
+
+impl HasMeta for Context {
+    fn meta(&self) -> Option<&serde_json::Value> { self.meta.as_ref() }
+    fn meta_mut(&mut self) -> &mut Option<serde_json::Value> { &mut self.meta }
+}
+
+impl HasMeta for Ref {
+    fn meta(&self) -> Option<&serde_json::Value> { self.meta.as_ref() }
+    fn meta_mut(&mut self) -> &mut Option<serde_json::Value> { &mut self.meta }
 }
 
 // -- Supporting types --

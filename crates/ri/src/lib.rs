@@ -7,8 +7,8 @@ pub mod tool;
 
 // Top-level re-exports for convenience.
 pub use model::{
-    complete_tool_pairs, ContentBlock, Context, ContextId, Message, MessageId, Role,
-    SessionId, ThinkingReplay, Usage,
+    complete_tool_pairs, ContentBlock, Context, ContextId, Facet, HasMeta, Message, MessageId,
+    Ref, RefId, Role, ThinkingReplay, Usage,
 };
 pub use stream::StreamEvent;
 pub use provider::{
@@ -17,4 +17,4 @@ pub use provider::{
 };
 pub use tool::{Tool, ToolOutput, ToolSchema};
 pub use accumulator::StreamAccumulator;
-pub use store::{Session, Store};
+pub use store::{default_sessions_dir, MountId, Pool, Store};

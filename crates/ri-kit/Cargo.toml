@@ -16,3 +16,4 @@ command-group.workspace = true
 tracing.workspace = true
 chrono.workspace = true
 os_info.workspace = true
+eyre.workspace = true

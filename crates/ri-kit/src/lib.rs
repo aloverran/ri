@@ -1,5 +1,6 @@
 // Building blocks for ri agent applications.
 
+pub mod chat;
 pub mod prompts;
 pub mod resources;
 

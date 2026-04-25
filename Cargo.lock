@@ -1400,6 +1400,7 @@ dependencies = [
  "async-trait",
  "chrono",
  "command-group",
+ "eyre",
  "os_info",
  "ri",
  "serde",
