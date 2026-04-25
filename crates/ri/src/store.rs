@@ -3,17 +3,23 @@
 //!
 //! `Pool` is the in-memory DAG -- a unified view of every message,
 //! context, and ref currently loaded, backed by one or more filesystem
-//! directories. Reads are always global across the pool.
+//! directories. Reads are always global across the pool: messages,
+//! contexts, and refs are all global atoms with no notion of "which
+//! mount they belong to".
 //!
-//! `Store` is a mount-scoped write handle. Every write a store performs
-//! goes to its mount's `store.jsonl`; reads delegate to the pool, so
-//! they remain global. Subsystems (chat, bank) receive a `Store` bound
-//! to their own mount and never see a mount id or file path.
+//! `Store` is a write handle bound to one mount. Every write a store
+//! performs goes to its mount's `store.jsonl`; reads delegate to the
+//! pool, so they remain global. A subsystem (chat, bank, ...) receives
+//! a `Store` and treats it as an opaque DB handle.
 //!
 //! On disk, each mount owns one directory. New writes always go to
 //! `<mount>/store.jsonl`. Legacy per-session `<slug>.jsonl` files load
-//! correctly and are superseded in place by later writes (last-line-wins
-//! on RefId); their pre-existing lines stay physically intact forever.
+//! correctly and are superseded in place by later writes.
+//!
+//! Refs are mutable: every write appends a full snapshot line carrying
+//! a wall-clock `ts`. The loader keeps the highest-ts line per RefId,
+//! independent of file load order or mount layout. Cross-process,
+//! cross-mount, and post-rename writes all converge deterministically.
 //!
 //! ```text
 //! pool = Pool::new();
@@ -30,6 +36,7 @@
 //! sessions.write_ref(&r)?;
 //!
 //! pool.get_message(&msg.id);                 // resolves globally
+//! pool.refs();                               // every ref, every mount
 //! ```
 
 use std::collections::HashMap;
@@ -38,6 +45,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+use chrono::{DateTime, TimeZone, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
@@ -50,11 +58,11 @@ use crate::model::{
 /// In-memory DAG of every atom currently loaded. Cheap to clone (internal
 /// `Arc`); clones are handles, not copies.
 ///
-/// The pool owns all three primitive maps (messages, contexts, refs) and
-/// the set of mounts backing them. Messages and contexts are mount-
-/// agnostic: they live in the pool and resolve globally regardless of
-/// which mount physically holds them. Refs carry a current-mount tag so
-/// `store.refs()` can filter.
+/// All three atoms (messages, contexts, refs) live globally in the pool
+/// and resolve regardless of which mount physically holds them. The pool
+/// also tracks the wall-clock timestamp of each ref's most recently
+/// loaded line so cross-mount and cross-process writes converge to the
+/// freshest snapshot.
 #[derive(Clone)]
 pub struct Pool {
     inner: Arc<Mutex<PoolInner>>,
@@ -64,14 +72,18 @@ struct PoolInner {
     messages: HashMap<MessageId, Message>,
     contexts: HashMap<ContextId, Context>,
     refs: HashMap<RefId, Ref>,
-    /// The mount each ref is currently homed in. Updated on every write.
-    ref_mount: HashMap<RefId, MountId>,
+    /// Wall-clock ts of the line that produced each ref's current state.
+    /// Used to discard older snapshots when the same RefId appears in
+    /// multiple files or mounts.
+    ref_ts: HashMap<RefId, DateTime<Utc>>,
     /// Mount directory plus per-mount write lock.
     mounts: HashMap<MountId, Mount>,
     next_mount: u64,
 }
 
-/// Opaque per-mount handle. Refs carry this to identify where they live.
+/// Opaque per-mount handle. Stores carry one to identify their write
+/// target; nothing in the user-facing API needs to construct or compare
+/// these.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct MountId(u64);
 
@@ -90,7 +102,7 @@ impl Pool {
                 messages: HashMap::new(),
                 contexts: HashMap::new(),
                 refs: HashMap::new(),
-                ref_mount: HashMap::new(),
+                ref_ts: HashMap::new(),
                 mounts: HashMap::new(),
                 next_mount: 0,
             })),
@@ -101,10 +113,9 @@ impl Pool {
     /// the path into the shared DAG and returns a write-scoped `Store`
     /// bound to the new mount.
     ///
-    /// Load order is explicit: legacy `*.jsonl` files load first (sorted
-    /// lex for determinism), then `store.jsonl` last. Last-line-wins
-    /// across the mount means subsequent writes to `store.jsonl` always
-    /// supersede legacy lines without touching them on disk.
+    /// File load order doesn't matter for correctness: every ref line
+    /// carries a `ts` and the loader keeps the newest. The legacy-first
+    /// pass is purely so the info-line counts read sensibly.
     ///
     /// Mounting the same canonicalized directory twice is rejected:
     /// it would create two write-locks against one file, silently breaking
@@ -161,7 +172,9 @@ impl Pool {
         inner.contexts.get(&r.head).cloned()
     }
 
-    /// All refs across every mount.
+    /// All refs currently loaded, across every mount. Apps filter this
+    /// by facet (`r.facet::<ChatFacet>()`, `r.facet::<BankFacet>()`,
+    /// ...) to get the subset they care about.
     pub fn refs(&self) -> Vec<Ref> {
         self.inner.lock().unwrap().refs.values().cloned().collect()
     }
@@ -245,36 +258,26 @@ impl Store {
     }
 
     /// Write a ref. Refs are mutable: writing the same id again appends
-    /// a new full-snapshot line and becomes the current state on next
-    /// load. In-memory state updates immediately. The ref's owning
-    /// mount becomes this store's mount.
+    /// a new full-snapshot line stamped with the current wall clock and
+    /// supersedes any earlier snapshot on the next load. In-memory state
+    /// updates immediately.
     pub fn write_ref(&self, r: &Ref) -> eyre::Result<()> {
+        let ts = Utc::now();
         let line = serde_json::to_string(&RefLine {
             r#ref: r.id.clone(),
             head: r.head.clone(),
+            ts,
             meta: r.meta.clone(),
         })?;
         self.append_line(&line)?;
         let mut inner = self.pool.inner.lock().unwrap();
         inner.refs.insert(r.id.clone(), r.clone());
-        inner.ref_mount.insert(r.id.clone(), self.mount);
+        inner.ref_ts.insert(r.id.clone(), ts);
         tracing::debug!("Wrote ref [{}] -> [{}] to mount {:?}", r.id, r.head, self.mount);
         Ok(())
     }
 
     pub fn pool(&self) -> &Pool { &self.pool }
-
-    /// Refs currently living in this mount. "Living in" is defined by
-    /// the ref's most recent write; a legacy ref whose latest line still
-    /// sits in an old `<slug>.jsonl` counts as living in the mount it
-    /// was loaded from.
-    pub fn refs(&self) -> Vec<Ref> {
-        let inner = self.pool.inner.lock().unwrap();
-        inner.refs.values()
-            .filter(|r| inner.ref_mount.get(&r.id).copied() == Some(self.mount))
-            .cloned()
-            .collect()
-    }
 
     pub fn get_message(&self, id: &MessageId) -> Option<Message> { self.pool.get_message(id) }
     pub fn get_context(&self, id: &ContextId) -> Option<Context> { self.pool.get_context(id) }
@@ -392,15 +395,17 @@ impl Store {
         // have both "ref" + "head" keys.
         if obj.get("ref").is_some() && obj.get("head").is_some() {
             let rl: RefLine = serde_json::from_value(obj)?;
-            let id = rl.r#ref.clone();
-            inner.refs.insert(id.clone(), Ref { id: id.clone(), head: rl.head, meta: rl.meta });
-            inner.ref_mount.insert(id, self.mount);
+            install_ref(
+                &mut inner,
+                Ref { id: rl.r#ref.clone(), head: rl.head, meta: rl.meta },
+                rl.ts,
+            );
         } else if obj.get("session").is_some() && obj.get("head").is_some() {
             let sl: LegacySessionLine = serde_json::from_value(obj)?;
             let id = RefId::new(sl.session.clone());
+            let ts = parse_legacy_ts(sl.ts.as_deref());
             let meta = Some(synth_chat_meta(&sl));
-            inner.refs.insert(id.clone(), Ref { id: id.clone(), head: sl.head, meta });
-            inner.ref_mount.insert(id, self.mount);
+            install_ref(&mut inner, Ref { id, head: sl.head, meta }, ts);
         } else if obj.get("msg").is_some() {
             let ml: MessageLine = serde_json::from_value(obj)?;
             inner.messages.insert(ml.msg.clone(), Message {
@@ -416,6 +421,38 @@ impl Store {
         }
         Ok(())
     }
+}
+
+/// Install a ref snapshot iff its `ts` is at least as new as anything
+/// we've already loaded for the same id. Equal-ts ties go to the
+/// later-arriving line so a same-second double-write still converges
+/// without a coin flip in the parser.
+fn install_ref(inner: &mut PoolInner, r: Ref, ts: DateTime<Utc>) {
+    if let Some(existing_ts) = inner.ref_ts.get(&r.id) {
+        if ts < *existing_ts {
+            return;
+        }
+    }
+    inner.ref_ts.insert(r.id.clone(), ts);
+    inner.refs.insert(r.id.clone(), r);
+}
+
+/// Parse a legacy session line's `ts` field into a `DateTime<Utc>`.
+/// Two formats appear in the wild: the chat facet's
+/// `%Y-%m-%d %H:%M:%S UTC` and the older RFC3339 form. Anything
+/// unparseable falls back to `MIN_UTC` so a current write always
+/// supersedes a legacy line lacking provenance.
+fn parse_legacy_ts(s: Option<&str>) -> DateTime<Utc> {
+    let Some(s) = s.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Utc.timestamp_opt(0, 0).single().unwrap_or_else(Utc::now);
+    };
+    if let Ok(dt) = DateTime::parse_from_rfc3339(s) {
+        return dt.with_timezone(&Utc);
+    }
+    if let Ok(naive) = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S UTC") {
+        return Utc.from_utc_datetime(&naive);
+    }
+    Utc.timestamp_opt(0, 0).single().unwrap_or_else(Utc::now)
 }
 
 // -- On-disk line formats -----------------------------------------------
@@ -445,6 +482,9 @@ struct ContextLine {
 struct RefLine {
     r#ref: RefId,
     head: ContextId,
+    /// Wall-clock of when this snapshot was written. Used at load time
+    /// to merge multiple snapshots for the same RefId by recency.
+    ts: DateTime<Utc>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     meta: Option<serde_json::Value>,
 }
@@ -490,4 +530,93 @@ pub fn default_sessions_dir() -> eyre::Result<PathBuf> {
     let home = dirs::home_dir()
         .ok_or_else(|| eyre::eyre!("Could not determine home directory"))?;
     Ok(home.join(".ri").join("sessions"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tmp_dir(tag: &str) -> PathBuf {
+        let unique = uuid::Uuid::new_v4().simple().to_string();
+        let dir = std::env::temp_dir().join(format!("ri-store-{}-{}", tag, unique));
+        std::fs::create_dir_all(&dir).expect("create tmp dir");
+        dir
+    }
+
+    /// Two stores, each with a snapshot of the same RefId. The newer
+    /// snapshot wins after both have been loaded -- regardless of which
+    /// directory got mounted second.
+    #[test]
+    fn ref_supersession_picks_newest_ts_across_mounts() {
+        let dir_a = tmp_dir("a");
+        let dir_b = tmp_dir("b");
+
+        let ctx_old = ContextId::new("ctx_old");
+        let ctx_new = ContextId::new("ctx_new");
+        let ref_id = RefId::new("ref_under_test");
+
+        // Pre-seed each directory with a single ref line. dir_a's line
+        // is older; dir_b's line is newer.
+        let line_old = serde_json::to_string(&RefLine {
+            r#ref: ref_id.clone(),
+            head: ctx_old.clone(),
+            ts: Utc.with_ymd_and_hms(2025, 1, 1, 0, 0, 0).unwrap(),
+            meta: None,
+        }).unwrap();
+        let line_new = serde_json::to_string(&RefLine {
+            r#ref: ref_id.clone(),
+            head: ctx_new.clone(),
+            ts: Utc.with_ymd_and_hms(2026, 4, 1, 0, 0, 0).unwrap(),
+            meta: None,
+        }).unwrap();
+        std::fs::write(dir_a.join(STORE_FILE), format!("{}\n", line_old)).unwrap();
+        std::fs::write(dir_b.join(STORE_FILE), format!("{}\n", line_new)).unwrap();
+
+        // Mount A first, then B. Newer line wins.
+        let pool = Pool::new();
+        let _a = pool.mount(&dir_a).unwrap();
+        let _b = pool.mount(&dir_b).unwrap();
+        assert_eq!(pool.get_ref(&ref_id).unwrap().head, ctx_new);
+
+        // Mount B first, then A. Same outcome -- order is irrelevant.
+        let pool2 = Pool::new();
+        let _b2 = pool2.mount(&dir_b).unwrap();
+        let _a2 = pool2.mount(&dir_a).unwrap();
+        assert_eq!(pool2.get_ref(&ref_id).unwrap().head, ctx_new);
+    }
+
+    /// Legacy `session` lines without a `ts` still order against fresh
+    /// `ref` lines: a freshly-written ref always supersedes a legacy
+    /// snapshot, because the loader assigns legacy lines the epoch
+    /// fallback when `ts` is absent.
+    #[test]
+    fn fresh_ref_supersedes_legacy_session_line() {
+        let dir = tmp_dir("legacy");
+
+        let ctx_legacy = ContextId::new("ctx_legacy");
+        let ctx_fresh = ContextId::new("ctx_fresh");
+        let ref_id = RefId::new("ref_legacy_id");
+
+        let legacy_line = json!({
+            "session": ref_id.as_str(),
+            "head": ctx_legacy.as_str(),
+            "name": "old chat",
+        }).to_string();
+        std::fs::write(dir.join("legacy.jsonl"), format!("{}\n", legacy_line)).unwrap();
+
+        let pool = Pool::new();
+        let store = pool.mount(&dir).unwrap();
+        assert_eq!(pool.get_ref(&ref_id).unwrap().head, ctx_legacy);
+
+        let fresh = Ref { id: ref_id.clone(), head: ctx_fresh.clone(), meta: None };
+        store.write_ref(&fresh).unwrap();
+
+        // Drop the pool, remount fresh: store.jsonl + legacy.jsonl, the
+        // fresh write wins regardless of file iteration order.
+        drop(store);
+        drop(pool);
+        let pool2 = Pool::new();
+        let _store2 = pool2.mount(&dir).unwrap();
+        assert_eq!(pool2.get_ref(&ref_id).unwrap().head, ctx_fresh);
+    }
 }

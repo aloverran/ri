@@ -7,7 +7,7 @@
 //! `meta.chat`; legacy Session lines from older data are translated into
 //! the same shape on load so callers never need a compatibility branch.
 
-use ri::{Context, ContextId, Facet, HasMeta, Message, Ref, RefId, Store};
+use ri::{Context, ContextId, Facet, HasMeta, Message, Pool, Ref, RefId, Store};
 use serde::{Deserialize, Serialize};
 
 /// Application-level state for a chat session. The title drives the
@@ -118,6 +118,23 @@ pub fn read_facet(r: &Ref) -> Option<ChatFacet> {
         }
         None => None,
     }
+}
+
+/// Every ref in the pool that carries a `ChatFacet`, paired with the
+/// parsed facet for downstream sorting/filtering. The chat-app filter
+/// equivalent of "what's the session list" -- since refs are a global
+/// atom, this is a pool-level query, not a per-mount one.
+///
+/// Refs whose meta has the `chat` key but doesn't parse drop out via
+/// `read_facet`'s logging path; this list is the recovered subset.
+pub fn list_chat_refs(pool: &Pool) -> Vec<(Ref, ChatFacet)> {
+    pool.refs()
+        .into_iter()
+        .filter_map(|r| {
+            let facet = read_facet(&r)?;
+            Some((r, facet))
+        })
+        .collect()
 }
 
 #[cfg(test)]
