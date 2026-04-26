@@ -18,7 +18,7 @@ pub fn all_providers() -> Vec<Box<dyn LlmProvider>> {
 }
 
 pub fn default_model_id() -> &'static str {
-    "claude-opus-4-6"
+    "claude-opus-4-7"
 }
 
 /// Model IDs from authenticated providers only.
