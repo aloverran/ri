@@ -13,6 +13,9 @@ use serde::{Deserialize, Serialize};
 /// Application-level state for a chat session. The title drives the
 /// session list; created_at drives the sort order; cwd + host drive
 /// where the session's tools run; parent expresses sub-agent lineage.
+/// The `pinned` and `auto_listen` flags are operator-facing booleans:
+/// pinned sessions sort to the top of the session list; auto-listen
+/// sessions are the ones the daily reconciler walks.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatFacet {
     pub title: String,
@@ -24,6 +27,17 @@ pub struct ChatFacet {
     /// Parent ref, if this session was spawned by another.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent: Option<RefId>,
+    /// Operator-set: pinned sessions float to the top of the session
+    /// list view. Used as a "currently working with, not finished"
+    /// marker. Default false on existing/legacy refs.
+    #[serde(default)]
+    pub pinned: bool,
+    /// Operator-set: when true, the daily auto-listen reconciler walks
+    /// this session for every auto-enabled bank. Flagging is what
+    /// admits a session (including sub-sessions / consult / talk)
+    /// into the reconciler's source set. Default false.
+    #[serde(default)]
+    pub auto_listen: bool,
 }
 
 impl Facet for ChatFacet {
@@ -98,6 +112,8 @@ pub fn update_facet(
             cwd: String::new(),
             host: None,
             parent: None,
+            pinned: false,
+            auto_listen: false,
         });
     edit(&mut chat);
     let next = current.with_facet(&chat)?;
