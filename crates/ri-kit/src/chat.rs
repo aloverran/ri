@@ -12,10 +12,15 @@ use serde::{Deserialize, Serialize};
 
 /// Application-level state for a chat session. The title drives the
 /// session list; created_at drives the sort order; cwd + host drive
-/// where the session's tools run; parent expresses sub-agent lineage.
-/// The `pinned` and `no_listen` flags are operator-facing booleans:
-/// pinned sessions sort to the top of the session list; no-listen
-/// sessions are the ones the daily reconciler skips.
+/// where the session's tools run; parent expresses sub-agent lineage;
+/// pinned sessions sort to the top of the session list view.
+///
+/// This facet is shared across chat-style applications (ri-web, ri-cli)
+/// and is intentionally narrow: feature-specific per-session state
+/// (auto-listen opt-out, bank consultation, etc) lives in its own
+/// sibling facet keyed under `meta`, owned by the crate that consumes
+/// it. ri-kit knows nothing about features only one of its consumers
+/// uses.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatFacet {
     pub title: String,
@@ -32,17 +37,6 @@ pub struct ChatFacet {
     /// marker. Default false on existing/legacy refs.
     #[serde(default)]
     pub pinned: bool,
-    /// Operator-set: when true, the daily auto-listen reconciler skips
-    /// this session even if it would otherwise be eligible. Meaningful
-    /// only on top-level sessions (`parent.is_none()`); sub-sessions
-    /// (sub-agents, branches, consults, talks, listeners) are excluded
-    /// from auto-listen by lineage, so the field has no effect there.
-    /// Default false -- top-level chats are auto-listened by default,
-    /// opt-out via this flag. The write API rejects attempts to set
-    /// it on a non-root session so the field's value tracks its
-    /// observable behavior.
-    #[serde(default)]
-    pub no_listen: bool,
 }
 
 impl Facet for ChatFacet {
@@ -118,7 +112,6 @@ pub fn update_facet(
             host: None,
             parent: None,
             pinned: false,
-            no_listen: false,
         });
     edit(&mut chat);
     let next = current.with_facet(&chat)?;
