@@ -1,7 +1,7 @@
 // Building blocks for ri agent applications.
 
 pub mod chat;
-pub mod prompts;
+pub mod commands;
 pub mod resources;
 
 use std::collections::HashMap;

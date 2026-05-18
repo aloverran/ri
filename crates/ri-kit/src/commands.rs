@@ -1,7 +1,8 @@
-// Prompt template loading and expansion.
+// Slash-command parsing and template expansion.
 //
-// Load .md template files from any directory. The caller decides which
-// directories to scan (global config, project-local, explicit paths).
+// Loads `.md` command templates from a directory and expands a
+// `/name arg1 arg2 ...` user input into the matching template's body
+// with positional arguments substituted.
 //
 // Templates support variable substitution in their body:
 //   $1, $2, ...         positional args
