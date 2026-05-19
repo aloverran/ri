@@ -168,6 +168,11 @@ impl LlmProvider for GeminiProvider {
                     cost: ModelCost { input: 2.0, output: 12.0, cache_read: 0.2, cache_write: 0.375 },
                 },
                 Model {
+                    id: "gemini-3.5-flash".into(), name: "Gemini 3.5 Flash".into(),
+                    reasoning: true, context_window: 1_048_576, max_tokens: 65_536,
+                    cost: ModelCost { input: 1.5, output: 9.0, cache_read: 0.15, cache_write: 0.0 },
+                },
+                Model {
                     id: "gemini-3-flash-preview".into(), name: "Gemini 3 Flash".into(),
                     reasoning: true, context_window: 1_048_576, max_tokens: 65_536,
                     cost: ModelCost { input: 0.5, output: 3.0, cache_read: 0.05, cache_write: 0.0 },
@@ -599,8 +604,7 @@ fn build_contents(messages: &[Message], model_id: &str) -> Vec<Value> {
 }
 
 fn is_gemini3(model_id: &str) -> bool {
-    model_id.contains("3-pro") || model_id.contains("3-flash")
-        || model_id.contains("3.1-pro") || model_id.contains("3.1-flash")
+    model_id.starts_with("gemini-3")
 }
 
 /// Provider-native tools (search grounding and sandboxed code execution)
