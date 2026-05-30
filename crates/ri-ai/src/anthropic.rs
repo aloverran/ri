@@ -165,6 +165,11 @@ impl LlmProvider for AnthropicProvider {
                 reasoning: true, context_window: 200_000, max_tokens: 128_000,
                 cost: ModelCost { input: 5.0, output: 25.0, cache_read: 0.5, cache_write: 6.25 },
             },
+            Model {
+                id: "claude-opus-4-8".into(), name: "Claude Opus 4.8".into(),
+                reasoning: true, context_window: 200_000, max_tokens: 128_000,
+                cost: ModelCost { input: 5.0, output: 25.0, cache_read: 0.5, cache_write: 6.25 },
+            },
             // Extended context variants -- 1M token input via beta header.
             // Same models and pricing, but opts into the context-1m-2025-08-07 beta.
             Model {
@@ -179,6 +184,11 @@ impl LlmProvider for AnthropicProvider {
             },
             Model {
                 id: "claude-opus-4-7-1m".into(), name: "Claude Opus 4.7 (1M)".into(),
+                reasoning: true, context_window: 1_000_000, max_tokens: 128_000,
+                cost: ModelCost { input: 5.0, output: 25.0, cache_read: 0.5, cache_write: 6.25 },
+            },
+            Model {
+                id: "claude-opus-4-8-1m".into(), name: "Claude Opus 4.8 (1M)".into(),
                 reasoning: true, context_window: 1_000_000, max_tokens: 128_000,
                 cost: ModelCost { input: 5.0, output: 25.0, cache_read: 0.5, cache_write: 6.25 },
             },
@@ -488,6 +498,7 @@ fn thinking_mode(model_id: &str) -> ThinkingMode {
     match model_id {
         "claude-opus-4-6"
         | "claude-opus-4-7"
+        | "claude-opus-4-8"
         | "claude-sonnet-4-6" => ThinkingMode::Adaptive,
         _ => ThinkingMode::Budget,
     }
