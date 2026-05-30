@@ -186,7 +186,11 @@ fn scan_dir(dir: &Path, files: &mut Vec<ContextFile>, seen: &mut HashSet<PathBuf
 ///   resolve within this directory (no upward traversal past it).
 /// - `visited`: canonical paths already in the include stack, for cycle
 ///   detection.
-fn expand_includes(
+///
+/// Shared by AGENTS.md/CLAUDE.md discovery and the glob-rule discovery in
+/// ri-web (for global rules, which live on the server's own filesystem), so
+/// every context prompt file expands includes the same way.
+pub fn expand_includes(
     content: &str,
     base_dir: &Path,
     boundary: &Path,
