@@ -25,6 +25,8 @@ use serde::{Deserialize, Serialize};
 use serde::de::DeserializeOwned;
 use uuid::Uuid;
 
+use crate::blob::BlobHash;
+
 // String newtypes for message, context, and ref identifiers.
 // Separate types so the compiler catches mix-ups.
 
@@ -180,10 +182,12 @@ pub enum ContentBlock {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         replay: Option<ThinkingReplay>,
     },
-    Image {
-        #[serde(rename = "mediaType")]
+    Blob {
         media_type: String,
-        data: String,
+        hash: BlobHash,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+        size: u64,
     },
     ToolUse {
         id: String,
@@ -225,6 +229,14 @@ impl ContentBlock {
         ContentBlock::Thinking { thinking: s.into(), replay: None }
     }
 
+    /// A reference to a binary blob in the content-addressed store. Carries
+    /// the content address plus enough metadata (`media_type`, optional
+    /// `name`, `size`) to render a placeholder without ever touching the
+    /// bytes.
+    pub fn blob(media_type: impl Into<String>, hash: BlobHash, name: Option<String>, size: u64) -> Self {
+        ContentBlock::Blob { media_type: media_type.into(), hash, name, size }
+    }
+
     pub fn tool_use(id: impl Into<String>, name: impl Into<String>, input: serde_json::Value) -> Self {
         ContentBlock::ToolUse { id: id.into(), name: name.into(), input, sig: None }
     }
@@ -259,9 +271,16 @@ impl ContentBlock {
                 Some(format!("[tool call: {}({})]", name, input))
             }
             ContentBlock::ToolResult { content, is_error, .. } => {
-                let text: String = content.iter().filter_map(|b| {
-                    if let ContentBlock::Text { text, .. } = b { Some(text.as_str()) } else { None }
-                }).collect::<Vec<_>>().join("\n");
+                // Render every inner block (this is the design's third flatten
+                // site): a Blob with no text becomes its `[attachment ...]`
+                // placeholder rather than vanishing. Genuinely-empty results
+                // (no blocks / all-empty) still collapse to None so empty tool
+                // results keep skipping.
+                let text: String = content.iter()
+                    .map(|b| b.as_text_or_placeholder())
+                    .filter(|s| !s.is_empty())
+                    .collect::<Vec<_>>()
+                    .join("\n");
                 if text.is_empty() { return None; }
                 let label = if *is_error { "tool error" } else { "tool output" };
                 Some(format!("[{}: {}]", label, text))
@@ -270,7 +289,23 @@ impl ContentBlock {
         }
     }
 
-    /// Short human-readable summary of this block, targeting ~800 chars.
+    /// Flatten this block to plain text for sites that can carry nothing
+    /// else (a tool-result crossing a text-only provider boundary). Text
+    /// passes through verbatim; a `Blob` becomes a human placeholder so it
+    /// is *surfaced, never silently swallowed*; anything else falls back to
+    /// `summarize()`. This is the exception path, not the norm -- the norm
+    /// is to inject the actual bytes.
+    pub fn as_text_or_placeholder(&self) -> String {
+        match self {
+            ContentBlock::Text { text, .. } => text.clone(),
+            ContentBlock::Blob { media_type, name, size, .. } => {
+                blob_placeholder(media_type, name.as_deref(), *size)
+            }
+            other => other.summarize(),
+        }
+    }
+
+
     pub fn summarize(&self) -> String {
         match self {
             ContentBlock::Text { text, .. } => {
@@ -281,8 +316,8 @@ impl ContentBlock {
                 let body = truncate_with_ellipsis(thinking, SUMMARY_WIDTH - tag.len());
                 format!("{tag}{body}")
             }
-            ContentBlock::Image { media_type, .. } => {
-                format!("[image: {media_type}]")
+            ContentBlock::Blob { .. } => {
+                self.as_text_or_placeholder()
             }
             ContentBlock::ToolUse { name, input, .. } => {
                 let tag = format!("[tool: {name}] ");
@@ -334,9 +369,8 @@ fn display_block(out: &mut String, block: &ContentBlock) {
                 None => {}
             }
         }
-        ContentBlock::Image { media_type, data } => {
-            let size = format_byte_size(data.len());
-            out.push_str(&format!("--- image ({}, {}) ---\n", media_type, size));
+        ContentBlock::Blob { media_type, size, .. } => {
+            out.push_str(&format!("--- attachment ({}, {}) ---\n", media_type, format_byte_size_u64(*size)));
         }
         ContentBlock::ToolUse { name, input, .. } => {
             out.push_str(&format!("--- tool_use: {} ---\n", name));
@@ -374,6 +408,29 @@ fn format_byte_size(bytes: usize) -> String {
         format!("{:.1}KB", bytes as f64 / 1024.0)
     } else {
         format!("{:.1}MB", bytes as f64 / (1024.0 * 1024.0))
+    }
+}
+
+/// `u64` counterpart of [`format_byte_size`], for blob sizes (which are
+/// carried as `u64` so they survive on platforms with a 32-bit `usize`).
+fn format_byte_size_u64(bytes: u64) -> String {
+    if bytes < 1024 {
+        format!("{}B", bytes)
+    } else if bytes < 1024 * 1024 {
+        format!("{:.1}KB", bytes as f64 / 1024.0)
+    } else {
+        format!("{:.1}MB", bytes as f64 / (1024.0 * 1024.0))
+    }
+}
+
+/// The single source of truth for how a blob renders as text when its
+/// bytes can't be carried. `pub(crate)` so providers reuse the exact same
+/// wording at their flatten sites. Example output:
+/// `[attachment audio/mpeg "clip.mp3", 3.2MB]`.
+pub(crate) fn blob_placeholder(media_type: &str, name: Option<&str>, size: u64) -> String {
+    match name {
+        Some(name) => format!("[attachment {} \"{}\", {}]", media_type, name, format_byte_size_u64(size)),
+        None => format!("[attachment {}, {}]", media_type, format_byte_size_u64(size)),
     }
 }
 

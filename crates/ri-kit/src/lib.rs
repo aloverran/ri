@@ -134,11 +134,7 @@ async fn run_bash(
 
     let command = match input["command"].as_str() {
         Some(c) => c,
-        None => return ToolOutput {
-            text: "missing 'command' parameter".into(),
-            is_error: true,
-            details: None,
-        },
+        None => return ToolOutput::error("missing 'command' parameter"),
     };
     let timeout_ms = parse_u64(&input["timeout"]).unwrap_or(120_000);
 
@@ -154,11 +150,7 @@ async fn run_bash(
     // so we can kill the entire tree on cleanup.
     let mut child = match cmd.group_spawn() {
         Ok(c) => c,
-        Err(e) => return ToolOutput {
-            text: format!("Failed to spawn: {}", e),
-            is_error: true,
-            details: None,
-        },
+        Err(e) => return ToolOutput::error(format!("Failed to spawn: {}", e)),
     };
 
     // Take stdout/stderr handles for concurrent reading.
@@ -192,11 +184,7 @@ async fn run_bash(
                     let _ = child.kill().await;
                     let _ = stdout_task.await;
                     let _ = stderr_task.await;
-                    return ToolOutput {
-                        text: format!("Process error: {}", e),
-                        is_error: true,
-                        details: None,
-                    };
+                    return ToolOutput::error(format!("Process error: {}", e));
                 }
             }
         },
@@ -213,15 +201,11 @@ async fn run_bash(
     let stderr_bytes = stderr_task.await.unwrap_or_default();
 
     if exit_status.is_none() {
-        return ToolOutput {
-            text: if cancel.is_cancelled() {
+        return ToolOutput::error(if cancel.is_cancelled() {
                 "Command aborted".into()
             } else {
                 format!("Command timed out after {}ms", timeout_ms)
-            },
-            is_error: true,
-            details: None,
-        };
+            });
     }
 
     let exit_code = exit_status.unwrap().code().unwrap_or(-1);
@@ -239,35 +223,23 @@ async fn run_bash(
     let truncated = truncate_output(&combined, 2000, 50 * 1024);
     let text = format!("Exit code: {}\n{}", exit_code, truncated);
 
-    ToolOutput {
-        text,
-        is_error: exit_code != 0,
-        details: Some(serde_json::json!({
+    ToolOutput::text(text).with_error(exit_code != 0).with_details(serde_json::json!({
             "exit_code": exit_code,
             "stdout": stdout,
             "stderr": stderr,
-        })),
-    }
+        }))
 }
 
 async fn run_read(input: serde_json::Value, cwd: &Path) -> ToolOutput {
     let path_str = match input["path"].as_str() {
         Some(p) => p,
-        None => return ToolOutput {
-            text: "missing 'path' parameter".into(),
-            is_error: true,
-            details: None,
-        },
+        None => return ToolOutput::error("missing 'path' parameter"),
     };
 
     let path = resolve_path(path_str, cwd);
     let content = match tokio::fs::read_to_string(&path).await {
         Ok(c) => c,
-        Err(e) => return ToolOutput {
-            text: format!("Failed to read {}: {}", path.display(), e),
-            is_error: true,
-            details: None,
-        },
+        Err(e) => return ToolOutput::error(format!("Failed to read {}: {}", path.display(), e)),
     };
 
     let offset = parse_u64(&input["offset"]).unwrap_or(1).max(1) as usize - 1;
@@ -289,132 +261,76 @@ async fn run_read(input: serde_json::Value, cwd: &Path) -> ToolOutput {
         numbered
     };
 
-    ToolOutput {
-        text,
-        is_error: false,
-        details: Some(serde_json::json!({
+    ToolOutput::text(text).with_details(serde_json::json!({
             "path": path_str,
             "total_lines": total,
             "offset": offset + 1,
             "limit": limit,
-        })),
-    }
+        }))
 }
 
 async fn run_write(input: serde_json::Value, cwd: &Path) -> ToolOutput {
     let path_str = match input["path"].as_str() {
         Some(p) => p,
-        None => return ToolOutput {
-            text: "missing 'path' parameter".into(),
-            is_error: true,
-            details: None,
-        },
+        None => return ToolOutput::error("missing 'path' parameter"),
     };
     let content = match input["content"].as_str() {
         Some(c) => c,
-        None => return ToolOutput {
-            text: "missing 'content' parameter".into(),
-            is_error: true,
-            details: None,
-        },
+        None => return ToolOutput::error("missing 'content' parameter"),
     };
 
     let path = resolve_path(path_str, cwd);
     if let Some(parent) = path.parent() {
         if let Err(e) = tokio::fs::create_dir_all(parent).await {
-            return ToolOutput {
-                text: format!("Failed to create directories: {}", e),
-                is_error: true,
-                details: None,
-            };
+            return ToolOutput::error(format!("Failed to create directories: {}", e));
         }
     }
 
     match tokio::fs::write(&path, content).await {
-        Ok(()) => ToolOutput {
-            text: format!("Wrote {} bytes to {}", content.len(), path.display()),
-            is_error: false,
-            details: Some(serde_json::json!({
+        Ok(()) => ToolOutput::text(format!("Wrote {} bytes to {}", content.len(), path.display())).with_details(serde_json::json!({
                 "path": path_str,
                 "size": content.len(),
             })),
-        },
-        Err(e) => ToolOutput {
-            text: format!("Failed to write: {}", e),
-            is_error: true,
-            details: None,
-        },
+        Err(e) => ToolOutput::error(format!("Failed to write: {}", e)),
     }
 }
 
 async fn run_edit(input: serde_json::Value, cwd: &Path) -> ToolOutput {
     let path_str = match input["path"].as_str() {
         Some(p) => p,
-        None => return ToolOutput {
-            text: "missing 'path' parameter".into(),
-            is_error: true,
-            details: None,
-        },
+        None => return ToolOutput::error("missing 'path' parameter"),
     };
     let old_text = match input["old_text"].as_str() {
         Some(t) => t,
-        None => return ToolOutput {
-            text: "missing 'old_text' parameter".into(),
-            is_error: true,
-            details: None,
-        },
+        None => return ToolOutput::error("missing 'old_text' parameter"),
     };
     let new_text = match input["new_text"].as_str() {
         Some(t) => t,
-        None => return ToolOutput {
-            text: "missing 'new_text' parameter".into(),
-            is_error: true,
-            details: None,
-        },
+        None => return ToolOutput::error("missing 'new_text' parameter"),
     };
 
     let path = resolve_path(path_str, cwd);
     let content = match tokio::fs::read_to_string(&path).await {
         Ok(c) => c,
-        Err(e) => return ToolOutput {
-            text: format!("Failed to read {}: {}", path.display(), e),
-            is_error: true,
-            details: None,
-        },
+        Err(e) => return ToolOutput::error(format!("Failed to read {}: {}", path.display(), e)),
     };
 
     let count = content.matches(old_text).count();
     if count == 0 {
-        return ToolOutput {
-            text: "old_text not found in file".into(),
-            is_error: true,
-            details: None,
-        };
+        return ToolOutput::error("old_text not found in file");
     }
     if count > 1 {
-        return ToolOutput {
-            text: format!("old_text found {} times; must be unique", count),
-            is_error: true,
-            details: None,
-        };
+        return ToolOutput::error(format!("old_text found {} times; must be unique", count));
     }
 
     let new_content = content.replacen(old_text, new_text, 1);
     match tokio::fs::write(&path, &new_content).await {
-        Ok(()) => ToolOutput {
-            text: format!("Edited {}", path.display()),
-            is_error: false,
-            details: Some(serde_json::json!({
+        Ok(()) => ToolOutput::text(format!("Edited {}", path.display())).with_details(serde_json::json!({
                 "path": path_str,
                 "old_text": old_text,
                 "new_text": new_text,
             })),
-        },
-        Err(e) => ToolOutput {
-            text: format!("Failed to write: {}", e),
-            is_error: true,
-            details: None,
-        },
+        Err(e) => ToolOutput::error(format!("Failed to write: {}", e)),
     }
 }
 

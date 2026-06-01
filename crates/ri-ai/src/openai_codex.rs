@@ -25,6 +25,7 @@ use ri::{
 };
 use crate::sse::{self, SseEvent, SseInterpreter};
 use crate::creds::{self, Credentials};
+use crate::media;
 
 // -- Constants --
 
@@ -214,7 +215,8 @@ impl LlmProvider for OpenAICodexProvider {
         }
 
         let prompt_cache_key = derive_prompt_cache_key(&opts.messages);
-        let body = build_body(&opts, prompt_cache_key.as_deref());
+        let resolved = resolve_blobs(&opts).await;
+        let body = build_body(&opts, prompt_cache_key.as_deref(), &resolved);
         let response = send_with_retry(
             &token,
             &account_id,
@@ -482,8 +484,8 @@ fn parse_codex_error(status: u16, body: &str) -> ApiError {
 
 // -- Request body --
 
-fn build_body(opts: &RequestOptions, prompt_cache_key: Option<&str>) -> Value {
-    let messages = build_input_messages(&opts.messages);
+fn build_body(opts: &RequestOptions, prompt_cache_key: Option<&str>, resolved: &media::ResolvedMap) -> Value {
+    let messages = build_input_messages(&opts.messages, resolved);
 
     let mut body = json!({
         "model": opts.model.id,
@@ -546,7 +548,40 @@ fn derive_prompt_cache_key(messages: &[Message]) -> Option<String> {
 
 // -- Message conversion (ri messages -> Responses API input) --
 
-fn build_input_messages(messages: &[Message]) -> Vec<Value> {
+/// Capability-aware resolution pass: OpenAI takes `image/*` inline for Stage 2.
+/// audio/pdf/video become a surfaced placeholder.
+/// Conservative cap on raw image size sent as a data-URL. Over this is
+/// surfaced as a placeholder rather than risking a 413 on the request payload.
+const OPENAI_IMAGE_LIMIT: u64 = 20 * 1024 * 1024;
+
+async fn resolve_blobs(opts: &RequestOptions) -> media::ResolvedMap {
+    let mut map = media::ResolvedMap::new();
+    for (mime, hash, size) in media::collect_blobs(&opts.messages) {
+        // The codex / GPT-5.x models here are natively multimodal for images
+        // (vision) but do NOT accept input_audio or input_file; audio/pdf/video
+        // are genuinely unsupported, so a placeholder is the correct total result.
+        let resolved = if !mime.starts_with("image/") {
+            media::Resolved::Placeholder(format!(
+                "[attachment {}, {} - this model can't read it]",
+                mime, media::human_size(size)
+            ))
+        } else if size > OPENAI_IMAGE_LIMIT {
+            media::Resolved::Placeholder(format!(
+                "[attachment {}, {} - exceeds this model's inline image limit]",
+                mime, media::human_size(size)
+            ))
+        } else {
+            match media::read_blob_b64(&opts.blobs, &hash).await {
+                Some(b64) => media::Resolved::Inline { media_type: mime.clone(), b64 },
+                None => media::Resolved::Placeholder(format!("[missing attachment {}]", mime)),
+            }
+        };
+        map.insert(hash, resolved);
+    }
+    map
+}
+
+fn build_input_messages(messages: &[Message], resolved: &media::ResolvedMap) -> Vec<Value> {
     let mut input: Vec<Value> = Vec::new();
     let mut text_block_counter = 0usize;
 
@@ -565,13 +600,23 @@ fn build_input_messages(messages: &[Message]) -> Vec<Value> {
                         ContentBlock::Text { text, .. } => {
                             Some(json!({ "type": "input_text", "text": text }))
                         }
-                        ContentBlock::Image { media_type, data } => {
-                            Some(json!({
-                                "type": "input_image",
-                                "detail": "auto",
-                                "image_url": format!("data:{};base64,{}", media_type, data),
-                            }))
-                        }
+                        ContentBlock::Blob { hash, .. } => match resolved.get(hash) {
+                            Some(media::Resolved::Inline { media_type, b64 }) => {
+                                Some(json!({
+                                    "type": "input_image",
+                                    "detail": "auto",
+                                    "image_url": format!("data:{};base64,{}", media_type, b64),
+                                }))
+                            }
+                            Some(media::Resolved::Placeholder(t)) => {
+                                Some(json!({ "type": "input_text", "text": t }))
+                            }
+                            // FileUri isn't an OpenAI concept here; missing degrades
+                            // to descriptive text. Surface, never drop.
+                            Some(media::Resolved::FileUri { .. }) | None => {
+                                Some(json!({ "type": "input_text", "text": block.as_text_or_placeholder() }))
+                            }
+                        },
                         _ => None,
                     }
                 }).collect();
@@ -641,6 +686,11 @@ fn build_input_messages(messages: &[Message]) -> Vec<Value> {
         // Tool results: these live in user messages in ri's model (role=User
         // with ToolResult blocks), but need to become function_call_output items.
         if msg.role == Role::User || msg.role == Role::Assistant {
+            // Media inside a tool result is hoisted to a SINGLE trailing user
+            // message after all function_call_output items of this ri-message
+            // (function_call_output.output is string-only, and a user message
+            // interleaved between two outputs would break pairing).
+            let mut hoisted: Vec<Value> = Vec::new();
             for block in &msg.content {
                 if let ContentBlock::ToolResult { tool_use_id, content, .. } = block {
                     if !complete.contains(tool_use_id.as_str()) {
@@ -650,9 +700,12 @@ fn build_input_messages(messages: &[Message]) -> Vec<Value> {
                         }
                         continue;
                     }
-                    let text: String = content.iter().filter_map(|b| {
-                        if let ContentBlock::Text { text, .. } = b { Some(text.as_str()) } else { None }
-                    }).collect::<Vec<_>>().join("\n");
+                    // as_text_or_placeholder so a Blob yields descriptive text,
+                    // not an empty output.
+                    let text: String = content.iter()
+                        .map(|b| b.as_text_or_placeholder())
+                        .collect::<Vec<_>>()
+                        .join("\n");
 
                     let (call_id, _) = split_compound_id(tool_use_id);
                     // Codex has no is_error field on function_call_output; errors
@@ -662,7 +715,22 @@ fn build_input_messages(messages: &[Message]) -> Vec<Value> {
                         "call_id": call_id,
                         "output": if text.is_empty() { "(empty)".to_string() } else { text },
                     }));
+
+                    for b in content {
+                        if let ContentBlock::Blob { hash, .. } = b {
+                            if let Some(media::Resolved::Inline { media_type, b64 }) = resolved.get(hash) {
+                                hoisted.push(json!({
+                                    "type": "input_image",
+                                    "detail": "auto",
+                                    "image_url": format!("data:{};base64,{}", media_type, b64),
+                                }));
+                            }
+                        }
+                    }
                 }
+            }
+            if !hoisted.is_empty() {
+                input.push(json!({ "role": "user", "content": hoisted }));
             }
         }
     }

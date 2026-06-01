@@ -82,6 +82,10 @@ pub struct RequestOptions {
     pub max_tokens: Option<usize>,
     /// Whether to enable all of a model's built-in capabilities (e.g. Gemini's google_search + code_execution).
     pub native_tools: bool,
+    /// The global blob store. Lives alongside the `messages` that carry
+    /// `Blob` refs, so a provider can resolve a content address to bytes
+    /// only for the blobs a request will actually transmit.
+    pub blobs: std::sync::Arc<crate::blob::Blobs>,
 }
 
 type BoxError = Box<dyn std::error::Error + Send + Sync + 'static>;

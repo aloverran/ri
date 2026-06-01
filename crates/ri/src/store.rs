@@ -668,6 +668,14 @@ pub fn default_sessions_dir() -> eyre::Result<PathBuf> {
     Ok(home.join(".ri").join("sessions"))
 }
 
+/// Default blob directory (`~/.ri/blobs`) -- the global content-addressed
+/// store the pool never loads. Kept beside [`default_sessions_dir`].
+pub fn default_blobs_dir() -> eyre::Result<PathBuf> {
+    let home = dirs::home_dir()
+        .ok_or_else(|| eyre::eyre!("Could not determine home directory"))?;
+    Ok(home.join(".ri").join("blobs"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

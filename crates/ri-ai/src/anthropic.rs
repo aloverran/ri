@@ -18,6 +18,7 @@ use ri::{
 };
 use crate::sse::{self, SseEvent, SseInterpreter};
 use crate::creds::{self, CredsGuard, Credentials};
+use crate::media;
 
 fn creds_path() -> eyre::Result<PathBuf> {
     Ok(creds::ri_dir()?.join("anthropic_auth.json"))
@@ -299,11 +300,52 @@ impl LlmProvider for AnthropicProvider {
             opts.model.id = opts.model.id.strip_suffix("-1m").unwrap().to_string();
         }
 
-        let request = build_request(&api_key, &opts, extended_context);
+        let resolved = resolve_blobs(&opts).await;
+        let request = build_request(&api_key, &opts, extended_context, &resolved);
         let bytes = sse::send(request).await?;
         let state = AnthropicState::new(is_oauth, opts.tools.to_vec());
         Ok(Box::pin(sse::drive_sse_stream(bytes, state)))
     }
+}
+
+/// Maximum raw image size Anthropic accepts inline (~4.5 MB/image). Over this
+/// is surfaced as a placeholder rather than risking a 413/400.
+const ANTHROPIC_IMAGE_LIMIT: u64 = 4_500_000;
+
+/// Maximum raw PDF size Anthropic accepts inline as a document (~30 MB).
+const ANTHROPIC_PDF_LIMIT: u64 = 30 * 1024 * 1024;
+
+/// Capability-aware resolution pass: `image/*` under the image cap -> inline
+/// base64 (rendered as an image block); `application/pdf` under the PDF cap ->
+/// inline base64 (rendered as a document block); audio/video, or anything over
+/// a cap, -> placeholder. Anthropic has no upload API, so inline-or-placeholder
+/// is the whole story.
+async fn resolve_blobs(opts: &RequestOptions) -> media::ResolvedMap {
+    let mut map = media::ResolvedMap::new();
+    for (mime, hash, size) in media::collect_blobs(&opts.messages) {
+        let is_image = mime.starts_with("image/");
+        let is_pdf = mime == "application/pdf";
+        let over_limit = (is_image && size > ANTHROPIC_IMAGE_LIMIT)
+            || (is_pdf && size > ANTHROPIC_PDF_LIMIT);
+        let resolved = if !is_image && !is_pdf {
+            media::Resolved::Placeholder(format!(
+                "[attachment {}, {} - this model can't read it]",
+                mime, media::human_size(size)
+            ))
+        } else if over_limit {
+            media::Resolved::Placeholder(format!(
+                "[attachment {}, {} - exceeds this model's inline size limit]",
+                mime, media::human_size(size)
+            ))
+        } else {
+            match media::read_blob_b64(&opts.blobs, &hash).await {
+                Some(b64) => media::Resolved::Inline { media_type: mime.clone(), b64 },
+                None => media::Resolved::Placeholder(format!("[missing attachment {}]", mime)),
+            }
+        };
+        map.insert(hash, resolved);
+    }
+    map
 }
 
 // -- Token handling --
@@ -391,9 +433,9 @@ fn from_claude_code_name(name: &str, original_tools: &[ToolSchema]) -> String {
 
 // -- Request building --
 
-fn build_request(api_key: &str, opts: &RequestOptions, extended_context: bool) -> reqwest::RequestBuilder {
+fn build_request(api_key: &str, opts: &RequestOptions, extended_context: bool, resolved: &media::ResolvedMap) -> reqwest::RequestBuilder {
     let is_oauth = api_key.starts_with("sk-ant-oat");
-    let body = build_body(opts, is_oauth);
+    let body = build_body(opts, is_oauth, resolved);
     let url = "https://api.anthropic.com/v1/messages";
 
     tracing::trace!(url, %body, "Anthropic API request");
@@ -426,14 +468,14 @@ fn build_request(api_key: &str, opts: &RequestOptions, extended_context: bool) -
     builder.body(body.to_string())
 }
 
-fn build_body(opts: &RequestOptions, is_oauth: bool) -> Value {
+fn build_body(opts: &RequestOptions, is_oauth: bool, resolved: &media::ResolvedMap) -> Value {
     // Only emit structured tool protocol for complete call+result pairs.
     // Orphaned tool blocks from cross-provider contexts are filtered out.
     let complete = ri::complete_tool_pairs(&opts.messages);
 
     let messages: Vec<Value> = opts.messages.iter()
         .filter(|m| m.role != Role::System)
-        .map(|m| convert_message(m, &complete))
+        .map(|m| convert_message(m, &complete, resolved))
         .collect();
 
     let max_tokens = opts.max_tokens
@@ -533,7 +575,7 @@ fn apply_thinking(body: &mut Value, level: ThinkingLevel, mode: ThinkingMode) {
     }
 }
 
-fn convert_message(msg: &Message, complete: &std::collections::HashSet<&str>) -> Value {
+fn convert_message(msg: &Message, complete: &std::collections::HashSet<&str>, resolved: &media::ResolvedMap) -> Value {
     let role = match msg.role {
         Role::User => "user",
         Role::Assistant => "assistant",
@@ -550,7 +592,7 @@ fn convert_message(msg: &Message, complete: &std::collections::HashSet<&str>) ->
             ContentBlock::ToolResult { tool_use_id, .. } if !complete.contains(tool_use_id.as_str()) => {
                 c.tool_as_text().map(|t| json!({ "type": "text", "text": t }))
             }
-            _ => Some(convert_content(c)),
+            _ => Some(convert_content(c, resolved)),
         })
         .collect();
     let has_tool_results = msg.content.iter().any(|c| {
@@ -561,7 +603,7 @@ fn convert_message(msg: &Message, complete: &std::collections::HashSet<&str>) ->
     json!({ "role": effective_role, "content": content })
 }
 
-fn convert_content(c: &ContentBlock) -> Value {
+fn convert_content(c: &ContentBlock, resolved: &media::ResolvedMap) -> Value {
     match c {
         ContentBlock::Text { text, .. } => json!({ "type": "text", "text": text }),
         ContentBlock::Thinking { thinking, replay } => {
@@ -572,15 +614,28 @@ fn convert_content(c: &ContentBlock) -> Value {
                 json!({ "type": "text", "text": thinking })
             }
         }
-        ContentBlock::Image { media_type, data } => json!({
-            "type": "image",
-            "source": { "type": "base64", "media_type": media_type, "data": data }
-        }),
+        ContentBlock::Blob { hash, .. } => match resolved.get(hash) {
+            // PDF inline -> document block; everything else inline -> image block.
+            Some(media::Resolved::Inline { media_type, b64 }) if media_type == "application/pdf" => json!({
+                "type": "document",
+                "source": { "type": "base64", "media_type": "application/pdf", "data": b64 }
+            }),
+            Some(media::Resolved::Inline { media_type, b64 }) => json!({
+                "type": "image",
+                "source": { "type": "base64", "media_type": media_type, "data": b64 }
+            }),
+            // FileUri is not an Anthropic concept; surface as text. Placeholder
+            // and a missing entry both degrade to descriptive text -- never a drop.
+            Some(media::Resolved::FileUri { .. }) | None => {
+                json!({ "type": "text", "text": c.as_text_or_placeholder() })
+            }
+            Some(media::Resolved::Placeholder(t)) => json!({ "type": "text", "text": t }),
+        },
         ContentBlock::ToolUse { id, name, input, .. } => json!({
             "type": "tool_use", "id": id, "name": name, "input": input
         }),
         ContentBlock::ToolResult { tool_use_id, content, is_error, .. } => {
-            let content_json: Vec<Value> = content.iter().map(convert_content).collect();
+            let content_json: Vec<Value> = content.iter().map(|b| convert_content(b, resolved)).collect();
             json!({
                 "type": "tool_result",
                 "tool_use_id": tool_use_id,

@@ -8,6 +8,8 @@
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
+use crate::model::ContentBlock;
+
 /// Tool schema sent to the LLM API so it knows what tools are available.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolSchema {
@@ -17,17 +19,59 @@ pub struct ToolSchema {
 }
 
 /// Result of executing a tool.
+///
+/// The content is `Vec<ContentBlock>` -- the same shape `ToolResult.content`
+/// already has -- so a tool can return text, a binary `Blob`, or a mix, and
+/// the agent-loop conversion to a `ToolResult` is a straight move with no
+/// flatten.
 pub struct ToolOutput {
-    /// Text content sent to the LLM as the tool result.
-    pub text: String,
+    /// What flows back to the LLM as the tool result.
+    pub content: Vec<ContentBlock>,
     pub is_error: bool,
     /// Structured data for UI rendering. Not sent to the LLM.
     pub details: Option<serde_json::Value>,
 }
 
 impl ToolOutput {
-    pub fn error(msg: impl Into<String>) -> Self {
-        Self { text: msg.into(), is_error: true, details: None }
+    /// A plain-text result -- the overwhelmingly common case.
+    pub fn text(s: impl Into<String>) -> Self {
+        Self { content: vec![ContentBlock::text(s)], is_error: false, details: None }
+    }
+
+    /// An error result. Signature unchanged from the pre-reshape API.
+    pub fn error(s: impl Into<String>) -> Self {
+        Self { content: vec![ContentBlock::text(s)], is_error: true, details: None }
+    }
+
+    /// A result carrying arbitrary content blocks (e.g. a `Blob`).
+    pub fn blocks(content: Vec<ContentBlock>) -> Self {
+        Self { content, is_error: false, details: None }
+    }
+
+    /// Attach structured UI details.
+    pub fn with_details(mut self, details: serde_json::Value) -> Self {
+        self.details = Some(details);
+        self
+    }
+
+    /// Set the error flag.
+    pub fn with_error(mut self, is_error: bool) -> Self {
+        self.is_error = is_error;
+        self
+    }
+
+    /// Concatenate the text of every `Text` block (joined by newlines) for
+    /// callers that still want a flat string -- logging, `tag_host` -- without
+    /// breaking on a `Blob`-only output.
+    pub fn text_str(&self) -> String {
+        self.content
+            .iter()
+            .filter_map(|b| match b {
+                ContentBlock::Text { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 }
 

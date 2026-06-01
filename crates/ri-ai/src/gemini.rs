@@ -13,11 +13,12 @@ use serde_json::{json, Value};
 use tokio::sync::Mutex;
 
 use ri::{
-    ApiError, AuthMethod, ContentBlock, EventStream, LlmProvider, Message, Model, ModelCost,
+    ApiError, AuthMethod, BlobHash, ContentBlock, EventStream, LlmProvider, Message, Model, ModelCost,
     RequestOptions, Role, StreamEvent, ThinkingLevel, Usage,
 };
 use crate::sse::{self, SseEvent, SseInterpreter};
 use crate::gemini_auth;
+use crate::media;
 
 // -- Variant --
 
@@ -64,6 +65,12 @@ pub struct GeminiProvider {
     /// `complete_login` HTTP round trip. Access tokens and project IDs are
     /// read fresh from disk via `gemini_auth::load_creds` on each call.
     login: Mutex<LoginInProgress>,
+    /// Mandatory Files-API cache: `hash -> (fileUri, expiry)`. A large or
+    /// video blob is uploaded ONCE and reused across turns; entries past the
+    /// 48h TTL are dropped on access. Interior mutability with a `std::sync`
+    /// Mutex -- the critical section is short and never held across an await.
+    /// The `fileUri` is never persisted into a message; only the hash is.
+    files_cache: std::sync::Mutex<HashMap<BlobHash, (String, chrono::DateTime<chrono::Utc>)>>,
 }
 
 #[derive(Default)]
@@ -74,7 +81,11 @@ struct LoginInProgress {
 
 impl GeminiProvider {
     pub fn new(variant: GeminiVariant) -> Self {
-        Self { variant, login: Mutex::new(LoginInProgress::default()) }
+        Self {
+            variant,
+            login: Mutex::new(LoginInProgress::default()),
+            files_cache: std::sync::Mutex::new(HashMap::new()),
+        }
     }
 
     /// Return `(access_token, project_id)` for this provider. For OAuth
@@ -278,9 +289,204 @@ impl LlmProvider for GeminiProvider {
         let (token, project_id) = self.ensure_valid_token().await
             .map_err(|e| ApiError::other(format!("{e:#}")))?;
 
-        let request = build_request(self.variant, &token, &project_id, &opts);
+        // The Files API (large/video uploads) is reachable only with the
+        // public API key via `x-goog-api-key`; OAuth variants resolve
+        // inline-or-placeholder only.
+        let api_key = if self.variant == GeminiVariant::ApiKey && !token.is_empty() {
+            Some(token.clone())
+        } else {
+            None
+        };
+        let resolved = self.resolve_blobs(&opts, api_key.as_deref()).await;
+        let request = build_request(self.variant, &token, &project_id, &opts, &resolved);
         let bytes = sse::send(request).await?;
         Ok(Box::pin(sse::drive_sse_stream(bytes, GeminiState::new())))
+    }
+}
+
+/// Maximum raw blob size sent inline as base64. Larger blobs -- and all video,
+/// which the API accepts only through the Files API -- are uploaded to the
+/// Files API and referenced by `fileUri` instead.
+const GEMINI_INLINE_LIMIT: u64 = 18_000_000;
+
+/// Files API entries live 48h; we expire our cache slightly early (47h) so a
+/// uri is never referenced after the server has swept it.
+const FILES_API_TTL_HOURS: i64 = 47;
+
+impl GeminiProvider {
+    /// A still-valid cached fileUri for a hash, dropping the entry if past TTL.
+    fn cached_file_uri(&self, hash: &BlobHash) -> Option<String> {
+        let mut cache = self.files_cache.lock().unwrap();
+        match cache.get(hash) {
+            Some((uri, expiry)) if *expiry > chrono::Utc::now() => Some(uri.clone()),
+            Some(_) => { cache.remove(hash); None }
+            None => None,
+        }
+    }
+
+    fn store_file_uri(&self, hash: BlobHash, uri: String) {
+        let expiry = chrono::Utc::now() + chrono::Duration::hours(FILES_API_TTL_HOURS);
+        self.files_cache.lock().unwrap().insert(hash, (uri, expiry));
+    }
+
+    /// Capability-aware resolution pass: Gemini takes image/audio/video/pdf.
+    /// Non-video blobs at or under [`GEMINI_INLINE_LIMIT`] resolve to inline
+    /// base64; everything else (bigger, or any video) goes through the Files
+    /// API to a `fileUri`. A non-sendable modality, a missing blob, or an
+    /// upload that can't be performed surfaces as a placeholder -- never a
+    /// silent drop, never a raw 400.
+    async fn resolve_blobs(&self, opts: &RequestOptions, api_key: Option<&str>) -> media::ResolvedMap {
+        let mut map = media::ResolvedMap::new();
+        for (mime, hash, size) in media::collect_blobs(&opts.messages) {
+            let is_video = mime.starts_with("video/");
+            let sendable = mime.starts_with("image/")
+                || mime.starts_with("audio/")
+                || is_video
+                || mime == "application/pdf";
+            let resolved = if !sendable {
+                media::Resolved::Placeholder(format!(
+                    "[attachment {}, {} - this model can't read it]",
+                    mime, media::human_size(size)
+                ))
+            } else if !is_video && size <= GEMINI_INLINE_LIMIT {
+                match media::read_blob_b64(&opts.blobs, &hash).await {
+                    Some(b64) => media::Resolved::Inline { media_type: mime.clone(), b64 },
+                    None => media::Resolved::Placeholder(format!("[missing attachment {}]", mime)),
+                }
+            } else {
+                self.resolve_via_files_api(opts, &mime, &hash, size, is_video, api_key).await
+            };
+            map.insert(hash, resolved);
+        }
+        map
+    }
+
+    /// The Files-API path for large blobs and all video: cache-hit -> reuse;
+    /// otherwise read the raw bytes off the Tokio path, upload once, cache,
+    /// and reference by `fileUri`.
+    async fn resolve_via_files_api(
+        &self,
+        opts: &RequestOptions,
+        mime: &str,
+        hash: &BlobHash,
+        size: u64,
+        is_video: bool,
+        api_key: Option<&str>,
+    ) -> media::Resolved {
+        if let Some(uri) = self.cached_file_uri(hash) {
+            return media::Resolved::FileUri { media_type: mime.to_string(), uri };
+        }
+        let Some(api_key) = api_key else {
+            return media::Resolved::Placeholder(format!(
+                "[attachment {}, {} - too large to inline; Files API needs an API key]",
+                mime, media::human_size(size)
+            ));
+        };
+        // Read the raw bytes off the Tokio worker pool (a large video must not
+        // block an async worker).
+        let bytes = {
+            let blobs = opts.blobs.clone();
+            let h = hash.clone();
+            match tokio::task::spawn_blocking(move || blobs.get(&h)).await {
+                Ok(Ok(Some(b))) => b,
+                _ => return media::Resolved::Placeholder(format!("[missing attachment {}]", mime)),
+            }
+        };
+        match upload_to_files_api(api_key, mime, bytes, is_video).await {
+            Ok(uri) => {
+                self.store_file_uri(hash.clone(), uri.clone());
+                media::Resolved::FileUri { media_type: mime.to_string(), uri }
+            }
+            Err(e) => {
+                tracing::warn!("Gemini Files API upload failed for {mime}: {e:#}");
+                media::Resolved::Placeholder(format!(
+                    "[attachment {}, {} - upload failed]",
+                    mime, media::human_size(size)
+                ))
+            }
+        }
+    }
+}
+
+/// Upload raw bytes to the Gemini Files API and return the file's https `uri`.
+///
+/// Uses the simple **media** upload (`uploadType=media`, raw body) rather than
+/// reqwest's `multipart::Form`: the latter emits `multipart/form-data`, which
+/// the Files endpoint rejects, and `uploadType=media` needs no extra crate
+/// feature. The response is `{file:{uri,name,state,mimeType}}`. Images/audio
+/// are `ACTIVE` immediately; video enters `PROCESSING` and is polled to
+/// `ACTIVE` (or `FAILED`) before the uri is usable.
+async fn upload_to_files_api(
+    api_key: &str,
+    mime: &str,
+    bytes: Vec<u8>,
+    is_video: bool,
+) -> eyre::Result<String> {
+    let client = reqwest::Client::new();
+    let resp = client
+        .post("https://generativelanguage.googleapis.com/upload/v1beta/files?uploadType=media")
+        .header("x-goog-api-key", api_key)
+        .header("content-type", mime)
+        .body(bytes)
+        .send()
+        .await?;
+    let status = resp.status();
+    let text = resp.text().await?;
+    if !status.is_success() {
+        return Err(eyre::eyre!("Files API upload {}: {}", status, text));
+    }
+    let parsed: Value = serde_json::from_str(&text)?;
+    let file = &parsed["file"];
+    let uri = file["uri"].as_str()
+        .ok_or_else(|| eyre::eyre!("Files API response missing file.uri: {}", text))?
+        .to_string();
+    let name = file["name"].as_str().unwrap_or_default().to_string();
+    let state = file["state"].as_str().unwrap_or_default();
+    if is_video || state == "PROCESSING" {
+        poll_file_active(&client, api_key, &name).await?;
+    } else if state == "FAILED" {
+        return Err(eyre::eyre!("Files API processing FAILED for {}", name));
+    }
+    Ok(uri)
+}
+
+/// Poll `GET /v1beta/{name}` until the file reaches `ACTIVE`. Errors on
+/// `FAILED` or a timeout so the caller falls back to a placeholder rather than
+/// referencing an unusable file.
+async fn poll_file_active(client: &reqwest::Client, api_key: &str, name: &str) -> eyre::Result<()> {
+    if name.is_empty() {
+        return Err(eyre::eyre!("Files API returned no file name to poll"));
+    }
+    let url = format!("https://generativelanguage.googleapis.com/v1beta/{}", name);
+    // Up to ~5 minutes at a 5s interval -- ample for short clips.
+    for _ in 0..60 {
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        let resp = client.get(&url).header("x-goog-api-key", api_key).send().await?;
+        let parsed: Value = resp.json().await?;
+        match parsed["state"].as_str().unwrap_or_default() {
+            "ACTIVE" => return Ok(()),
+            "FAILED" => return Err(eyre::eyre!("Files API processing FAILED for {}", name)),
+            _ => continue,
+        }
+    }
+    Err(eyre::eyre!("Files API processing timed out for {}", name))
+}
+
+/// Emit the provider JSON part for a resolved blob (inline / fileData / text).
+fn resolved_part(resolved: &media::ResolvedMap, block: &ContentBlock) -> Value {
+    if let ContentBlock::Blob { hash, .. } = block {
+        match resolved.get(hash) {
+            Some(media::Resolved::Inline { media_type, b64 }) => {
+                json!({ "inlineData": { "mimeType": media_type, "data": b64 } })
+            }
+            Some(media::Resolved::FileUri { media_type, uri }) => {
+                json!({ "fileData": { "mimeType": media_type, "fileUri": uri } })
+            }
+            Some(media::Resolved::Placeholder(t)) => json!({ "text": t }),
+            None => json!({ "text": block.as_text_or_placeholder() }),
+        }
+    } else {
+        json!({ "text": block.as_text_or_placeholder() })
     }
 }
 
@@ -291,12 +497,13 @@ fn build_request(
     token: &str,
     project_id: &str,
     opts: &RequestOptions,
+    resolved: &media::ResolvedMap,
 ) -> reqwest::RequestBuilder {
     if variant == GeminiVariant::ApiKey {
-        return build_api_key_request(token, opts);
+        return build_api_key_request(token, opts, resolved);
     }
 
-    let body = build_cloud_body(variant, project_id, opts);
+    let body = build_cloud_body(variant, project_id, opts, resolved);
     let endpoint = match variant {
         GeminiVariant::Antigravity => gemini_auth::ANTIGRAVITY_DAILY_ENDPOINT,
         GeminiVariant::Cli => gemini_auth::GEMINI_CLI_ENDPOINT,
@@ -328,13 +535,13 @@ fn build_request(
 }
 
 /// Build request for the public Gemini API (API key auth, no Cloud Code Assist wrapper).
-fn build_api_key_request(api_key: &str, opts: &RequestOptions) -> reqwest::RequestBuilder {
+fn build_api_key_request(api_key: &str, opts: &RequestOptions, resolved: &media::ResolvedMap) -> reqwest::RequestBuilder {
     let url = format!(
         "https://generativelanguage.googleapis.com/v1beta/models/{}:streamGenerateContent?alt=sse&key={}",
         opts.model.id, api_key,
     );
 
-    let body = build_api_key_body(opts);
+    let body = build_api_key_body(opts, resolved);
 
     tracing::trace!("Gemini API key request to model [{}]", opts.model.id);
 
@@ -347,8 +554,8 @@ fn build_api_key_request(api_key: &str, opts: &RequestOptions) -> reqwest::Reque
 
 /// Body for the public Gemini API -- a direct GenerateContentRequest
 /// (no project/model/request envelope like Cloud Code Assist).
-fn build_api_key_body(opts: &RequestOptions) -> Value {
-    let contents = build_contents(&opts.messages, &opts.model.id);
+fn build_api_key_body(opts: &RequestOptions, resolved: &media::ResolvedMap) -> Value {
+    let contents = build_contents(&opts.messages, &opts.model.id, resolved);
 
     let max_tokens = opts.max_tokens
         .unwrap_or_else(|| (opts.model.max_tokens / 3).max(4096));
@@ -389,8 +596,8 @@ fn build_api_key_body(opts: &RequestOptions) -> Value {
     body
 }
 
-fn build_cloud_body(variant: GeminiVariant, project_id: &str, opts: &RequestOptions) -> Value {
-    let contents = build_contents(&opts.messages, &opts.model.id);
+fn build_cloud_body(variant: GeminiVariant, project_id: &str, opts: &RequestOptions, resolved: &media::ResolvedMap) -> Value {
+    let contents = build_contents(&opts.messages, &opts.model.id, resolved);
 
     let max_tokens = opts.max_tokens
         .unwrap_or_else(|| (opts.model.max_tokens / 3).max(4096));
@@ -460,7 +667,7 @@ fn build_cloud_body(variant: GeminiVariant, project_id: &str, opts: &RequestOpti
 
 // -- Message conversion --
 
-fn build_contents(messages: &[Message], model_id: &str) -> Vec<Value> {
+fn build_contents(messages: &[Message], model_id: &str, resolved: &media::ResolvedMap) -> Vec<Value> {
     let gemini3 = is_gemini3(model_id);
 
     // Only emit structured tool protocol for complete call+result pairs.
@@ -489,11 +696,20 @@ fn build_contents(messages: &[Message], model_id: &str) -> Vec<Value> {
         let has_tool_results = filtered_content.iter().any(|c| matches!(c, ContentBlock::ToolResult { .. }));
 
         if has_tool_results {
-            let parts: Vec<Value> = filtered_content.iter().filter_map(|c| {
+            // functionResponse parts first; any media carried *inside* a tool
+            // result is hoisted to sibling parts of the SAME user Content
+            // (Gemini text-only tool results can't hold bytes, and a second
+            // consecutive user Content would 400 on role alternation).
+            let mut parts: Vec<Value> = Vec::new();
+            let mut hoisted: Vec<Value> = Vec::new();
+            for c in &filtered_content {
                 if let ContentBlock::ToolResult { tool_use_id, content, is_error, .. } = c {
                     if !complete.contains(tool_use_id.as_str()) {
                         // Orphaned result -- downgrade to text.
-                        return c.tool_as_text().map(|t| json!({ "text": t }));
+                        if let Some(t) = c.tool_as_text() {
+                            parts.push(json!({ "text": t }));
+                        }
+                        continue;
                     }
                     let tool_name = tool_names.get(tool_use_id.as_str())
                         .cloned()
@@ -501,21 +717,38 @@ fn build_contents(messages: &[Message], model_id: &str) -> Vec<Value> {
                             tracing::warn!("No tool name found for tool_use_id [{}]", tool_use_id);
                             "unknown".to_string()
                         });
-                    let output_text: String = content.iter().filter_map(|b| {
-                        if let ContentBlock::Text { text, .. } = b { Some(text.as_str()) } else { None }
-                    }).collect::<Vec<_>>().join("\n");
+                    // Use as_text_or_placeholder so a Blob yields descriptive
+                    // text in the functionResponse, not an empty string.
+                    let output_text: String = content.iter()
+                        .map(|b| b.as_text_or_placeholder())
+                        .collect::<Vec<_>>()
+                        .join("\n");
                     let response = if *is_error {
                         json!({ "error": output_text })
                     } else {
                         json!({ "output": output_text })
                     };
-                    Some(json!({
+                    parts.push(json!({
                         "functionResponse": { "name": tool_name, "response": response }
-                    }))
-                } else {
-                    None
+                    }));
+                    // Hoist any injectable inner blob to a sibling media part.
+                    for b in content {
+                        if let ContentBlock::Blob { hash, .. } = b {
+                            match resolved.get(hash) {
+                                Some(media::Resolved::Inline { media_type, b64 }) => {
+                                    hoisted.push(json!({ "inlineData": { "mimeType": media_type, "data": b64 } }));
+                                }
+                                Some(media::Resolved::FileUri { media_type, uri }) => {
+                                    hoisted.push(json!({ "fileData": { "mimeType": media_type, "fileUri": uri } }));
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
                 }
-            }).collect();
+            }
+            // Media after functionResponses, all within one Content.
+            parts.extend(hoisted);
 
             let should_merge = contents.last()
                 .and_then(|c| c["role"].as_str())
@@ -587,8 +820,8 @@ fn build_contents(messages: &[Message], model_id: &str) -> Vec<Value> {
                     }
                 }
                 ContentBlock::ToolResult { .. } => {}
-                ContentBlock::Image { media_type, data, .. } => {
-                    parts.push(json!({ "inlineData": { "mimeType": media_type, "data": data } }));
+                ContentBlock::Blob { .. } => {
+                    parts.push(resolved_part(resolved, block));
                 }
                 ContentBlock::Error { .. } => {}
                 ContentBlock::Unknown(_) => {}

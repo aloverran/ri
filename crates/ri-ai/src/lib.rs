@@ -2,6 +2,7 @@ pub mod sse;
 pub mod creds;
 pub mod anthropic;
 pub mod gemini;
+pub mod media;
 mod gemini_auth;
 pub mod openai_codex;
 pub mod registry;
