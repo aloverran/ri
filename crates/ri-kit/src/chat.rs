@@ -43,18 +43,68 @@ impl Facet for ChatFacet {
     const KEY: &'static str = "chat";
 }
 
-/// Create a new chat session: write an empty root context and a ref
-/// carrying the given `ChatFacet`, both into the given store's mount.
-/// Returns the ref.
+/// Create a new chat session with a caller-chosen ref id: write an empty
+/// root context and a ref carrying the given `ChatFacet`, both into the
+/// given store. Returns the ref.
+///
+/// The id is taken as a parameter (rather than minted internally) so the
+/// caller can name the storage segment after it *before* writing -- e.g.
+/// a per-family file named after the root session id. `create_with_id`
+/// itself attaches no storage policy: it writes to whatever store it is
+/// handed, keeping the family/segment decision out of ri-kit.
+pub fn create_with_id(store: &Store, id: RefId, facet: ChatFacet) -> eyre::Result<Ref> {
+    let root = Context::new(Vec::new(), Vec::new(), None);
+    store.write_context(&root)?;
+    let r = Ref::with_id(id, root.id.clone()).with_facet(&facet)?;
+    store.write_ref(&r)?;
+    Ok(r)
+}
+
+/// Create a new chat session with a freshly minted ref id. Convenience
+/// over [`create_with_id`] for callers that don't need the id up front.
 ///
 /// This is the one common multi-write operation that chat applications
 /// need; written here to keep call sites declarative.
 pub fn create(store: &Store, facet: ChatFacet) -> eyre::Result<Ref> {
-    let root = Context::new(Vec::new(), Vec::new(), None);
-    store.write_context(&root)?;
-    let r = Ref::new(root.id.clone(), None).with_facet(&facet)?;
-    store.write_ref(&r)?;
-    Ok(r)
+    create_with_id(store, RefId::generate(), facet)
+}
+
+/// Resolve the family a ref belongs to: walk its `ChatFacet.parent` chain
+/// up to the root and return the root's id. A session family -- a root
+/// chat plus everything transitively spawned under it -- is stored in one
+/// file named by this id, so a write site that lacks the live parent's
+/// store (a cold branch/rewind, say) calls this to find the file to
+/// append to.
+///
+/// The walk is cycle-guarded and stops at the first ref that is unloaded
+/// or has no chat-parent. Every parent we create points at a chat ref in
+/// the same mount, so the returned id names a file in that mount; the
+/// guard only keeps a malformed chain from looping.
+pub fn family_segment(pool: &Pool, start: &RefId) -> RefId {
+    let mut current = start.clone();
+    let mut seen = std::collections::HashSet::new();
+    while seen.insert(current.clone()) {
+        let Some(r) = pool.get_ref(&current) else { break };
+        let Some(parent) = read_facet(&r).and_then(|f| f.parent) else { break };
+        current = parent;
+    }
+    current
+}
+
+/// The store a chat ref's family writes through: `store` rebound to the
+/// family's segment (the root ancestor's id). This is the single place the
+/// "a session family is one file named by its root" policy lives, so every
+/// write site -- create, resume, branch, sub-agent, compose -- routes the
+/// same way. Centralizing it is the point: the wrong store and the right
+/// store are the same type, so an open-coded mistake would compile and only
+/// surface as a post-restart data-scatter bug; one helper makes that
+/// unrepresentable.
+///
+/// `anchor` is any member of the family (the ref being written, or its
+/// parent for a not-yet-written child). A freshly minted root id that isn't
+/// in the pool yet resolves to itself, so this works for creation too.
+pub fn family_store(store: &Store, anchor: &RefId) -> eyre::Result<Store> {
+    store.segment(family_segment(store.pool(), anchor).as_str())
 }
 
 /// Resolve the ref's head to the list of messages in its head context.
@@ -163,4 +213,5 @@ mod tests {
     fn chat_facet_key_matches_legacy_loader() {
         assert_eq!(ChatFacet::KEY, "chat");
     }
+
 }

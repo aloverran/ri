@@ -458,6 +458,13 @@ impl Ref {
         Self { id: RefId::generate(), head, meta }
     }
 
+    /// Build a ref with a caller-chosen id rather than a minted one. Used
+    /// when the id must be known before the ref is written -- e.g. naming
+    /// a storage segment after it.
+    pub fn with_id(id: RefId, head: ContextId) -> Self {
+        Self { id, head, meta: None }
+    }
+
     /// Swap the head pointer, keeping id and meta unchanged. Useful in
     /// read-modify-write update flows: `store.get_ref(&id)?.with_head(ctx)`.
     pub fn with_head(mut self, head: ContextId) -> Self {

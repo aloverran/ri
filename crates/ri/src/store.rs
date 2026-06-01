@@ -5,35 +5,38 @@
 //! context, and ref currently loaded, backed by one or more filesystem
 //! directories. Reads are always global across the pool: messages,
 //! contexts, and refs are all global atoms with no notion of "which
-//! mount they belong to".
+//! mount or file they belong to".
 //!
-//! `Store` is a write handle bound to one mount. Every write a store
-//! performs goes to its mount's `store.jsonl`; reads delegate to the
-//! pool, so they remain global. A subsystem (chat, bank, ...) receives
-//! a `Store` and treats it as an opaque DB handle.
+//! `Store` is a write handle bound to one mount *and one segment*. A
+//! `Segment` is a relative path within the mount -- a write goes to
+//! `<mount>/<segment>.jsonl`. The default segment is `store`, so a plain
+//! mount writes to `<mount>/store.jsonl` exactly as before. Rebinding to
+//! another segment (`store.segment("ref_2604_ab")`) targets a different
+//! file in the same mount; reads still resolve globally through the pool.
 //!
-//! On disk, each mount owns one directory. New writes always go to
-//! `<mount>/store.jsonl`. Legacy per-session `<slug>.jsonl` files load
-//! correctly and are superseded in place by later writes.
+//! Core attaches no meaning to the segment string. Applications choose
+//! the layout: chat keeps a flat file per session family (segment = the
+//! root ref id), while banks nest a folder per bank (segment =
+//! `<bank>/<unit>`). Because the segment can contain `/`, one mount holds
+//! both flat files and folder trees, and deleting a tree is a plain `rm`.
 //!
-//! Refs are mutable: every write appends a full snapshot line carrying
-//! a wall-clock `ts`. The loader keeps the highest-ts line per RefId,
+//! On disk, the loader walks the whole mount directory recursively and
+//! ingests every `*.jsonl` it finds, at any depth. Each mount serializes
+//! appends per file: two writers to the same segment can't interleave
+//! lines, but writers to different segments proceed in parallel.
+//!
+//! Refs are mutable: every write appends a full snapshot line carrying a
+//! wall-clock `ts`. The loader keeps the highest-ts line per RefId,
 //! independent of file load order or mount layout. Cross-process,
 //! cross-mount, and post-rename writes all converge deterministically.
 //!
 //! ```text
 //! pool = Pool::new();
-//! sessions = pool.mount("~/.ri/sessions")?;  // Store bound to this mount
-//! banks    = pool.mount("~/.ri/banks")?;     // another Store, same pool
+//! sessions = pool.mount("~/.ri/sessions")?;  // Store on the default segment
+//! family   = sessions.segment("ref_2604_ab")?; // a per-family file
 //!
 //! let msg = Message::new(Role::User, content, None);
-//! sessions.write_message(&msg)?;             // goes to sessions/store.jsonl
-//!
-//! let ctx = Context::new(vec![msg.id.clone()], vec![], None);
-//! sessions.write_context(&ctx)?;
-//!
-//! let r = Ref::new(ctx.id.clone(), None);
-//! sessions.write_ref(&r)?;
+//! family.write_message(&msg)?;               // -> sessions/ref_2604_ab.jsonl
 //!
 //! pool.get_message(&msg.id);                 // resolves globally
 //! pool.refs();                               // every ref, every mount
@@ -59,10 +62,10 @@ use crate::model::{
 /// `Arc`); clones are handles, not copies.
 ///
 /// All three atoms (messages, contexts, refs) live globally in the pool
-/// and resolve regardless of which mount physically holds them. The pool
-/// also tracks the wall-clock timestamp of each ref's most recently
-/// loaded line so cross-mount and cross-process writes converge to the
-/// freshest snapshot.
+/// and resolve regardless of which mount or file physically holds them.
+/// The pool also tracks the wall-clock timestamp of each ref's most
+/// recently loaded line so cross-mount and cross-process writes converge
+/// to the freshest snapshot.
 #[derive(Clone)]
 pub struct Pool {
     inner: Arc<Mutex<PoolInner>>,
@@ -76,7 +79,7 @@ struct PoolInner {
     /// Used to discard older snapshots when the same RefId appears in
     /// multiple files or mounts.
     ref_ts: HashMap<RefId, DateTime<Utc>>,
-    /// Mount directory plus per-mount write lock.
+    /// Mount directory plus its per-file write locks.
     mounts: HashMap<MountId, Mount>,
     next_mount: u64,
 }
@@ -89,10 +92,11 @@ pub struct MountId(u64);
 
 struct Mount {
     dir: PathBuf,
-    /// Serializes appends to this mount's `store.jsonl` so lines from
-    /// concurrent writers don't interleave. Held only during
-    /// serialize + write + flush.
-    write_lock: Arc<Mutex<()>>,
+    /// One append lock per segment, created lazily on first write. Holds
+    /// only during serialize + write + flush. Two stores targeting the
+    /// same segment share the lock (lines never interleave); stores on
+    /// different segments hold different locks and write concurrently.
+    locks: Mutex<HashMap<Segment, Arc<Mutex<()>>>>,
 }
 
 impl Pool {
@@ -109,18 +113,17 @@ impl Pool {
         }
     }
 
-    /// Attach a directory to the pool. Loads every `*.jsonl` file under
-    /// the path into the shared DAG and returns a write-scoped `Store`
-    /// bound to the new mount.
+    /// Attach a directory to the pool. Recursively loads every `*.jsonl`
+    /// file under the path into the shared DAG and returns a write-scoped
+    /// `Store` bound to the new mount's default segment (`store.jsonl`).
     ///
     /// File load order doesn't matter for correctness: every ref line
-    /// carries a `ts` and the loader keeps the newest. The legacy-first
-    /// pass is purely so the info-line counts read sensibly.
+    /// carries a `ts` and the loader keeps the newest.
     ///
-    /// Mounting the same canonicalized directory twice is rejected:
-    /// it would create two write-locks against one file, silently breaking
-    /// append serialization. The error surfaces the misconfiguration
-    /// before any writes happen.
+    /// Mounting the same canonicalized directory twice is rejected: it
+    /// would create two independent lock tables against one set of files,
+    /// silently breaking append serialization. The error surfaces the
+    /// misconfiguration before any writes happen.
     pub fn mount(&self, path: impl AsRef<Path>) -> eyre::Result<Store> {
         let dir: PathBuf = path.as_ref().to_path_buf();
         fs::create_dir_all(&dir)?;
@@ -142,12 +145,12 @@ impl Pool {
             inner.next_mount += 1;
             inner.mounts.insert(id, Mount {
                 dir: dir.clone(),
-                write_lock: Arc::new(Mutex::new(())),
+                locks: Mutex::new(HashMap::new()),
             });
             id
         };
 
-        let store = Store { pool: self.clone(), mount: mount_id };
+        let store = Store { pool: self.clone(), mount: mount_id, segment: Segment::default() };
         store.load_mount(&dir)?;
         Ok(store)
     }
@@ -177,6 +180,20 @@ impl Pool {
     /// ...) to get the subset they care about.
     pub fn refs(&self) -> Vec<Ref> {
         self.inner.lock().unwrap().refs.values().cloned().collect()
+    }
+
+    /// Drop a ref from the in-memory pool. Deletion flows call this after
+    /// removing the backing file so the ref stops showing up in pool
+    /// queries (the session list, lineage walks) without a reload.
+    ///
+    /// Only the ref is evicted. Any messages and contexts it reached stay
+    /// in the pool until the next mount load -- they are immutable and now
+    /// unreferenced, so leaving them is harmless, and the pool keeps no
+    /// atom->file index to evict them precisely without one.
+    pub fn remove_ref(&self, id: &RefId) -> Option<Ref> {
+        let mut inner = self.inner.lock().unwrap();
+        inner.ref_ts.remove(id);
+        inner.refs.remove(id)
     }
 
     /// Resolve an ordered list of message IDs to their messages. Skips
@@ -211,11 +228,75 @@ impl Default for Pool {
     fn default() -> Self { Self::new() }
 }
 
+// -- Segment ------------------------------------------------------------
+
+/// Identifies which file within a mount a write targets: 1:1 with
+/// `<mount>/<segment>.jsonl`. The path may contain `/` to nest into
+/// subdirectories, so one mount can hold both flat per-family files and
+/// per-subsystem folder trees.
+///
+/// Core attaches no meaning to the path -- the application picks it (the
+/// root ref id of a session family, `<bank>/<unit>` for a memory bank,
+/// ...). `Segment::new` rejects any path that could escape the mount, so
+/// an illegal stem is a programming error surfaced at construction rather
+/// than a silent write outside the directory.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct Segment(Arc<str>);
+
+impl Segment {
+    /// Build a segment from a `/`-separated relative path. Each component
+    /// must be non-empty and not `.` or `..`, and may not contain a
+    /// backslash or NUL. This forbids absolute paths, parent-directory
+    /// escapes, and `//`, so the result always stays inside the mount.
+    pub fn new(path: impl AsRef<str>) -> eyre::Result<Self> {
+        let p = path.as_ref();
+        if p.is_empty() {
+            eyre::bail!("segment path is empty");
+        }
+        for comp in p.split('/') {
+            if comp.is_empty() {
+                eyre::bail!("segment {p:?} has an empty path component (leading, trailing, or doubled '/')");
+            }
+            if comp == "." || comp == ".." {
+                eyre::bail!("segment {p:?} contains a '.' or '..' component");
+            }
+            if comp.contains('\\') || comp.contains('\0') || comp.contains(':') {
+                eyre::bail!("segment {p:?} contains an illegal character (backslash, colon, or NUL)");
+            }
+        }
+        Ok(Segment(Arc::from(p)))
+    }
+
+    /// Resolve to the absolute `<dir>/<path>.jsonl` file. The `.jsonl`
+    /// extension lands on the final component; intermediate components
+    /// become subdirectories.
+    fn file_path(&self, dir: &Path) -> PathBuf {
+        let mut path = dir.to_path_buf();
+        let mut comps = self.0.split('/').peekable();
+        while let Some(comp) = comps.next() {
+            if comps.peek().is_some() {
+                path.push(comp);
+            } else {
+                path.push(format!("{comp}.jsonl"));
+            }
+        }
+        path
+    }
+}
+
+/// The mount-wide catch-all (`store.jsonl`). A freshly mounted store
+/// writes here until rebound with `Store::segment`, which preserves the
+/// historical single-file behavior.
+impl Default for Segment {
+    fn default() -> Self { Segment(Arc::from("store")) }
+}
+
 // -- Store --------------------------------------------------------------
 
-/// A mount-scoped write handle on a pool. Writes append to this mount's
-/// `store.jsonl`; reads delegate to the pool, so they remain global.
-/// Cheap to clone (holds a pool clone + a mount id).
+/// A mount-and-segment-scoped write handle on a pool. Writes append to
+/// this segment's `.jsonl`; reads delegate to the pool, so they remain
+/// global. Cheap to clone (holds a pool clone, a mount id, and a shared
+/// segment string).
 ///
 /// Stores never expose mount ids or file paths to their callers. A
 /// subsystem receives a store and treats it as an opaque DB handle.
@@ -223,11 +304,12 @@ impl Default for Pool {
 pub struct Store {
     pool: Pool,
     mount: MountId,
+    segment: Segment,
 }
 
 impl Store {
-    /// Write a message. The atom is appended to the mount's file and
-    /// registered in the pool.
+    /// Write a message. The atom is appended to this store's segment file
+    /// and registered in the pool.
     pub fn write_message(&self, msg: &Message) -> eyre::Result<()> {
         let line = serde_json::to_string(&MessageLine {
             msg: msg.id.clone(),
@@ -237,7 +319,7 @@ impl Store {
         })?;
         self.append_line(&line)?;
         self.pool.inner.lock().unwrap().messages.insert(msg.id.clone(), msg.clone());
-        tracing::debug!("Wrote {:?} message [{}] to mount {:?}", msg.role, msg.id, self.mount);
+        tracing::debug!("Wrote {:?} message [{}] to mount {:?} segment [{}]", msg.role, msg.id, self.mount, self.segment.0);
         Ok(())
     }
 
@@ -252,8 +334,8 @@ impl Store {
         })?;
         self.append_line(&line)?;
         self.pool.inner.lock().unwrap().contexts.insert(ctx.id.clone(), ctx.clone());
-        tracing::debug!("Wrote context [{}] to mount {:?} ({} messages, {} parents)",
-            ctx.id, self.mount, ctx.messages.len(), ctx.parents.len());
+        tracing::debug!("Wrote context [{}] to mount {:?} segment [{}] ({} messages, {} parents)",
+            ctx.id, self.mount, self.segment.0, ctx.messages.len(), ctx.parents.len());
         Ok(())
     }
 
@@ -273,8 +355,42 @@ impl Store {
         let mut inner = self.pool.inner.lock().unwrap();
         inner.refs.insert(r.id.clone(), r.clone());
         inner.ref_ts.insert(r.id.clone(), ts);
-        tracing::debug!("Wrote ref [{}] -> [{}] to mount {:?}", r.id, r.head, self.mount);
+        tracing::debug!("Wrote ref [{}] -> [{}] to mount {:?} segment [{}]", r.id, r.head, self.mount, self.segment.0);
         Ok(())
+    }
+
+    /// A handle to a different file within the same mount and pool. The
+    /// returned store writes to `<mount>/<segment>.jsonl`; reads are
+    /// unchanged (always global through the pool). Cheap clone.
+    ///
+    /// Errors only if the segment path is malformed (could escape the
+    /// mount); see [`Segment::new`].
+    pub fn segment(&self, path: impl AsRef<str>) -> eyre::Result<Store> {
+        Ok(Store {
+            pool: self.pool.clone(),
+            mount: self.mount,
+            segment: Segment::new(path)?,
+        })
+    }
+
+    /// Delete this store's segment file from disk. Returns whether a file
+    /// was actually removed (a missing file is not an error -- deletion is
+    /// idempotent). Holds the segment's append lock during removal so a
+    /// concurrent write can't interleave with the delete.
+    ///
+    /// In-memory eviction is a separate concern: the pool keeps no
+    /// atom->file index, so the caller drops the relevant refs via
+    /// [`Pool::remove_ref`]. Lingering messages/contexts are immutable and
+    /// unreferenced once their refs are gone, so they're harmless until the
+    /// next mount load clears them.
+    pub fn delete_segment_file(&self) -> eyre::Result<bool> {
+        let (path, lock) = self.mount_target()?;
+        let _guard = lock.lock().unwrap();
+        match fs::remove_file(&path) {
+            Ok(()) => Ok(true),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(e.into()),
+        }
     }
 
     pub fn pool(&self) -> &Pool { &self.pool }
@@ -299,60 +415,52 @@ impl Store {
     fn append_line(&self, line: &str) -> eyre::Result<()> {
         let (path, lock) = self.mount_target()?;
         let _guard = lock.lock().unwrap();
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
         let mut file = OpenOptions::new().create(true).append(true).open(&path)?;
         writeln!(file, "{}", line)?;
         file.flush()?;
         Ok(())
     }
 
+    /// Resolve this store's `(file path, append lock)`. The lock is shared
+    /// across every store targeting the same `(mount, segment)` and is
+    /// created on first use. Neither the pool lock nor the lock-table lock
+    /// is held across file I/O.
     fn mount_target(&self) -> eyre::Result<(PathBuf, Arc<Mutex<()>>)> {
         let inner = self.pool.inner.lock().unwrap();
         let mount = inner.mounts.get(&self.mount)
             .ok_or_else(|| eyre::eyre!("mount {:?} missing from pool", self.mount))?;
-        Ok((mount.dir.join(STORE_FILE), mount.write_lock.clone()))
+        let path = self.segment.file_path(&mount.dir);
+        let lock = mount.locks.lock().unwrap()
+            .entry(self.segment.clone())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone();
+        Ok((path, lock))
     }
 
     fn load_mount(&self, dir: &Path) -> eyre::Result<()> {
         if !dir.exists() { return Ok(()); }
 
-        // Two passes: legacy first, then store.jsonl. The split is
-        // explicit (not relying on lex order) so renaming legacy files
-        // can never silently invert the supersession order.
-        let mut legacy: Vec<PathBuf> = Vec::new();
-        let mut canonical: Option<PathBuf> = None;
-        for entry in fs::read_dir(dir)? {
-            let path = match entry {
-                Ok(e) => e.path(),
-                Err(_) => continue,
-            };
-            if path.extension().is_some_and(|x| x == "jsonl") {
-                if path.file_name().is_some_and(|n| n == STORE_FILE) {
-                    canonical = Some(path);
-                } else {
-                    legacy.push(path);
-                }
-            }
-        }
-        legacy.sort();
+        // Gather every *.jsonl under the mount, at any depth, then load in
+        // a stable order. Order is irrelevant to correctness (refs carry a
+        // `ts` and supersede by recency); the sort just keeps log lines
+        // and any same-ts tie-breaks deterministic.
+        let mut files: Vec<PathBuf> = Vec::new();
+        collect_jsonl(dir, &mut files, 0);
+        files.sort();
 
-        let mut loaded_files = 0;
-        for path in &legacy {
+        for path in &files {
             if let Err(e) = self.load_file(path) {
                 tracing::warn!("Failed to load store file {}: {}", path.display(), e);
             }
-            loaded_files += 1;
-        }
-        if let Some(path) = &canonical {
-            if let Err(e) = self.load_file(path) {
-                tracing::warn!("Failed to load store file {}: {}", path.display(), e);
-            }
-            loaded_files += 1;
         }
 
         let inner = self.pool.inner.lock().unwrap();
         tracing::info!(
             "Mounted {} ({} files, {} messages, {} contexts, {} refs)",
-            dir.display(), loaded_files,
+            dir.display(), files.len(),
             inner.messages.len(), inner.contexts.len(), inner.refs.len(),
         );
         Ok(())
@@ -423,6 +531,36 @@ impl Store {
     }
 }
 
+/// Recursively gather every `*.jsonl` file under `dir` into `out`.
+///
+/// Directory symlinks are not followed: `DirEntry::file_type` reports the
+/// entry itself (not its target), so a symlinked directory reads as a
+/// symlink rather than a dir and is skipped -- the walk can't loop. A
+/// generous depth cap is a second guard against pathological trees.
+fn collect_jsonl(dir: &Path, out: &mut Vec<PathBuf>, depth: usize) {
+    const MAX_DEPTH: usize = 16;
+    if depth > MAX_DEPTH {
+        tracing::warn!("Stopping mount load at depth {} under {}", MAX_DEPTH, dir.display());
+        return;
+    }
+    let entries = match fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(e) => {
+            tracing::warn!("Failed to read dir {}: {}", dir.display(), e);
+            return;
+        }
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(ft) = entry.file_type() else { continue };
+        if ft.is_dir() {
+            collect_jsonl(&path, out, depth + 1);
+        } else if ft.is_file() && path.extension().is_some_and(|x| x == "jsonl") {
+            out.push(path);
+        }
+    }
+}
+
 /// Install a ref snapshot iff its `ts` is at least as new as anything
 /// we've already loaded for the same id. Equal-ts ties go to the
 /// later-arriving line so a same-second double-write still converges
@@ -456,8 +594,6 @@ fn parse_legacy_ts(s: Option<&str>) -> DateTime<Utc> {
 }
 
 // -- On-disk line formats -----------------------------------------------
-
-const STORE_FILE: &str = "store.jsonl";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct MessageLine {
@@ -569,8 +705,8 @@ mod tests {
             ts: Utc.with_ymd_and_hms(2026, 4, 1, 0, 0, 0).unwrap(),
             meta: None,
         }).unwrap();
-        std::fs::write(dir_a.join(STORE_FILE), format!("{}\n", line_old)).unwrap();
-        std::fs::write(dir_b.join(STORE_FILE), format!("{}\n", line_new)).unwrap();
+        std::fs::write(dir_a.join("store.jsonl"), format!("{}\n", line_old)).unwrap();
+        std::fs::write(dir_b.join("store.jsonl"), format!("{}\n", line_new)).unwrap();
 
         // Mount A first, then B. Newer line wins.
         let pool = Pool::new();
