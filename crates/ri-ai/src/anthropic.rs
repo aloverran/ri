@@ -293,6 +293,7 @@ impl LlmProvider for AnthropicProvider {
     async fn stream(&self, mut opts: RequestOptions) -> Result<EventStream, ApiError> {
         let (api_key, is_oauth) = self.ensure_valid_token().await
             .map_err(|e| ApiError::other(format!("{e:#}")))?;
+        let auth = if is_oauth { Auth::Oauth } else { Auth::ApiKey };
 
         // Strip the -1m suffix (ri-internal) before sending to the API.
         let extended_context = opts.model.id.ends_with("-1m");
@@ -301,7 +302,7 @@ impl LlmProvider for AnthropicProvider {
         }
 
         let resolved = resolve_blobs(&opts).await;
-        let request = build_request(&api_key, &opts, extended_context, &resolved);
+        let request = build_request(&api_key, auth, &opts, extended_context, &resolved);
         let bytes = sse::send(request).await?;
         let state = AnthropicState::new(is_oauth, opts.tools.to_vec());
         Ok(Box::pin(sse::drive_sse_stream(bytes, state)))
@@ -433,42 +434,133 @@ fn from_claude_code_name(name: &str, original_tools: &[ToolSchema]) -> String {
 
 // -- Request building --
 
-fn build_request(api_key: &str, opts: &RequestOptions, extended_context: bool, resolved: &media::ResolvedMap) -> reqwest::RequestBuilder {
-    let is_oauth = api_key.starts_with("sk-ant-oat");
-    let body = build_body(opts, is_oauth, resolved);
+fn build_request(api_key: &str, auth: Auth, opts: &RequestOptions, extended_context: bool, resolved: &media::ResolvedMap) -> reqwest::RequestBuilder {
+    let body = build_body(opts, auth, resolved);
     let url = "https://api.anthropic.com/v1/messages";
 
+    let beta_header = assemble_betas(&opts.model.id, auth, extended_context).join(",");
+    tracing::debug!(model = %opts.model.id, betas = %beta_header, "Anthropic request betas");
     tracing::trace!(url, %body, "Anthropic API request");
 
-    let mut builder = reqwest::Client::new()
+    let builder = reqwest::Client::new()
         .post(url)
         .header("anthropic-version", "2023-06-01")
         .header("content-type", "application/json")
-        .header("accept", "text/event-stream");
+        .header("accept", "text/event-stream")
+        .header("anthropic-beta", beta_header);
 
-    let context_1m_beta = if extended_context { ",context-1m-2025-08-07" } else { "" };
-
-    if is_oauth {
-        builder = builder
-            .header("authorization", format!("Bearer {}", api_key))
-            .header("anthropic-beta", format!(
-                "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,fine-grained-tool-streaming-2025-05-14{context_1m_beta}"
-            ))
+    match auth {
+        Auth::Oauth => builder
+            .header("authorization", format!("Bearer {api_key}"))
             .header("anthropic-dangerous-direct-browser-access", "true")
-            .header("user-agent", "claude-cli/2.1.2 (external, cli)")
-            .header("x-app", "cli");
-    } else {
-        builder = builder
+            .header("user-agent", CLAUDE_CODE_USER_AGENT)
+            .header("x-app", "cli")
+            .body(body.to_string()),
+        Auth::ApiKey => builder
             .header("x-api-key", api_key)
-            .header("anthropic-beta", format!(
-                "interleaved-thinking-2025-05-14,fine-grained-tool-streaming-2025-05-14{context_1m_beta}"
-            ));
+            .header("user-agent", RI_USER_AGENT)
+            .body(body.to_string()),
     }
-
-    builder.body(body.to_string())
 }
 
-fn build_body(opts: &RequestOptions, is_oauth: bool, resolved: &media::ResolvedMap) -> Value {
+/// Which credential a request authenticates with. The OAuth path impersonates
+/// Claude Code -- it carries the `claude-code`/`oauth` betas, the "You are
+/// Claude Code" system prefix, and Claude Code tool names -- so the generation
+/// we present must line up with the beta envelope we send. The api-key path is
+/// a plain first-party client and skips all of that.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Auth {
+    ApiKey,
+    Oauth,
+}
+
+/// User-Agent presented when impersonating Claude Code over OAuth. Pinned to
+/// the Claude Code release whose beta envelope `assemble_betas` mirrors; bump
+/// the two together so the version and the betas stay one coherent contract.
+const CLAUDE_CODE_USER_AGENT: &str = "claude-cli/2.1.159 (external, cli)";
+
+/// User-Agent for direct api-key requests; ri has no reason to hide here.
+const RI_USER_AGENT: &str = concat!("ri/", env!("CARGO_PKG_VERSION"));
+
+// The `anthropic-beta` opt-ins ri knows about: each value is the literal token
+// Anthropic parses, the const name is its meaning. Claude Code keeps a 26-entry
+// registry, but most of those gate on a backend (bedrock/vertex/foundry) or an
+// org feature-flag that ri does not have -- ri only ever talks to the
+// first-party API -- so modelling them here would be machinery with nothing
+// behind it. We carry exactly the ones a first-party request can earn.
+const CLAUDE_CODE: &str = "claude-code-20250219";
+const OAUTH_AUTH: &str = "oauth-2025-04-20";
+const LONG_CONTEXT: &str = "context-1m-2025-08-07";
+const INTERLEAVED_THINKING: &str = "interleaved-thinking-2025-05-14";
+const PROMPT_CACHING_SCOPE: &str = "prompt-caching-scope-2026-01-05";
+const MID_CONVERSATION_SYSTEM: &str = "mid-conversation-system-2026-04-07";
+
+/// Assemble the `anthropic-beta` opt-ins for one request, mirroring the slice
+/// of Claude Code's per-request assembler (`KO6`) that actually applies to ri:
+/// first-party transport only, gated by model id and credential. The push
+/// order follows Claude Code so a wire diff against the real client stays
+/// small. `model_id` is canonical (the `-1m` suffix is stripped upstream);
+/// `extended_context` carries the 1M-context opt-in for those variants.
+fn assemble_betas(model_id: &str, auth: Auth, extended_context: bool) -> Vec<String> {
+    let mut betas: Vec<String> = Vec::new();
+
+    // `claude-code` tags agentic-coding traffic; Claude Code omits it for Haiku
+    // (`!isHaiku`). ri sends it only while impersonating Claude Code (OAuth),
+    // paired with the "You are Claude Code" system prefix build_body adds on
+    // that same path.
+    if auth == Auth::Oauth && !model_id.contains("haiku") {
+        betas.push(CLAUDE_CODE.into());
+    }
+    if auth == Auth::Oauth {
+        betas.push(OAUTH_AUTH.into());
+    }
+    if extended_context {
+        betas.push(LONG_CONTEXT.into());
+    }
+    // Interleaved thinking: Claude Code's `tf$` on a first-party backend (ri is
+    // always first-party) reduces to "every model except the claude-3 family" --
+    // Haiku 4.5 included, verified against the live API. The `claude-haiku-4-5`
+    // carve-out in `tf$` only fires on non-first-party backends (bedrock, vertex,
+    // gateway), which ri never touches. Behind Claude Code's own kill-switch so a
+    // runaway turn can be reined in without a rebuild.
+    if !model_id.contains("claude-3-") && !env_flag("DISABLE_INTERLEAVED_THINKING") {
+        betas.push(INTERLEAVED_THINKING.into());
+    }
+    // Claude Code sends this on every first-party request, and ri is always
+    // first-party. ri's body-root cache_control is honored without it, but it
+    // keeps the envelope aligned with the client we impersonate.
+    betas.push(PROMPT_CACHING_SCOPE.into());
+    // Opus 4.8 is the only current model Claude Code opts into mid-stream system
+    // blocks for. ri hoists all system content to the top of the request rather
+    // than weaving it in, so this is inert today -- but it mirrors the envelope
+    // opus-4-8 was aligned with, and would switch on for free the day ri starts
+    // weaving system blocks into the message stream.
+    if model_id.contains("opus-4-8") {
+        betas.push(MID_CONVERSATION_SYSTEM.into());
+    }
+    // Manual escape hatch, appended verbatim (no dedup, matching Claude Code's
+    // ANTHROPIC_BETAS).
+    if let Ok(extra) = std::env::var("ANTHROPIC_BETAS") {
+        betas.extend(extra.split(',').map(str::trim).filter(|s| !s.is_empty()).map(String::from));
+    }
+    betas
+}
+
+/// Whether an env kill-switch is set to a meaningful "on" value. Empty, `0`, and
+/// `false` (any case) all read as off, so an accidental bare `VAR=` does not
+/// silently flip behavior.
+fn env_flag(key: &str) -> bool {
+    std::env::var(key)
+        .map(|v| {
+            let v = v.trim();
+            !v.is_empty() && v != "0" && !v.eq_ignore_ascii_case("false")
+        })
+        .unwrap_or(false)
+}
+
+fn build_body(opts: &RequestOptions, auth: Auth, resolved: &media::ResolvedMap) -> Value {
+    let oauth = auth == Auth::Oauth;
+
     // Only emit structured tool protocol for complete call+result pairs.
     // Orphaned tool blocks from cross-provider contexts are filtered out.
     let complete = ri::complete_tool_pairs(&opts.messages);
@@ -489,7 +581,7 @@ fn build_body(opts: &RequestOptions, is_oauth: bool, resolved: &media::ResolvedM
         "cache_control": { "type": "ephemeral" },
     });
 
-    if is_oauth {
+    if oauth {
         let mut system_blocks = vec![
             json!({ "type": "text", "text": "You are Claude Code, Anthropic's official CLI for Claude." }),
         ];
@@ -503,7 +595,7 @@ fn build_body(opts: &RequestOptions, is_oauth: bool, resolved: &media::ResolvedM
 
     if !opts.tools.is_empty() {
         let tools: Vec<Value> = opts.tools.iter().map(|t| {
-            let name = if is_oauth { to_claude_code_name(&t.name) } else { t.name.clone() };
+            let name = if oauth { to_claude_code_name(&t.name) } else { t.name.clone() };
             json!({
                 "name": name,
                 "description": t.description,
@@ -534,16 +626,14 @@ enum ThinkingMode {
 }
 
 fn thinking_mode(model_id: &str) -> ThinkingMode {
-    // `-1m` suffix is stripped upstream, so we see canonical ids only.
-    // New Anthropic models must be added here; anything unknown defaults
-    // to budget mode, which the older reasoning models require.
-    match model_id {
-        "claude-opus-4-6"
-        | "claude-opus-4-7"
-        | "claude-opus-4-8"
-        | "claude-sonnet-4-6" => ThinkingMode::Adaptive,
-        _ => ThinkingMode::Budget,
-    }
+    // Claude Code's `gH8`: the hybrid-reasoning generation takes adaptive
+    // thinking; everything older requires a hard `budget_tokens` ceiling.
+    // Substring matching so a dated id (`claude-opus-4-8-2026...`) classifies the
+    // same as its canonical form, and anything unknown stays on budget.
+    let adaptive = ["opus-4-6", "opus-4-7", "opus-4-8", "sonnet-4-6"]
+        .iter()
+        .any(|family| model_id.contains(family));
+    if adaptive { ThinkingMode::Adaptive } else { ThinkingMode::Budget }
 }
 
 fn apply_thinking(body: &mut Value, level: ThinkingLevel, mode: ThinkingMode) {
@@ -579,7 +669,11 @@ fn convert_message(msg: &Message, complete: &std::collections::HashSet<&str>, re
     let role = match msg.role {
         Role::User => "user",
         Role::Assistant => "assistant",
-        Role::System => "user",
+        // build_body hoists every Role::System into the top-level `system` field
+        // and filters it out before this map, so reaching here means that
+        // contract broke upstream. Surface it loudly rather than silently
+        // demoting a system message to a user turn (the original bug here).
+        Role::System => unreachable!("Role::System is hoisted into the top-level system field by build_body and filtered before convert_message"),
     };
 
     // Convert blocks, downgrading orphaned tool blocks to text.
