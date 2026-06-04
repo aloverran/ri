@@ -7,7 +7,7 @@
 //
 // OAuth credential management and project discovery are in gemini_auth.rs.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use async_trait::async_trait;
 use serde_json::{json, Value};
 use tokio::sync::Mutex;
@@ -670,8 +670,25 @@ fn build_cloud_body(variant: GeminiVariant, project_id: &str, opts: &RequestOpti
 fn build_contents(messages: &[Message], model_id: &str, resolved: &media::ResolvedMap) -> Vec<Value> {
     let gemini3 = is_gemini3(model_id);
 
-    // Only emit structured tool protocol for complete call+result pairs.
+    // The set of tool calls we replay as native Gemini protocol (functionCall +
+    // functionResponse). A pair qualifies only when both halves are present and,
+    // on Gemini 3 (which validates `thoughtSignature`), the call carries a valid
+    // one. A call produced by another model never has a Gemini signature, so on
+    // Gemini 3 it -- and its result -- fall to the read-only text path; Gemini 2.5
+    // imposes no signature requirement and keeps replaying its own calls natively.
+    // One set governs both the call and the result so they never disagree --
+    // otherwise the model is handed a functionResponse for a call it never sees.
     let complete = ri::complete_tool_pairs(messages);
+    let native: HashSet<&str> = messages.iter()
+        .flat_map(|m| &m.content)
+        .filter_map(|b| match b {
+            ContentBlock::ToolUse { id, sig, .. }
+                if complete.contains(id.as_str())
+                    && (!gemini3 || sig.as_deref().filter(|s| is_valid_signature(s)).is_some()) =>
+                Some(id.as_str()),
+            _ => None,
+        })
+        .collect();
 
     let mut tool_names: HashMap<String, String> = HashMap::new();
     for msg in messages {
@@ -696,41 +713,40 @@ fn build_contents(messages: &[Message], model_id: &str, resolved: &media::Resolv
         let has_tool_results = filtered_content.iter().any(|c| matches!(c, ContentBlock::ToolResult { .. }));
 
         if has_tool_results {
-            // functionResponse parts first; any media carried *inside* a tool
-            // result is hoisted to sibling parts of the SAME user Content
-            // (Gemini text-only tool results can't hold bytes, and a second
-            // consecutive user Content would 400 on role alternation).
+            // A tool-result message becomes one user Content. Each result is a
+            // native functionResponse when its call is being replayed natively,
+            // otherwise read-only text -- emitting a functionResponse whose
+            // functionCall was demoted hands the model a result for a call it never
+            // made. Media carried inside a result is hoisted to sibling parts either
+            // way, so bytes are never lost on downgrade.
             let mut parts: Vec<Value> = Vec::new();
             let mut hoisted: Vec<Value> = Vec::new();
             for c in &filtered_content {
                 if let ContentBlock::ToolResult { tool_use_id, content, is_error, .. } = c {
-                    if !complete.contains(tool_use_id.as_str()) {
-                        // Orphaned result -- downgrade to text.
-                        if let Some(t) = c.tool_as_text() {
-                            parts.push(json!({ "text": t }));
-                        }
-                        continue;
+                    if native.contains(tool_use_id.as_str()) {
+                        let tool_name = tool_names.get(tool_use_id.as_str())
+                            .cloned()
+                            .unwrap_or_else(|| {
+                                tracing::warn!("No tool name found for tool_use_id [{}]", tool_use_id);
+                                "unknown".to_string()
+                            });
+                        // as_text_or_placeholder so a Blob yields descriptive text
+                        // in the functionResponse, not an empty string.
+                        let output_text: String = content.iter()
+                            .map(|b| b.as_text_or_placeholder())
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        let response = if *is_error {
+                            json!({ "error": output_text })
+                        } else {
+                            json!({ "output": output_text })
+                        };
+                        parts.push(json!({
+                            "functionResponse": { "name": tool_name, "response": response }
+                        }));
+                    } else if let Some(t) = c.tool_as_text() {
+                        parts.push(json!({ "text": t }));
                     }
-                    let tool_name = tool_names.get(tool_use_id.as_str())
-                        .cloned()
-                        .unwrap_or_else(|| {
-                            tracing::warn!("No tool name found for tool_use_id [{}]", tool_use_id);
-                            "unknown".to_string()
-                        });
-                    // Use as_text_or_placeholder so a Blob yields descriptive
-                    // text in the functionResponse, not an empty string.
-                    let output_text: String = content.iter()
-                        .map(|b| b.as_text_or_placeholder())
-                        .collect::<Vec<_>>()
-                        .join("\n");
-                    let response = if *is_error {
-                        json!({ "error": output_text })
-                    } else {
-                        json!({ "output": output_text })
-                    };
-                    parts.push(json!({
-                        "functionResponse": { "name": tool_name, "response": response }
-                    }));
                     // Hoist any injectable inner blob to a sibling media part.
                     for b in content {
                         if let ContentBlock::Blob { hash, .. } = b {
@@ -747,27 +763,9 @@ fn build_contents(messages: &[Message], model_id: &str, resolved: &media::Resolv
                     }
                 }
             }
-            // Media after functionResponses, all within one Content.
+            // Media after the responses, all within the one Content.
             parts.extend(hoisted);
-
-            let should_merge = contents.last()
-                .and_then(|c| c["role"].as_str())
-                .map(|r| r == "user")
-                .unwrap_or(false)
-                && contents.last()
-                    .and_then(|c| c["parts"].as_array())
-                    .map(|p| p.iter().any(|part| part.get("functionResponse").is_some()))
-                    .unwrap_or(false);
-
-            if should_merge {
-                if let Some(last) = contents.last_mut() {
-                    if let Some(arr) = last["parts"].as_array_mut() {
-                        arr.extend(parts);
-                    }
-                }
-            } else {
-                contents.push(json!({ "role": "user", "parts": parts }));
-            }
+            push_parts(&mut contents, "user", parts);
             continue;
         }
 
@@ -777,7 +775,15 @@ fn build_contents(messages: &[Message], model_id: &str, resolved: &media::Resolv
             Role::System => continue,
         };
 
+        // Blocks that keep this message's role accumulate in `parts`; foreign tool
+        // calls that can't be replayed natively accumulate in `downgraded` and are
+        // emitted as a trailing user Content (after this message's prose -- any
+        // intra-message text/call interleaving is flattened), so the model reads
+        // them as external observations rather than its own behavior to imitate.
+        // (A demoted call left in the model turn is few-shot bait: Gemini 3 echoes
+        // the text shape and emits phantom, non-executing "tool calls".)
         let mut parts: Vec<Value> = Vec::new();
+        let mut downgraded: Vec<Value> = Vec::new();
         for block in filtered_content {
             match block {
                 ContentBlock::Text { text, .. } => {
@@ -797,26 +803,14 @@ fn build_contents(messages: &[Message], model_id: &str, resolved: &media::Resolv
                     parts.push(json!({ "text": thinking }));
                 }
                 ContentBlock::ToolUse { id, name, input, sig, .. } => {
-                    // Gemini 3 requires thoughtSignature on function calls when thinking
-                    // is enabled. Emit native functionCall only when the pair is complete
-                    // and we have a valid signature; otherwise fall back to a text annotation.
-                    let valid_sig = sig.as_deref().filter(|s| is_valid_signature(s));
-                    let can_emit_native = complete.contains(id.as_str())
-                        && !(gemini3 && valid_sig.is_none());
-                    if !can_emit_native {
-                        let args_str = serde_json::to_string_pretty(input).unwrap_or_default();
-                        parts.push(json!({
-                            "text": format!(
-                                "[Historical context: a different model called tool \"{}\" with arguments: {}. Do not mimic this format - use proper function calling.]",
-                                name, args_str
-                            )
-                        }));
-                    } else {
+                    if native.contains(id.as_str()) {
                         let mut part = json!({ "functionCall": { "name": name, "args": input } });
-                        if let Some(s) = valid_sig {
+                        if let Some(s) = sig.as_deref().filter(|s| is_valid_signature(s)) {
                             part["thoughtSignature"] = json!(s);
                         }
                         parts.push(part);
+                    } else if let Some(t) = block.tool_as_text() {
+                        downgraded.push(json!({ "text": t }));
                     }
                 }
                 ContentBlock::ToolResult { .. } => {}
@@ -828,12 +822,28 @@ fn build_contents(messages: &[Message], model_id: &str, resolved: &media::Resolv
             }
         }
 
-        if !parts.is_empty() {
-            contents.push(json!({ "role": gemini_role, "parts": parts }));
-        }
+        push_parts(&mut contents, gemini_role, parts);
+        push_parts(&mut contents, "user", downgraded);
     }
 
     contents
+}
+
+/// Append `parts` to `contents` under `role`, merging into the trailing Content
+/// when it already carries that role. Gemini 400s on two consecutive same-role
+/// Contents, so every Content is built here -- which also guarantees each one
+/// already has a `parts` array for the merge to extend. Empty `parts` is a no-op.
+fn push_parts(contents: &mut Vec<Value>, role: &str, parts: Vec<Value>) {
+    if parts.is_empty() { return; }
+    if let Some(last) = contents.last_mut() {
+        if last.get("role").and_then(|r| r.as_str()) == Some(role) {
+            if let Some(arr) = last.get_mut("parts").and_then(|p| p.as_array_mut()) {
+                arr.extend(parts);
+                return;
+            }
+        }
+    }
+    contents.push(json!({ "role": role, "parts": parts }));
 }
 
 fn is_gemini3(model_id: &str) -> bool {
