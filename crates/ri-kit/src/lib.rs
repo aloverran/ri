@@ -33,9 +33,9 @@ impl Tool for BashTool {
             "type": "object",
             "properties": {
                 "command": { "type": "string", "description": "The shell command to execute" },
-                "timeout": { "type": "integer", "description": "Timeout in milliseconds" }
+                "timeout": { "type": "integer", "description": "Timeout in milliseconds, after which the command is killed. Choose a bound that fits the command so a hang or runaway (e.g. a recursive search) can't block the agent." }
             },
-            "required": ["command"]
+            "required": ["command", "timeout"]
         })
     }
     async fn run(&self, input: serde_json::Value, cancel: tokio_util::sync::CancellationToken) -> ToolOutput {
@@ -136,7 +136,10 @@ async fn run_bash(
         Some(c) => c,
         None => return ToolOutput::error("missing 'command' parameter"),
     };
-    let timeout_ms = parse_u64(&input["timeout"]).unwrap_or(120_000);
+    let timeout_ms = match parse_u64(&input["timeout"]) {
+        Some(t) => t,
+        None => return ToolOutput::error("missing or invalid 'timeout' parameter"),
+    };
 
     let mut cmd = tokio::process::Command::new("sh");
     cmd.arg("-c")
