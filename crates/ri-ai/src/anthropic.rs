@@ -153,45 +153,32 @@ impl LlmProvider for AnthropicProvider {
             },
             Model {
                 id: "claude-sonnet-4-6".into(), name: "Claude Sonnet 4.6".into(),
-                reasoning: true, context_window: 200_000, max_tokens: 128_000,
+                reasoning: true, context_window: 1_000_000, max_tokens: 128_000,
                 cost: ModelCost { input: 3.0, output: 15.0, cache_read: 0.3, cache_write: 3.75 },
             },
             Model {
                 id: "claude-opus-4-6".into(), name: "Claude Opus 4.6".into(),
-                reasoning: true, context_window: 200_000, max_tokens: 128_000,
+                reasoning: true, context_window: 1_000_000, max_tokens: 128_000,
                 cost: ModelCost { input: 5.0, output: 25.0, cache_read: 0.5, cache_write: 6.25 },
             },
             Model {
                 id: "claude-opus-4-7".into(), name: "Claude Opus 4.7".into(),
-                reasoning: true, context_window: 200_000, max_tokens: 128_000,
+                reasoning: true, context_window: 1_000_000, max_tokens: 128_000,
                 cost: ModelCost { input: 5.0, output: 25.0, cache_read: 0.5, cache_write: 6.25 },
             },
             Model {
                 id: "claude-opus-4-8".into(), name: "Claude Opus 4.8".into(),
-                reasoning: true, context_window: 200_000, max_tokens: 128_000,
-                cost: ModelCost { input: 5.0, output: 25.0, cache_read: 0.5, cache_write: 6.25 },
-            },
-            // Extended context variants -- 1M token input via beta header.
-            // Same models and pricing, but opts into the context-1m-2025-08-07 beta.
-            Model {
-                id: "claude-sonnet-4-6-1m".into(), name: "Claude Sonnet 4.6 (1M)".into(),
-                reasoning: true, context_window: 1_000_000, max_tokens: 128_000,
-                cost: ModelCost { input: 3.0, output: 15.0, cache_read: 0.3, cache_write: 3.75 },
-            },
-            Model {
-                id: "claude-opus-4-6-1m".into(), name: "Claude Opus 4.6 (1M)".into(),
                 reasoning: true, context_window: 1_000_000, max_tokens: 128_000,
                 cost: ModelCost { input: 5.0, output: 25.0, cache_read: 0.5, cache_write: 6.25 },
             },
+            // Anthropic's most capable widely released model: a tier above Opus,
+            // natively 1M-context with always-on adaptive thinking. (Its restricted
+            // sibling Claude Mythos 5 is absent from this account's model list, so
+            // listing it would only add an unusable, never-resolving entry.)
             Model {
-                id: "claude-opus-4-7-1m".into(), name: "Claude Opus 4.7 (1M)".into(),
+                id: "claude-fable-5".into(), name: "Claude Fable 5".into(),
                 reasoning: true, context_window: 1_000_000, max_tokens: 128_000,
-                cost: ModelCost { input: 5.0, output: 25.0, cache_read: 0.5, cache_write: 6.25 },
-            },
-            Model {
-                id: "claude-opus-4-8-1m".into(), name: "Claude Opus 4.8 (1M)".into(),
-                reasoning: true, context_window: 1_000_000, max_tokens: 128_000,
-                cost: ModelCost { input: 5.0, output: 25.0, cache_read: 0.5, cache_write: 6.25 },
+                cost: ModelCost { input: 10.0, output: 50.0, cache_read: 1.0, cache_write: 12.5 },
             },
         ]
     }
@@ -290,19 +277,13 @@ impl LlmProvider for AnthropicProvider {
         Ok(())
     }
 
-    async fn stream(&self, mut opts: RequestOptions) -> Result<EventStream, ApiError> {
+    async fn stream(&self, opts: RequestOptions) -> Result<EventStream, ApiError> {
         let (api_key, is_oauth) = self.ensure_valid_token().await
             .map_err(|e| ApiError::other(format!("{e:#}")))?;
         let auth = if is_oauth { Auth::Oauth } else { Auth::ApiKey };
 
-        // Strip the -1m suffix (ri-internal) before sending to the API.
-        let extended_context = opts.model.id.ends_with("-1m");
-        if extended_context {
-            opts.model.id = opts.model.id.strip_suffix("-1m").unwrap().to_string();
-        }
-
         let resolved = resolve_blobs(&opts).await;
-        let request = build_request(&api_key, auth, &opts, extended_context, &resolved);
+        let request = build_request(&api_key, auth, &opts, &resolved);
         let bytes = sse::send(request).await?;
         let state = AnthropicState::new(is_oauth, opts.tools.to_vec());
         Ok(Box::pin(sse::drive_sse_stream(bytes, state)))
@@ -434,11 +415,11 @@ fn from_claude_code_name(name: &str, original_tools: &[ToolSchema]) -> String {
 
 // -- Request building --
 
-fn build_request(api_key: &str, auth: Auth, opts: &RequestOptions, extended_context: bool, resolved: &media::ResolvedMap) -> reqwest::RequestBuilder {
+fn build_request(api_key: &str, auth: Auth, opts: &RequestOptions, resolved: &media::ResolvedMap) -> reqwest::RequestBuilder {
     let body = build_body(opts, auth, resolved);
     let url = "https://api.anthropic.com/v1/messages";
 
-    let beta_header = assemble_betas(&opts.model.id, auth, extended_context).join(",");
+    let beta_header = assemble_betas(&opts.model.id, auth).join(",");
     tracing::debug!(model = %opts.model.id, betas = %beta_header, "Anthropic request betas");
     tracing::trace!(url, %body, "Anthropic API request");
 
@@ -477,7 +458,7 @@ enum Auth {
 /// User-Agent presented when impersonating Claude Code over OAuth. Pinned to
 /// the Claude Code release whose beta envelope `assemble_betas` mirrors; bump
 /// the two together so the version and the betas stay one coherent contract.
-const CLAUDE_CODE_USER_AGENT: &str = "claude-cli/2.1.159 (external, cli)";
+const CLAUDE_CODE_USER_AGENT: &str = "claude-cli/2.1.170 (external, cli)";
 
 /// User-Agent for direct api-key requests; ri has no reason to hide here.
 const RI_USER_AGENT: &str = concat!("ri/", env!("CARGO_PKG_VERSION"));
@@ -490,18 +471,15 @@ const RI_USER_AGENT: &str = concat!("ri/", env!("CARGO_PKG_VERSION"));
 // behind it. We carry exactly the ones a first-party request can earn.
 const CLAUDE_CODE: &str = "claude-code-20250219";
 const OAUTH_AUTH: &str = "oauth-2025-04-20";
-const LONG_CONTEXT: &str = "context-1m-2025-08-07";
 const INTERLEAVED_THINKING: &str = "interleaved-thinking-2025-05-14";
 const PROMPT_CACHING_SCOPE: &str = "prompt-caching-scope-2026-01-05";
 const MID_CONVERSATION_SYSTEM: &str = "mid-conversation-system-2026-04-07";
 
 /// Assemble the `anthropic-beta` opt-ins for one request, mirroring the slice
-/// of Claude Code's per-request assembler (`KO6`) that actually applies to ri:
+/// of Claude Code's per-request assembler that actually applies to ri:
 /// first-party transport only, gated by model id and credential. The push
-/// order follows Claude Code so a wire diff against the real client stays
-/// small. `model_id` is canonical (the `-1m` suffix is stripped upstream);
-/// `extended_context` carries the 1M-context opt-in for those variants.
-fn assemble_betas(model_id: &str, auth: Auth, extended_context: bool) -> Vec<String> {
+/// order follows Claude Code so a wire diff against the real client stays small.
+fn assemble_betas(model_id: &str, auth: Auth) -> Vec<String> {
     let mut betas: Vec<String> = Vec::new();
 
     // `claude-code` tags agentic-coding traffic; Claude Code omits it for Haiku
@@ -513,9 +491,6 @@ fn assemble_betas(model_id: &str, auth: Auth, extended_context: bool) -> Vec<Str
     }
     if auth == Auth::Oauth {
         betas.push(OAUTH_AUTH.into());
-    }
-    if extended_context {
-        betas.push(LONG_CONTEXT.into());
     }
     // Interleaved thinking: Claude Code's `tf$` on a first-party backend (ri is
     // always first-party) reduces to "every model except the claude-3 family" --
@@ -530,12 +505,12 @@ fn assemble_betas(model_id: &str, auth: Auth, extended_context: bool) -> Vec<Str
     // first-party. ri's body-root cache_control is honored without it, but it
     // keeps the envelope aligned with the client we impersonate.
     betas.push(PROMPT_CACHING_SCOPE.into());
-    // Opus 4.8 is the only current model Claude Code opts into mid-stream system
-    // blocks for. ri hoists all system content to the top of the request rather
-    // than weaving it in, so this is inert today -- but it mirrors the envelope
-    // opus-4-8 was aligned with, and would switch on for free the day ri starts
-    // weaving system blocks into the message stream.
-    if model_id.contains("opus-4-8") {
+    // Mid-stream system blocks: Claude Code opts Opus 4.8 and Fable 5 specifically
+    // into this (not the wider Opus line). ri hoists all system content to the top
+    // of the request rather than weaving it in, so this is inert today -- but it
+    // mirrors the envelope these models were aligned with, and would switch on for
+    // free the day ri starts weaving system blocks into the message stream.
+    if model_id.contains("opus-4-8") || model_id.contains("fable") {
         betas.push(MID_CONVERSATION_SYSTEM.into());
     }
     // Manual escape hatch, appended verbatim (no dedup, matching Claude Code's
@@ -630,7 +605,7 @@ fn thinking_mode(model_id: &str) -> ThinkingMode {
     // thinking; everything older requires a hard `budget_tokens` ceiling.
     // Substring matching so a dated id (`claude-opus-4-8-2026...`) classifies the
     // same as its canonical form, and anything unknown stays on budget.
-    let adaptive = ["opus-4-6", "opus-4-7", "opus-4-8", "sonnet-4-6"]
+    let adaptive = ["opus-4-6", "opus-4-7", "opus-4-8", "sonnet-4-6", "fable"]
         .iter()
         .any(|family| model_id.contains(family));
     if adaptive { ThinkingMode::Adaptive } else { ThinkingMode::Budget }
