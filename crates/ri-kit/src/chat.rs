@@ -135,9 +135,30 @@ pub fn advance_head(
     messages: Vec<ri::MessageId>,
     meta: Option<serde_json::Value>,
 ) -> eyre::Result<Context> {
+    advance_head_with_parents(store, id, messages, Vec::new(), meta)
+}
+
+/// `advance_head` with additional provenance parents recorded on the
+/// new context. Extra parents follow the prior head and are
+/// deduplicated against it -- the head move and the record of what it
+/// incorporated land in one atomic append. Merging an addressed
+/// context (`crate::merge`) is the canonical caller.
+pub fn advance_head_with_parents(
+    store: &Store,
+    id: &RefId,
+    messages: Vec<ri::MessageId>,
+    extra_parents: Vec<ContextId>,
+    meta: Option<serde_json::Value>,
+) -> eyre::Result<Context> {
     let current = store.get_ref(id)
         .ok_or_else(|| eyre::eyre!("ref [{}] not found", id))?;
-    let ctx = Context::new(messages, vec![current.head.clone()], meta);
+    let mut parents = vec![current.head.clone()];
+    for p in extra_parents {
+        if !parents.contains(&p) {
+            parents.push(p);
+        }
+    }
+    let ctx = Context::new(messages, parents, meta);
     store.write_context(&ctx)?;
     let next = current.with_head(ctx.id.clone());
     store.write_ref(&next)?;

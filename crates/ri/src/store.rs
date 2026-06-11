@@ -182,6 +182,17 @@ impl Pool {
         self.inner.lock().unwrap().refs.values().cloned().collect()
     }
 
+    /// Every loaded context matching `pred`, across every mount. The
+    /// predicate keeps the scan cheap (only matches are cloned). Like
+    /// `refs()`, apps select by facet (`c.facet::<SomeFacet>()`) -- the
+    /// pool attaches no meaning to context metadata.
+    pub fn find_contexts(&self, pred: impl Fn(&Context) -> bool) -> Vec<Context> {
+        self.inner.lock().unwrap().contexts.values()
+            .filter(|c| pred(c))
+            .cloned()
+            .collect()
+    }
+
     /// Drop a ref from the in-memory pool. Deletion flows call this after
     /// removing the backing file so the ref stops showing up in pool
     /// queries (the session list, lineage walks) without a reload.

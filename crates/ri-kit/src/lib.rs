@@ -2,6 +2,7 @@
 
 pub mod chat;
 pub mod commands;
+pub mod merge;
 pub mod resources;
 
 use std::collections::HashMap;
