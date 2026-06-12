@@ -39,7 +39,7 @@ ri-web/
     state.rs              # AppState, SessionState, RunHandle, LoginInProgress
     api.rs                # axum route handlers (REST + SSE + auth)
     agent.rs              # Agent loop + background title generation
-    meta_tools.rs         # runAgent, readContextGraph, readMessage, appendMessage, createContext
+    meta_tools.rs         # Execution seams for ri_kit::meta_tools (store access, run spawning)
     tracing_broadcast.rs  # Live tracing log forwarding to SSE clients
   frontend/               # SolidJS + Vite project
 ```
@@ -198,7 +198,7 @@ The agent loop logic is similar between ri-cli and ri-web but not identical:
 - ri-web: broadcasts through a channel (multiple consumers)
 - ri-web: spawns as a tokio task, includes title generation, AGENTS.md discovery via meta tags
 
-Both are ~100-300 lines of application code composing the same primitives. Extracting a shared crate would over-abstract. Two applications writing their own loops from the same building blocks is the intended pattern.
+Both loops are application code composing the same primitives. Extracting a shared loop crate would over-abstract: the two IO models (stream return vs broadcast) are genuinely different, and each loop is small. The meta-tools are the opposite case -- their entire surface (schemas, validation, store surgery, formatting) is harness-independent, so it lives once in `ri_kit::meta_tools` and each application implements only the `StoreAccess`/`MetaExec` seams.
 
 ## Frontend
 

@@ -3,6 +3,7 @@
 pub mod chat;
 pub mod commands;
 pub mod merge;
+pub mod meta_tools;
 pub mod resources;
 
 use std::collections::HashMap;

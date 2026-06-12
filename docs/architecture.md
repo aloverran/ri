@@ -219,6 +219,7 @@ Does NOT handle: message storage, tool execution, agent loop.
 Building blocks for agent applications:
 
 - **Coding tools**: `bash`, `read`, `write`, `edit`. Each implements the `Tool` trait from ri. `all_tools()` returns the full set.
+- **Meta-tools** (`meta_tools`): `runAgent`, `runTurn`, `readContextGraph`, `readMessage`, `createContext` -- the context-orchestration surface agents use to drive ri itself. The tools (names, schemas, validation, store surgery, output formatting) live here once, shared by every harness; a harness supplies two seams: `StoreAccess` (how to obtain the current store view) and `MetaExec` (model availability + how spawned runs execute).
 - **Prompt templates** (`prompts`): Load `.md` templates from config directories, parse `/command arg1 arg2` invocations, expand `$1`, `$@`, `${@:N}` placeholders.
 - **Context and resources** (`resources`): Discover AGENTS.md/CLAUDE.md files by walking up from the working directory, load settings from `~/.config/agents/settings.json`, build environment info for system prompts, `{{include:path}}` directive expansion.
 
@@ -230,7 +231,7 @@ Terminal agent. Wires everything together for interactive use:
 - `interactive` -- TUI with ratatui (inline viewport, scrollback, tui-textarea input, streaming preview)
 - `print_mode` -- Single-shot: run one prompt, print output, exit
 - `rpc_mode` -- JSON-over-stdio for embedding in other tools
-- `meta_tools` -- `runAgent`, `readContextGraph`, `readMessage`, `appendMessage`, `createContext` tools for sub-agent orchestration
+- `meta_tools` -- The CLI's seams for `ri_kit::meta_tools`: fresh per-call store mounts, and self-contained background tasks for spawned runs
 
 ### ri-web
 
@@ -239,7 +240,7 @@ Web agent. Same primitives, different composition:
 - `agent` -- Agent loop adapted for broadcast (tokio::sync::broadcast instead of stream return). Background title generation.
 - `api` -- axum REST + SSE routes (session CRUD, message streaming, model listing, auth management, log streaming)
 - `state` -- `AppState`, `SessionState`, `RunHandle` (multi-session server state)
-- `meta_tools` -- Same three meta-tools, adapted for shared server state (Weak<AppState>)
+- `meta_tools` -- The web's seams for `ri_kit::meta_tools`: the shared store handle via `Weak<AppState>`, and spawned runs as child SessionStates with SSE and SSH inheritance
 - `tracing_broadcast` -- Live tracing log forwarding to SSE clients
 
 ## The agent loop
