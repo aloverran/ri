@@ -219,7 +219,7 @@ Does NOT handle: message storage, tool execution, agent loop.
 Building blocks for agent applications:
 
 - **Coding tools**: `bash`, `read`, `write`, `edit`. Each implements the `Tool` trait from ri. `all_tools()` returns the full set.
-- **Meta-tools** (`meta_tools`): `runAgent`, `runTurn`, `readContextGraph`, `readMessage`, `createContext` -- the context-orchestration surface agents use to drive ri itself. The tools (names, schemas, validation, store surgery, output formatting) live here once, shared by every harness; a harness supplies two seams: `StoreAccess` (how to obtain the current store view) and `MetaExec` (model availability + how spawned runs execute).
+- **Meta-tools** (`meta_tools`): the context-orchestration surface agents use to drive ri itself -- `createMessage`/`readMessage`, `createContext`/`readContext`, and `updateRef`/`readRef` as pure data operations over the pool, plus `runAgent`/`readAgent` over the harness runtime (`runAgent` with no tools is a single turn; with tools it loops). The tools (names, schemas, validation, store surgery, output formatting) live here once, shared by every harness; a harness supplies two seams: `StoreAccess` (how to obtain the current store view) and `MetaExec` (model + base-tool availability, how spawned runs execute, and a ref's live runtime status).
 - **Prompt templates** (`prompts`): Load `.md` templates from config directories, parse `/command arg1 arg2` invocations, expand `$1`, `$@`, `${@:N}` placeholders.
 - **Context and resources** (`resources`): Discover AGENTS.md/CLAUDE.md files by walking up from the working directory, load settings from `~/.config/agents/settings.json`, build environment info for system prompts, `{{include:path}}` directive expansion.
 
