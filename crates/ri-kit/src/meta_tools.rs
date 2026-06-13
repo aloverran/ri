@@ -360,9 +360,10 @@ impl Tool for CreateContextTool {
          discovers and merges the context (messages and provenance) at its next \
          safe boundary -- the data-native way to hand messages to another \
          session without owning its ref. The optional 'jump' instead addresses \
-         a relocation: the owner moves its head onto a target context (tagging \
-         its old head as a live snapshot ref first), then continues from there \
-         -- this is how an agent rewinds or branches itself. 'merge_into' and \
+         a relocation: at its next safe boundary the owner preserves its \
+         current head as a live snapshot ref, then resumes from the target with \
+         this context's messages appended -- this is how an agent rewinds or \
+         branches itself. 'merge_into' and \
          'jump' are mutually exclusive (a context carries one instruction)."
     }
 
@@ -414,13 +415,16 @@ impl Tool for CreateContextTool {
                 },
                 "jump": {
                     "type": "object",
-                    "description": "Address a head relocation to a ref: when \
-                        the owner next reaches a safe boundary it tags its \
-                        current head as a live snapshot sub-session, then moves \
-                        its head onto the target and continues from there. This \
-                        is the pull-based way an agent rewinds or branches \
-                        itself (the loop owns its head, so it cannot be \
-                        repointed from outside). Mutually exclusive with \
+                    "description": "Address a head relocation to a ref. At its \
+                        next safe boundary -- not when this call returns -- the \
+                        owner preserves its current head as a live snapshot \
+                        sub-session, then resumes on a fresh head: the target's \
+                        messages, followed by any messages you composed into \
+                        this context, parented on the old head, the target, and \
+                        this context. Until that boundary the ref keeps its \
+                        current head. This is the pull-based way an agent rewinds \
+                        or branches itself; the loop owns its head, so it cannot \
+                        be repointed from outside. Mutually exclusive with \
                         merge_into.",
                     "properties": {
                         "target": {
