@@ -351,9 +351,13 @@ impl Tool for CreateContextTool {
         "Create a new context (an ordered list of messages plus parent links) \
          from existing atoms. Each entry either references a message \
          ({\"message_id\": MSG_ID}) or embeds a whole context ({\"context_id\": \
-         CTX_ID}), expanding its messages in place and registering it as a DAG \
-         parent. Returns the new context_id. Use this to compose, merge, filter, \
-         or fork contexts. This tool only references existing atoms -- to author \
+         CTX_ID}) -- a context id, or a ref id resolved to its current head -- \
+         expanding its messages in place and registering it as a DAG parent. The \
+         optional top-level 'exclude' then drops named message ids from the \
+         assembled list, so you can take a long context minus a few messages \
+         without relisting the rest. Returns the new context_id. Use this to \
+         compose, merge, filter, fork, extend, or wrap contexts. This tool only \
+         references existing atoms -- to author \
          new message text or rewrite a role, call createMessage first and \
          reference the id it returns. The optional 'merge_into' addresses the \
          context to another ref: if that ref's owner runs an agent loop, it \
@@ -377,8 +381,9 @@ impl Tool for CreateContextTool {
                         - {\"message_id\": MSG_ID}: include one existing message. \
                         Ids are global across the whole ri database, so this can \
                         point into any session.\n\
-                        - {\"context_id\": CTX_ID}: expand all of that context's \
-                        messages in place and register it as a DAG parent.",
+                        - {\"context_id\": ID}: expand all messages of a context \
+                        (a context id, or a ref id resolved to its current head) \
+                        in place, and register the context as a DAG parent.",
                     "items": {
                         "type": "object",
                         "properties": {
@@ -388,10 +393,19 @@ impl Tool for CreateContextTool {
                             },
                             "context_id": {
                                 "type": "string",
-                                "description": "Embed all messages from this context, and register it as a parent."
+                                "description": "Embed all messages from a context, registering it as a parent. Accepts a context id, or a ref id resolved to its current head context (snapshotted now)."
                             }
                         }
                     }
+                },
+                "exclude": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Message ids to drop from the final assembled \
+                        list (after every entry expands). Removes all occurrences \
+                        of each id; an id matching no assembled message is an \
+                        error. The ergonomic way to take a long context minus a \
+                        few messages without relisting the rest."
                 },
                 "parents": {
                     "type": "array",
@@ -498,16 +512,29 @@ impl Tool for CreateContextTool {
                         "messages[{}]: context_id must be a non-empty string", i
                     )),
                 };
-                match store.get_context(&ContextId::from(cid)) {
-                    Some(ctx) => {
-                        all_messages.extend(ctx.messages);
-                        if seen_parents.insert(cid.to_string()) {
-                            parents.push(ContextId::from(cid));
-                        }
-                    }
+                // ctx-or-ref: a known context is used as-is, a ref resolves to
+                // its head. Register the resolved context -- never the ref id --
+                // as the parent, so the DAG never holds a ref where a context id
+                // belongs.
+                let resolved = match resolve_to_context_id(&store, cid) {
+                    Some(c) => c,
                     None => return ToolOutput::error(&format!(
-                        "messages[{}]: context [{}] not found", i, cid
+                        "messages[{}]: [{}] is neither a known context nor a ref", i, cid
                     )),
+                };
+                let ctx = match store.get_context(&resolved) {
+                    Some(c) => c,
+                    // Only reachable when cid named a ref whose head context is
+                    // missing; a cid that named a context already resolved by
+                    // being fetched inside resolve_to_context_id.
+                    None => return ToolOutput::error(&format!(
+                        "messages[{}]: ref [{}] points at a missing head context [{}]",
+                        i, cid, resolved
+                    )),
+                };
+                all_messages.extend(ctx.messages);
+                if seen_parents.insert(resolved.to_string()) {
+                    parents.push(resolved);
                 }
             } else {
                 let mid = match entry["message_id"].as_str() {
@@ -541,6 +568,44 @@ impl Tool for CreateContextTool {
             }
         }
 
+        // Top-level exclude: drop every occurrence of each id from the assembled
+        // list, applied once after assembly so the result is independent of
+        // entry order. An id that matches nothing is a canary (a stale id or the
+        // wrong source context), surfaced before any write -- consistent with
+        // the dangling-reference handling above.
+        let mut excluded_count = 0usize;
+        if let Some(raw) = input.get("exclude") {
+            let arr = match raw.as_array() {
+                Some(a) => a,
+                None => return ToolOutput::error("'exclude' must be an array of message ids"),
+            };
+            let mut drop: HashSet<String> = HashSet::new();
+            for (i, v) in arr.iter().enumerate() {
+                match v.as_str() {
+                    Some(s) if !s.is_empty() => { drop.insert(s.to_string()); }
+                    _ => return ToolOutput::error(&format!(
+                        "exclude[{}]: must be a non-empty message id string", i
+                    )),
+                }
+            }
+            if !drop.is_empty() {
+                let present: HashSet<&str> = all_messages.iter().map(|m| m.as_str()).collect();
+                let mut unmatched: Vec<&str> =
+                    drop.iter().map(|s| s.as_str()).filter(|s| !present.contains(s)).collect();
+                if !unmatched.is_empty() {
+                    unmatched.sort();
+                    let list = unmatched.iter().map(|s| format!("[{}]", s)).collect::<Vec<_>>().join(", ");
+                    return ToolOutput::error(&format!(
+                        "exclude: {} not present in the assembled {}-message list",
+                        list, all_messages.len()
+                    ));
+                }
+                let before = all_messages.len();
+                all_messages.retain(|m| !drop.contains(m.as_str()));
+                excluded_count = before - all_messages.len();
+            }
+        }
+
         let mut new_ctx = Context::new(all_messages, parents, None);
         if let Some(env) = &envelope {
             if let Err(e) = new_ctx.set_facet(env) {
@@ -561,8 +626,13 @@ impl Tool for CreateContextTool {
             }
             None => String::new(),
         };
+        let counts = if excluded_count > 0 {
+            format!("{} messages, {} excluded", new_ctx.messages.len(), excluded_count)
+        } else {
+            format!("{} messages", new_ctx.messages.len())
+        };
         ToolOutput::text(format!(
-            "Created context [{}] ({} messages){}", ctx_id, new_ctx.messages.len(), addressed
+            "Created context [{}] ({}){}", ctx_id, counts, addressed
         )).with_details(json!({ "context_id": ctx_id }))
     }
 }
@@ -620,27 +690,26 @@ fn resolve_envelope(
         };
         let target_str = obj.get("target").and_then(|v| v.as_str()).filter(|s| !s.is_empty())
             .ok_or("jump.target: required (a context id, or a ref id resolved to its head)")?;
-        let target = resolve_jump_target(store, target_str)?;
+        let target = resolve_to_context_id(store, target_str)
+            .ok_or_else(|| format!("jump.target: [{}] is neither a known context nor a ref", target_str))?;
         return Ok(Some(Envelope { to, instruction: Instruction::Jump { target } }));
     }
 
     Ok(None)
 }
 
-/// Resolve a jump target string to an immutable context id: a known context
-/// id is used as-is; a known ref id resolves to its current head context
-/// (author-time "jump to ref R" sugar -- the deferred jump still lands at a
-/// fixed point, never re-chasing a moving ref).
-fn resolve_jump_target(store: &Store, s: &str) -> Result<ContextId, String> {
+/// Resolve an id that may be a context id or a ref id into an immutable context
+/// id: a known context is used as-is; a known ref resolves to its current head
+/// context (snapshotted now). `None` when the id names neither -- the caller
+/// phrases the error with its own context. The single "ctx-or-ref -> context"
+/// resolver, shared by context embedding and `jump.target`, so author-time "use
+/// ref R" sugar lands at a fixed point everywhere, never re-chasing a moving ref.
+fn resolve_to_context_id(store: &Store, s: &str) -> Option<ContextId> {
     let cid = ContextId::from(s);
     if store.get_context(&cid).is_some() {
-        return Ok(cid);
+        return Some(cid);
     }
-    let rid = RefId::from(s);
-    if let Some(r) = store.get_ref(&rid) {
-        return Ok(r.head);
-    }
-    Err(format!("jump.target: [{}] is neither a known context nor a ref", s))
+    store.get_ref(&RefId::from(s)).map(|r| r.head)
 }
 
 /// Default ancestor-walk depth for `readContext`.

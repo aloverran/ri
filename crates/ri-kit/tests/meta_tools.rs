@@ -288,6 +288,80 @@ async fn create_context_is_pure_composition() {
 }
 
 #[tokio::test]
+async fn create_context_embed_ref_and_exclude() {
+    let f = fixture("create-context-embed-exclude");
+
+    let m1 = f.one_message("user", "one").await;
+    let m2 = f.one_message("assistant", "two").await;
+    let ctx_a = f.context_of(&[m1.as_str(), m2.as_str()]).await;
+
+    // A ref stands in for its head context in the embed slot (wrap/extend): its
+    // messages expand in place, surrounded by the bare-message entries. The
+    // registered parent must be the RESOLVED context, never the ref id.
+    f.run("updateRef", json!({ "ref_id": "ref_topic", "context_id": ctx_a })).await;
+    let sys = f.one_message("system", "prelude").await;
+    let tail = f.one_message("user", "postlude").await;
+    let out = f.run("createContext", json!({
+        "messages": [
+            { "message_id": sys.as_str() },
+            { "context_id": "ref_topic" },
+            { "message_id": tail.as_str() }
+        ]
+    })).await;
+    assert!(!out.is_error, "ref embed failed: {}", text(&out));
+    let store = mount(&f.dir);
+    let w = store.get_context(&ContextId::from(detail_str(&out, "context_id").as_str())).unwrap();
+    assert_eq!(
+        w.messages.iter().map(|m| m.to_string()).collect::<Vec<_>>(),
+        vec![sys.clone(), m1.clone(), m2.clone(), tail.clone()],
+        "ref head expands in place, wrapped by the surrounding messages"
+    );
+    assert_eq!(w.parents.len(), 1);
+    assert_eq!(w.parents[0].as_str(), ctx_a, "parent is the resolved context, not the ref id");
+
+    // exclude drops every occurrence from the assembled list. Embedding ctx_a and
+    // also m1 by id puts m1 in twice; exclude:[m1] removes both (count > list len).
+    let out = f.run("createContext", json!({
+        "messages": [ { "context_id": ctx_a }, { "message_id": m1.as_str() } ],
+        "exclude": [ m1.as_str() ]
+    })).await;
+    assert!(!out.is_error, "exclude failed: {}", text(&out));
+    assert!(text(&out).contains("2 excluded"), "all occurrences removed + reported: {}", text(&out));
+    let store = mount(&f.dir);
+    let c = store.get_context(&ContextId::from(detail_str(&out, "context_id").as_str())).unwrap();
+    assert_eq!(
+        c.messages.iter().map(|m| m.to_string()).collect::<Vec<_>>(),
+        vec![m2.clone()],
+        "both m1 occurrences gone, m2 remains"
+    );
+    assert_eq!(c.parents[0].as_str(), ctx_a, "embedded context stays a parent even after exclusion");
+
+    // An exclude id matching nothing in the assembled list is a canary, surfaced
+    // before any write.
+    let out = f.run("createContext", json!({
+        "messages": [ { "context_id": ctx_a } ], "exclude": [ "msg_not_here" ]
+    })).await;
+    assert!(out.is_error);
+    assert!(
+        text(&out).contains("[msg_not_here]") && text(&out).contains("not present"),
+        "unmatched exclude errors: {}", text(&out)
+    );
+
+    // exclude must be an array of ids, and reject empty-string members.
+    let out = f.run("createContext", json!({
+        "messages": [ { "context_id": ctx_a } ], "exclude": "msg_x"
+    })).await;
+    assert!(out.is_error);
+    assert!(text(&out).contains("must be an array"), "got: {}", text(&out));
+
+    let out = f.run("createContext", json!({
+        "messages": [ { "context_id": ctx_a } ], "exclude": [ "" ]
+    })).await;
+    assert!(out.is_error);
+    assert!(text(&out).contains("exclude[0]"), "got: {}", text(&out));
+}
+
+#[tokio::test]
 async fn create_context_jump_envelope() {
     use ri_kit::envelope::{Envelope, Instruction};
     let f = fixture("create-context-jump");
