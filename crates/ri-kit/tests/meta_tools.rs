@@ -266,24 +266,95 @@ async fn create_context_is_pure_composition() {
     assert!(out.is_error);
     assert!(text(&out).contains("message [msg_missing] not found"), "got: {}", text(&out));
 
-    // merge_into stamps the facet and validates the destination.
+    // merge_into stamps an Envelope carrying the Merge instruction and validates the destination.
     let out = f.run("createContext", json!({
         "messages": [ { "message_id": m1.as_str() } ],
         "merge_into": f.session_id.as_str()
     })).await;
     assert!(!out.is_error, "unexpected error: {}", text(&out));
-    assert!(text(&out).contains(", addressed to ["), "got: {}", text(&out));
+    assert!(text(&out).contains(", merge_into ["), "got: {}", text(&out));
     let env_id = detail_str(&out, "context_id");
     let store = mount(&f.dir);
     let env = store.get_context(&ContextId::from(env_id.as_str())).unwrap();
-    let dest = env.facet::<ri_kit::merge::MergeInto>().unwrap().unwrap();
-    assert_eq!(dest.0.to_string(), f.session_id.to_string());
+    let envelope = env.facet::<ri_kit::envelope::Envelope>().unwrap().unwrap();
+    assert_eq!(envelope.to.to_string(), f.session_id.to_string());
+    assert_eq!(envelope.instruction, ri_kit::envelope::Instruction::Merge);
 
     let out = f.run("createContext", json!({
         "messages": [ { "message_id": m1.as_str() } ], "merge_into": "ref_nope"
     })).await;
     assert!(out.is_error);
     assert_eq!(text(&out), "merge_into: ref [ref_nope] not found");
+}
+
+#[tokio::test]
+async fn create_context_jump_envelope() {
+    use ri_kit::envelope::{Envelope, Instruction};
+    let f = fixture("create-context-jump");
+    let m1 = f.one_message("user", "a").await;
+    let ctx_a = f.context_of(&[m1.as_str()]).await;
+
+    // jump with a context target, self-addressed (to defaults to the caller).
+    let out = f.run("createContext", json!({
+        "messages": [], "jump": { "target": ctx_a }
+    })).await;
+    assert!(!out.is_error, "unexpected error: {}", text(&out));
+    assert!(
+        text(&out).contains(&format!("jump [{}] -> target [{}]", f.session_id, ctx_a)),
+        "got: {}", text(&out)
+    );
+    let env_id = detail_str(&out, "context_id");
+    let env = mount(&f.dir).get_context(&ContextId::from(env_id.as_str())).unwrap();
+    let envelope = env.facet::<Envelope>().unwrap().unwrap();
+    assert_eq!(envelope.to.to_string(), f.session_id.to_string(), "self-addressed by default");
+    assert_eq!(
+        envelope.instruction,
+        Instruction::Jump { target: ContextId::from(ctx_a.as_str()) },
+        "context target stamped as-is"
+    );
+
+    // A ref target resolves to that ref's current head context at author time.
+    f.run("updateRef", json!({ "ref_id": "ref_topic", "context_id": ctx_a })).await;
+    let out = f.run("createContext", json!({
+        "messages": [], "jump": { "target": "ref_topic" }
+    })).await;
+    assert!(!out.is_error, "ref target resolves: {}", text(&out));
+    let env = mount(&f.dir).get_context(&ContextId::from(detail_str(&out, "context_id").as_str())).unwrap();
+    assert_eq!(
+        env.facet::<Envelope>().unwrap().unwrap().instruction,
+        Instruction::Jump { target: ContextId::from(ctx_a.as_str()) },
+        "ref target resolved to its head context"
+    );
+
+    // An explicit `to` addresses another ref's owner.
+    let out = f.run("createContext", json!({
+        "messages": [], "jump": { "to": "ref_topic", "target": ctx_a }
+    })).await;
+    assert!(!out.is_error, "explicit to: {}", text(&out));
+    let env = mount(&f.dir).get_context(&ContextId::from(detail_str(&out, "context_id").as_str())).unwrap();
+    assert_eq!(env.facet::<Envelope>().unwrap().unwrap().to.to_string(), "ref_topic");
+
+    // merge_into and jump are mutually exclusive.
+    let out = f.run("createContext", json!({
+        "messages": [], "merge_into": f.session_id.as_str(), "jump": { "target": ctx_a }
+    })).await;
+    assert!(out.is_error);
+    assert!(text(&out).contains("at most one of 'merge_into' or 'jump'"), "got: {}", text(&out));
+
+    // Missing target, dangling target, dangling to -- each surfaces before any write.
+    let out = f.run("createContext", json!({ "messages": [], "jump": {} })).await;
+    assert!(out.is_error);
+    assert!(text(&out).contains("jump.target: required"), "got: {}", text(&out));
+
+    let out = f.run("createContext", json!({ "messages": [], "jump": { "target": "ctx_nope" } })).await;
+    assert!(out.is_error);
+    assert!(text(&out).contains("neither a known context nor a ref"), "got: {}", text(&out));
+
+    let out = f.run("createContext", json!({
+        "messages": [], "jump": { "to": "ref_nope", "target": ctx_a }
+    })).await;
+    assert!(out.is_error);
+    assert_eq!(text(&out), "jump.to: ref [ref_nope] not found");
 }
 
 #[tokio::test]
@@ -415,7 +486,8 @@ async fn read_ref_head_facets_and_inbox() {
     })).await;
     let out = f.run("readRef", json!({ "ref_id": "ref_raw" })).await;
     assert!(!out.is_error);
-    assert!(text(&out).contains("inbox (1 pending"), "inbox count: {}", text(&out));
+    assert!(text(&out).contains("inbox (1 pending envelope)"), "inbox count: {}", text(&out));
+    assert!(text(&out).contains("[merge]"), "verb label shown: {}", text(&out));
 
     let out = f.run("readRef", json!({ "ref_id": "ref_nope" })).await;
     assert!(out.is_error);

@@ -97,9 +97,11 @@ pub trait MetaExec: Send + Sync {
 }
 
 /// Build the eight meta-tools over the two harness seams. `session_id` is the
-/// calling session: spawned runs are parented to it, composed contexts and
-/// forged messages land in its family file, and it is the one ref `updateRef`
-/// may move even while it runs (a ref owns itself).
+/// calling session: spawned runs are parented to it, and composed contexts and
+/// forged messages land in its family file. A running ref -- including the
+/// caller's own -- is never repointed by `updateRef` (the loop owns its head);
+/// a live ref relocates its head only through its own loop, via a `jump`
+/// envelope (`createContext` / `crate::envelope`).
 pub fn create(
     store: Arc<dyn StoreAccess>,
     exec: Arc<dyn MetaExec>,
@@ -357,7 +359,11 @@ impl Tool for CreateContextTool {
          context to another ref: if that ref's owner runs an agent loop, it \
          discovers and merges the context (messages and provenance) at its next \
          safe boundary -- the data-native way to hand messages to another \
-         session without owning its ref."
+         session without owning its ref. The optional 'jump' instead addresses \
+         a relocation: the owner moves its head onto a target context (tagging \
+         its old head as a live snapshot ref first), then continues from there \
+         -- this is how an agent rewinds or branches itself. 'merge_into' and \
+         'jump' are mutually exclusive (a context carries one instruction)."
     }
 
     fn parameters(&self) -> Value {
@@ -405,6 +411,35 @@ impl Tool for CreateContextTool {
                         include a framing message if the recipient needs one. \
                         Pass parents for provenance (e.g. your own current \
                         context)."
+                },
+                "jump": {
+                    "type": "object",
+                    "description": "Address a head relocation to a ref: when \
+                        the owner next reaches a safe boundary it tags its \
+                        current head as a live snapshot sub-session, then moves \
+                        its head onto the target and continues from there. This \
+                        is the pull-based way an agent rewinds or branches \
+                        itself (the loop owns its head, so it cannot be \
+                        repointed from outside). Mutually exclusive with \
+                        merge_into.",
+                    "properties": {
+                        "target": {
+                            "type": "string",
+                            "description": "Where the head should land: a \
+                                context id (used as-is, immutable) or a ref id \
+                                (resolved to its current head context now, at \
+                                construction). The relocation lands at this \
+                                fixed point even if applied later."
+                        },
+                        "to": {
+                            "type": "string",
+                            "description": "The ref whose head should jump. \
+                                Defaults to the calling session -- a self-jump \
+                                (rewind/branch yourself). Set it to address a \
+                                jump to another ref's owner."
+                        }
+                    },
+                    "required": ["target"]
                 }
             },
             "required": ["messages"]
@@ -428,21 +463,13 @@ impl Tool for CreateContextTool {
             ),
         };
 
-        // Validate the destination before any write, so a bad input has no
-        // side effects. A valid ref that never runs an agent loop is still a
-        // legal destination (a topic ref accumulates pending envelopes).
-        let merge_into = match input.get("merge_into") {
-            None => None,
-            Some(v) => match v.as_str() {
-                Some(s) if !s.is_empty() => {
-                    let dest = RefId::from(s);
-                    if store.get_ref(&dest).is_none() {
-                        return ToolOutput::error(&format!("merge_into: ref [{}] not found", s));
-                    }
-                    Some(dest)
-                }
-                _ => return ToolOutput::error("merge_into: must be a non-empty string"),
-            },
+        // Resolve the optional addressing (merge_into / jump) into an envelope
+        // before any write, so a bad address has no side effects. A valid ref
+        // that never runs an agent loop is still a legal destination (a topic
+        // ref accumulates pending envelopes).
+        let envelope = match resolve_envelope(&store, &self.session_id, &input) {
+            Ok(e) => e,
+            Err(msg) => return ToolOutput::error(&msg),
         };
 
         let mut all_messages: Vec<MessageId> = Vec::new();
@@ -511,9 +538,9 @@ impl Tool for CreateContextTool {
         }
 
         let mut new_ctx = Context::new(all_messages, parents, None);
-        if let Some(dest) = &merge_into {
-            if let Err(e) = new_ctx.set_facet(&crate::merge::MergeInto(dest.clone())) {
-                return ToolOutput::error(&format!("merge_into: failed to stamp facet: {}", e));
+        if let Some(env) = &envelope {
+            if let Err(e) = new_ctx.set_facet(env) {
+                return ToolOutput::error(&format!("failed to stamp envelope facet: {}", e));
             }
         }
         if let Err(e) = family_store.write_context(&new_ctx) {
@@ -521,13 +548,95 @@ impl Tool for CreateContextTool {
         }
 
         let ctx_id = new_ctx.id.to_string();
-        let addressed = merge_into.as_ref()
-            .map(|d| format!(", addressed to [{}]", d))
-            .unwrap_or_default();
+        let addressed = match &envelope {
+            Some(crate::envelope::Envelope { to, instruction: crate::envelope::Instruction::Merge }) => {
+                format!(", merge_into [{}]", to)
+            }
+            Some(crate::envelope::Envelope { to, instruction: crate::envelope::Instruction::Jump { target } }) => {
+                format!(", jump [{}] -> target [{}]", to, target)
+            }
+            None => String::new(),
+        };
         ToolOutput::text(format!(
             "Created context [{}] ({} messages){}", ctx_id, new_ctx.messages.len(), addressed
         )).with_details(json!({ "context_id": ctx_id }))
     }
+}
+
+/// Parse the optional addressing parameters (`merge_into`, `jump`) into an
+/// [`crate::envelope::Envelope`], validating every ref and resolving a jump
+/// target to an immutable context id -- all before any write, so a bad
+/// address is surfaced with no side effects.
+///
+/// The two are mutually exclusive: a context carries one envelope with one
+/// instruction. `merge_into` is the merge shorthand; `jump` defaults its
+/// `to` to the calling session (a self-rewind) and resolves its `target`
+/// now, so a deferred jump lands at a fixed point regardless of later head
+/// movement.
+fn resolve_envelope(
+    store: &Store,
+    session_id: &RefId,
+    input: &Value,
+) -> Result<Option<crate::envelope::Envelope>, String> {
+    use crate::envelope::{Envelope, Instruction};
+
+    let has_merge = input.get("merge_into").map_or(false, |v| !v.is_null());
+    let has_jump = input.get("jump").map_or(false, |v| !v.is_null());
+    if has_merge && has_jump {
+        return Err(
+            "specify at most one of 'merge_into' or 'jump' -- a context carries one instruction"
+                .to_string(),
+        );
+    }
+
+    if has_merge {
+        let s = input["merge_into"].as_str().filter(|s| !s.is_empty())
+            .ok_or("merge_into: must be a non-empty string")?;
+        let dest = RefId::from(s);
+        if store.get_ref(&dest).is_none() {
+            return Err(format!("merge_into: ref [{}] not found", s));
+        }
+        return Ok(Some(Envelope { to: dest, instruction: Instruction::Merge }));
+    }
+
+    if has_jump {
+        let obj = input["jump"].as_object()
+            .ok_or("jump: must be an object { \"target\": ..., \"to\"?: ... }")?;
+        // `to` defaults to the calling session -- the self-jump (rewind/branch
+        // yourself) case the operator framed; set it to address another ref.
+        let to = match obj.get("to").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
+            Some(s) => {
+                let r = RefId::from(s);
+                if store.get_ref(&r).is_none() {
+                    return Err(format!("jump.to: ref [{}] not found", s));
+                }
+                r
+            }
+            None => session_id.clone(),
+        };
+        let target_str = obj.get("target").and_then(|v| v.as_str()).filter(|s| !s.is_empty())
+            .ok_or("jump.target: required (a context id, or a ref id resolved to its head)")?;
+        let target = resolve_jump_target(store, target_str)?;
+        return Ok(Some(Envelope { to, instruction: Instruction::Jump { target } }));
+    }
+
+    Ok(None)
+}
+
+/// Resolve a jump target string to an immutable context id: a known context
+/// id is used as-is; a known ref id resolves to its current head context
+/// (author-time "jump to ref R" sugar -- the deferred jump still lands at a
+/// fixed point, never re-chasing a moving ref).
+fn resolve_jump_target(store: &Store, s: &str) -> Result<ContextId, String> {
+    let cid = ContextId::from(s);
+    if store.get_context(&cid).is_some() {
+        return Ok(cid);
+    }
+    let rid = RefId::from(s);
+    if let Some(r) = store.get_ref(&rid) {
+        return Ok(r.head);
+    }
+    Err(format!("jump.target: [{}] is neither a known context nor a ref", s))
 }
 
 /// Default ancestor-walk depth for `readContext`.
@@ -736,9 +845,11 @@ impl Tool for UpdateRefTool {
         // as data (createContext merge_into) or move it once idle.
         if existing.is_some() && self.exec.agent_status(&ref_id).await.running {
             let hint = if ref_id == self.session_id {
-                "your own loop advances your head while you run -- a tool call can't repoint it mid-run"
+                "your own loop owns your head while you run -- relocate it with a \
+                 createContext jump envelope, which the loop applies at its next boundary"
             } else {
-                "address a context to it with createContext merge_into instead, or move it once idle"
+                "address it with createContext merge_into (weave messages) or jump \
+                 (relocate its head) instead, or move it once idle"
             };
             return ToolOutput::error(&format!(
                 "ref [{}] is owned by a running agent loop; {}", ref_id, hint
@@ -764,7 +875,7 @@ impl Tool for UpdateRefTool {
         // head's ancestry, which strands merge receipts (re-delivery) and
         // detaches history. Surfaced as a note; never blocks the move.
         let severed_note = prior_head.as_ref().and_then(|prior| {
-            let reachable = crate::merge::reachable_contexts(store.pool(), &head);
+            let reachable = crate::envelope::reachable_contexts(store.pool(), &head);
             if reachable.contains(prior) {
                 None
             } else {
@@ -790,7 +901,7 @@ impl Tool for UpdateRefTool {
 }
 
 /// Read a ref as data: its head, parent-chain size, facets, and its pending
-/// `merge_into` inbox (contexts addressed to it that its chain hasn't merged).
+/// envelope inbox (instructions addressed to it that its chain hasn't applied).
 /// Pure data -- for whether a loop is alive on the ref, use `readAgent`.
 struct ReadRefTool {
     store: Arc<dyn StoreAccess>,
@@ -806,9 +917,10 @@ impl Tool for ReadRefTool {
         "Read a ref (a named pointer to a context; a session is a ref) as data: \
          its head context, how many contexts its chain reaches, the facets \
          attached to it (chat title/parent/pinned, or 'raw' if none), and its \
-         pending merge_into inbox -- contexts addressed to this ref that its \
-         chain has not merged yet. This is pure data from the pool; for live \
-         runtime status (is a loop running, what is it streaming) use readAgent."
+         pending envelope inbox -- instructions (merge or jump) addressed to \
+         this ref that its chain has not applied yet. This is pure data from \
+         the pool; for live runtime status (is a loop running, what is it \
+         streaming) use readAgent."
     }
 
     fn parameters(&self) -> Value {
@@ -840,20 +952,32 @@ impl Tool for ReadRefTool {
             None => return ToolOutput::error(&format!("ref '{}' not found", ref_id)),
         };
 
-        let reachable = crate::merge::reachable_contexts(store.pool(), &r.head);
-        let pending = crate::merge::pending_merges(store.pool(), &ref_id, &reachable);
+        let reachable = crate::envelope::reachable_contexts(store.pool(), &r.head);
+        let pending = crate::envelope::pending_envelopes(store.pool(), &ref_id, &reachable);
 
         let mut out = format!("REF {}\n", ref_id);
         out.push_str(&format!("head: {}\n", r.head));
         out.push_str(&format!("chain: {} contexts reachable\n", reachable.len()));
         out.push_str(&format!("facets: {}\n", describe_facets(&r)));
 
-        out.push_str(&format!("\ninbox ({} pending merge_into):\n", pending.len()));
+        out.push_str(&format!(
+            "\ninbox ({} pending envelope{}):\n",
+            pending.len(), if pending.len() == 1 { "" } else { "s" }
+        ));
         if pending.is_empty() {
             out.push_str("  (none)\n");
         } else {
             for env in &pending {
-                out.push_str(&format!("  {} ({} messages)", env.id, env.messages.len()));
+                let verb = match env.facet::<crate::envelope::Envelope>() {
+                    Some(Ok(crate::envelope::Envelope {
+                        instruction: crate::envelope::Instruction::Merge, ..
+                    })) => "merge".to_string(),
+                    Some(Ok(crate::envelope::Envelope {
+                        instruction: crate::envelope::Instruction::Jump { target }, ..
+                    })) => format!("jump -> {}", target),
+                    _ => "?".to_string(),
+                };
+                out.push_str(&format!("  {} [{}] ({} messages)", env.id, verb, env.messages.len()));
                 if let Some(first) = env.messages.first().and_then(|id| store.get_message(id)) {
                     out.push(' ');
                     out.push_str(&first.summarize());

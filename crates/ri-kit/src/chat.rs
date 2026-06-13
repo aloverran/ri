@@ -43,6 +43,38 @@ impl Facet for ChatFacet {
     const KEY: &'static str = "chat";
 }
 
+/// Marks a ref as a point-in-time snapshot left behind when a session's
+/// head was relocated -- an operator rewind, or an agent self-jump, tagged
+/// the prior head with a ref before moving (git tag before reset). Lets
+/// the session list group or filter these "old work branches" apart from
+/// live sessions without inferring it from shape.
+///
+/// Provenance only knowable at mint time lives here; the precise envelope
+/// and target ids stay structural (the new head's DAG parents), so this
+/// records just enough to filter: which session it split from, and which
+/// relocation made it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SnapshotFacet {
+    /// The ref whose head moved off this snapshot's context.
+    pub origin: RefId,
+    /// What relocation created it.
+    pub via: SnapshotVia,
+}
+
+/// The relocation that minted a [`SnapshotFacet`] ref.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SnapshotVia {
+    /// Operator-initiated rewind (the HTTP rewind endpoint).
+    Rewind,
+    /// Agent-initiated jump envelope applied by the owning loop.
+    Jump,
+}
+
+impl Facet for SnapshotFacet {
+    const KEY: &'static str = "snapshot";
+}
+
 /// Create a new chat session with a caller-chosen ref id: write an empty
 /// root context and a ref carrying the given `ChatFacet`, both into the
 /// given store. Returns the ref.
@@ -67,6 +99,40 @@ pub fn create_with_id(store: &Store, id: RefId, facet: ChatFacet) -> eyre::Resul
 /// need; written here to keep call sites declarative.
 pub fn create(store: &Store, facet: ChatFacet) -> eyre::Result<Ref> {
     create_with_id(store, RefId::generate(), facet)
+}
+
+/// Tag a context as a live snapshot sub-session of `source`: mint a fresh
+/// ref pinned at `head`, carrying a [`ChatFacet`] (so it lists under the
+/// source's Sub-sessions, navigable for history inspection) inherited from
+/// `source`, plus a [`SnapshotFacet`] recording why it exists. This is the
+/// one place the "tag the old head before relocating it" policy lives, so
+/// both operator rewind and agent jump leave identical, filterable markers.
+///
+/// The snapshot shares `head` with the source; the caller moves the source
+/// off it next (the head pointer is what diverges, not the context). Writes
+/// through the given store, which the caller scopes to the source's family
+/// file so the snapshot lands beside its origin.
+pub fn snapshot_ref(
+    store: &Store,
+    source: &Ref,
+    head: ContextId,
+    via: SnapshotVia,
+) -> eyre::Result<Ref> {
+    let source_chat = read_facet(source)
+        .ok_or_else(|| eyre::eyre!("snapshot source ref [{}] has no chat facet", source.id))?;
+    let chat = ChatFacet {
+        title: source_chat.title.clone(),
+        created_at: chrono::Utc::now().to_rfc3339(),
+        cwd: source_chat.cwd.clone(),
+        host: source_chat.host.clone(),
+        parent: Some(source.id.clone()),
+        pinned: false,
+    };
+    let snapshot = Ref::new(head, None)
+        .with_facet(&chat)?
+        .with_facet(&SnapshotFacet { origin: source.id.clone(), via })?;
+    store.write_ref(&snapshot)?;
+    Ok(snapshot)
 }
 
 /// Resolve the family a ref belongs to: walk its `ChatFacet.parent` chain
