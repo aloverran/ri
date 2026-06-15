@@ -583,6 +583,17 @@ pub trait HasMeta {
         }
         Ok(())
     }
+
+    /// Drop a facet's key from meta. The delete half of the facet
+    /// vocabulary, paired with `set_facet`: an application unsets a
+    /// facet without reaching through `meta_mut` and re-encoding meta's
+    /// physical shape itself. Other keys are preserved; a missing key
+    /// (or absent / non-object meta) is a no-op.
+    fn remove_facet<F: Facet>(&mut self) {
+        if let Some(serde_json::Value::Object(map)) = self.meta_mut() {
+            map.remove(F::KEY);
+        }
+    }
 }
 
 impl HasMeta for Message {
