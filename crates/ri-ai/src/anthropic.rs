@@ -4,7 +4,6 @@
 // SSE interpretation, and login flow.
 
 use std::collections::HashMap;
-use std::fmt;
 use std::path::PathBuf;
 use std::time::Duration;
 use async_trait::async_trait;
@@ -284,7 +283,7 @@ impl LlmProvider for AnthropicProvider {
 
         let resolved = resolve_blobs(&opts).await;
         let request = build_request(&api_key, auth, &opts, &resolved);
-        let bytes = sse::send(request).await?;
+        let bytes = sse::send(request, classify_error).await?;
         let state = AnthropicState::new(is_oauth, opts.tools.to_vec());
         Ok(Box::pin(sse::drive_sse_stream(bytes, state)))
     }
@@ -720,32 +719,33 @@ fn convert_content(c: &ContentBlock, resolved: &media::ResolvedMap) -> Value {
     }
 }
 
-// -- SSE error type --
+/// Map an Anthropic error response to an `ApiError`. Anthropic's transient
+/// failures are 429 (`rate_limit_error`), 529 (`overloaded_error`), and 5xx
+/// server errors; its retry delay arrives in the `retry-after` header (passed
+/// here as `retry_after_ms`). A permanent quota is a 402, not a 429, so every
+/// rate limit here is a transient throttle worth retrying. Used for both the
+/// HTTP response (status set) and a mid-stream `error` event (status 0, where
+/// `error.type` carries the verdict).
+fn classify_error(status: u16, body: &str, retry_after_ms: Option<u64>) -> ApiError {
+    let error_type = serde_json::from_str::<Value>(body)
+        .ok()
+        .and_then(|p| p["error"]["type"].as_str().map(String::from));
 
-/// Error received during an Anthropic SSE stream (the `error` event type).
-/// Carries the raw event data since Anthropic has sent non-JSON errors
-/// (like "Bad Gateway") during outages.
-#[derive(Debug)]
-struct AnthropicStreamError {
-    raw: String,
-}
+    let retryable = status == 429
+        || status == 529
+        || (500..=599).contains(&status)
+        || matches!(
+            error_type.as_deref(),
+            Some("rate_limit_error" | "overloaded_error" | "api_error")
+        );
 
-impl fmt::Display for AnthropicStreamError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match serde_json::from_str::<Value>(&self.raw) {
-            Ok(parsed) => {
-                let error_type = parsed["error"]["type"].as_str().unwrap_or("unknown");
-                let message = parsed["error"]["message"].as_str().unwrap_or("Unknown error");
-                let pretty = serde_json::to_string_pretty(&parsed)
-                    .unwrap_or_else(|_| self.raw.clone());
-                write!(f, "{}: {}\n\nRaw API response:\n{}", error_type, message, pretty)
-            }
-            Err(_) => write!(f, "{}", self.raw),
-        }
+    let err = sse::HttpApiError { status, body: body.to_string() };
+    if retryable {
+        ApiError::retryable(retry_after_ms.unwrap_or(0), err)
+    } else {
+        ApiError::other(err)
     }
 }
-
-impl std::error::Error for AnthropicStreamError {}
 
 // -- SSE interpretation --
 
@@ -927,18 +927,10 @@ impl SseInterpreter for AnthropicState {
             }
 
             "error" => {
-                let is_rate_limit = serde_json::from_str::<Value>(&sse.data)
-                    .ok()
-                    .and_then(|p| p["error"]["type"].as_str().map(|s| s == "rate_limit_error"))
-                    .unwrap_or(false);
-
-                let err = AnthropicStreamError { raw: sse.data.clone() };
-
-                if is_rate_limit {
-                    out.push(Err(ApiError::rate_limited(5000, err)));
-                } else {
-                    out.push(Err(ApiError::other(err)));
-                }
+                // A mid-stream error event -- classify it with the same shared
+                // policy as an HTTP error so an `overloaded_error` or
+                // `rate_limit_error` here rides out like its status-code twin.
+                out.push(Err(classify_error(0, &sse.data, None)));
             }
 
             other => { error!("Unknown SSE event type: [{}]", other); }
@@ -947,5 +939,3 @@ impl SseInterpreter for AnthropicState {
         out
     }
 }
-
-

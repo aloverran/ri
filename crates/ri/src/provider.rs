@@ -90,20 +90,21 @@ pub struct RequestOptions {
 
 type BoxError = Box<dyn std::error::Error + Send + Sync + 'static>;
 
-/// An error from an LLM provider. Actionable variants (`RateLimited`,
-/// `ContextOverflow`) carry structured data for the agent loop to act on.
-/// Everything else flows through `Other` transparently, preserving the
-/// full source chain for diagnostics.
+/// An error from an LLM provider. The one actionable distinction is whether the
+/// caller should retry: `Retryable` carries the provider's requested delay for
+/// the backoff policy to act on. Everything else flows through `Other`
+/// transparently, preserving the full source chain for diagnostics.
 #[derive(Debug, thiserror::Error)]
 pub enum ApiError {
-    #[error("rate limited, retry after {retry_after_ms}ms")]
-    RateLimited {
+    /// A transient failure worth riding out with backoff: rate limits (429),
+    /// provider overload (Anthropic 529), transient server errors (500/502/503),
+    /// dropped connections. `retry_after_ms` is the provider's requested floor --
+    /// from a `retry-after` header or a body hint, or 0 when none was given --
+    /// which the retry policy clamps and schedules around. The specific wire
+    /// cause survives in `source` for diagnostics (`display_chain`).
+    #[error("retryable provider error, retry after {retry_after_ms}ms")]
+    Retryable {
         retry_after_ms: u64,
-        source: BoxError,
-    },
-
-    #[error("context overflow")]
-    ContextOverflow {
         source: BoxError,
     },
 
@@ -116,12 +117,10 @@ impl ApiError {
         Self::Other(source.into())
     }
 
-    pub fn rate_limited(retry_after_ms: u64, source: impl Into<BoxError>) -> Self {
-        Self::RateLimited { retry_after_ms, source: source.into() }
-    }
-
-    pub fn context_overflow(source: impl Into<BoxError>) -> Self {
-        Self::ContextOverflow { source: source.into() }
+    /// Construct a transient error the caller should retry after at least
+    /// `retry_after_ms` (pass 0 when the provider gave no hint).
+    pub fn retryable(retry_after_ms: u64, source: impl Into<BoxError>) -> Self {
+        Self::Retryable { retry_after_ms, source: source.into() }
     }
 
     /// Walk the full source chain into a single string for logging or persistence.

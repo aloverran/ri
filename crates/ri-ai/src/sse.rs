@@ -17,11 +17,10 @@ use ri::{ApiError, StreamEvent};
 
 // -- HTTP error type --
 
-/// HTTP-level error from a provider API. Carries the status code and raw
-/// response body so diagnostics survive the `BoxError` journey through `ApiError`.
-///
-/// Shared by all providers that use `sse::send` (Anthropic, Gemini).
-/// Providers with custom HTTP handling (Codex) define their own.
+/// A provider error carrying the status code and raw response body so
+/// diagnostics survive the `BoxError` journey through `ApiError`. The one error
+/// carrier for every provider -- HTTP responses (status set) and mid-stream
+/// `error` events (status 0, code recovered from the body).
 #[derive(Debug)]
 pub struct HttpApiError {
     pub status: u16,
@@ -37,6 +36,13 @@ impl fmt::Display for HttpApiError {
             .and_then(|v| serde_json::to_string_pretty(&v).ok())
             .unwrap_or_else(|| self.body.clone());
 
+        // A mid-stream error event has no HTTP status (0); omit the prefix then.
+        let prefix = if self.status == 0 {
+            String::new()
+        } else {
+            format!("HTTP {}: ", self.status)
+        };
+
         if let Some(error) = serde_json::from_str::<serde_json::Value>(&self.body)
             .ok()
             .as_ref()
@@ -44,11 +50,10 @@ impl fmt::Display for HttpApiError {
         {
             let error_type = error["type"].as_str().unwrap_or("unknown");
             let message = error["message"].as_str().unwrap_or(&self.body);
-            return write!(f, "HTTP {}: {}: {}\n\nRaw response:\n{}",
-                self.status, error_type, message, pretty);
+            return write!(f, "{}{}: {}\n\nRaw response:\n{}", prefix, error_type, message, pretty);
         }
 
-        write!(f, "HTTP {}\n\nRaw response:\n{}", self.status, pretty)
+        write!(f, "{}\n\nRaw response:\n{}", prefix.trim_end_matches(": "), pretty)
     }
 }
 
@@ -56,46 +61,56 @@ impl std::error::Error for HttpApiError {}
 
 // -- HTTP dispatch --
 
+/// Send a request and return its SSE byte stream, or turn a failure into an
+/// `ApiError`. Transport failures (no HTTP response, or a dropped connection)
+/// are generic and handled here; an HTTP error response is handed to the
+/// provider's `classify` closure -- only the provider knows its own error shape.
+/// The standard `retry-after` header (a generic HTTP signal) is parsed and
+/// passed along as a hint the provider may use or override from its own body.
 pub async fn send(
     builder: reqwest::RequestBuilder,
+    classify: impl FnOnce(u16, &str, Option<u64>) -> ApiError,
 ) -> Result<impl futures::Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Send, ApiError> {
     let response = builder.send().await
-        .map_err(|e| ApiError::other(e))?;
+        .map_err(classify_transport_error)?;
     let status = response.status().as_u16();
 
     if status >= 400 {
+        let retry_after = retry_after_header_ms(response.headers());
         let body = response.text().await.unwrap_or_default();
-        return Err(classify_http_error(status, &body));
+        return Err(classify(status, &body, retry_after));
     }
 
     Ok(response.bytes_stream())
 }
 
-/// Wrap an HTTP error response in the appropriate `ApiError` variant.
-/// Classification reads from the raw body; formatting lives in `HttpApiError::Display`.
-fn classify_http_error(status: u16, body: &str) -> ApiError {
-    let err = HttpApiError { status, body: body.to_string() };
-
-    if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(body) {
-        if let Some(error) = parsed.get("error") {
-            let error_type = error["type"].as_str().unwrap_or("unknown");
-            let message = error["message"].as_str().unwrap_or("");
-
-            if error_type == "rate_limit_error" || status == 429 {
-                return ApiError::rate_limited(5000, err);
-            }
-            if message.contains("token") && (message.contains("exceed") || message.contains("limit")) {
-                return ApiError::context_overflow(err);
-            }
-            return ApiError::other(err);
-        }
+/// Classify a transport-level failure -- the request never produced an HTTP
+/// status, or the connection dropped mid-stream. Generic, not provider-specific:
+/// timeouts and broken connections are transient (the request simply didn't
+/// complete), so a fresh retry usually succeeds; a request we failed to build is
+/// our own bug and fatal.
+fn classify_transport_error(err: reqwest::Error) -> ApiError {
+    if err.is_timeout() || err.is_connect() || err.is_body() || err.is_decode() {
+        ApiError::retryable(0, err)
+    } else {
+        ApiError::other(err)
     }
+}
 
-    if status == 429 || body.contains("RESOURCE_EXHAUSTED") {
-        return ApiError::rate_limited(5000, err);
+/// Parse the standard `retry-after` (seconds) / `retry-after-ms` (milliseconds)
+/// HTTP headers into milliseconds. Generic HTTP plumbing -- the provider's
+/// `classify` receives this as a hint.
+fn retry_after_header_ms(headers: &reqwest::header::HeaderMap) -> Option<u64> {
+    if let Some(ms) = headers.get("retry-after-ms")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.trim().parse::<u64>().ok())
+    {
+        return Some(ms);
     }
-
-    ApiError::other(err)
+    headers.get("retry-after")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .map(|secs| secs * 1000)
 }
 
 // -- SSE parsing --
@@ -174,7 +189,7 @@ pub fn drive_sse_stream(
                     }
                 }
                 Err(e) => {
-                    yield Err(ApiError::other(e));
+                    yield Err(classify_transport_error(e));
                     return;
                 }
             }

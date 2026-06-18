@@ -299,9 +299,57 @@ impl LlmProvider for GeminiProvider {
         };
         let resolved = self.resolve_blobs(&opts, api_key.as_deref()).await;
         let request = build_request(self.variant, &token, &project_id, &opts, &resolved);
-        let bytes = sse::send(request).await?;
+        let bytes = sse::send(request, classify_error).await?;
         Ok(Box::pin(sse::drive_sse_stream(bytes, GeminiState::new())))
     }
+}
+
+/// Map a Gemini error response to an `ApiError`. Gemini's transient failures are
+/// 429 `RESOURCE_EXHAUSTED` (a per-minute throttle) and 500/503 `UNAVAILABLE`;
+/// it delivers its retry delay in the body as a `google.rpc.RetryInfo` detail. A
+/// 429 that names a daily quota (`PerDay`/`QUOTA_EXHAUSTED`) is permanent -- it
+/// would just keep failing -- so it is NOT retried. Used for both the HTTP
+/// response (status set) and a mid-stream error chunk (status from `error.code`).
+fn classify_error(status: u16, body: &str, retry_after_ms: Option<u64>) -> ApiError {
+    let json = serde_json::from_str::<Value>(body).ok();
+    let error = json.as_ref().and_then(|p| p.get("error"));
+    let gstatus = error.and_then(|e| e["status"].as_str());
+
+    let rate_limited = status == 429 || gstatus == Some("RESOURCE_EXHAUSTED");
+    let server_error = (500..=599).contains(&status) || gstatus == Some("UNAVAILABLE");
+
+    let err = sse::HttpApiError { status, body: body.to_string() };
+    if rate_limited && is_permanent_quota(error) {
+        return ApiError::other(err); // daily/balance exhaustion -- would keep failing
+    }
+    if rate_limited || server_error {
+        let delay = retry_after_ms.or_else(|| retry_info_delay_ms(error)).unwrap_or(0);
+        return ApiError::retryable(delay, err);
+    }
+    ApiError::other(err)
+}
+
+/// Whether a Gemini 429 names a daily/long-window quota or exhausted balance --
+/// the throttle won't clear on a short backoff (the `QuotaFailure`/`ErrorInfo`
+/// details carry the metric name).
+fn is_permanent_quota(error: Option<&Value>) -> bool {
+    let Some(error) = error else { return false };
+    let hay = error.to_string().to_lowercase();
+    hay.contains("perday") || hay.contains("daily") || hay.contains("quota_exhausted")
+}
+
+/// Gemini's retry delay lives in the body as a `google.rpc.RetryInfo` detail
+/// with a `retryDelay` like "15s" or "27.2s".
+fn retry_info_delay_ms(error: Option<&Value>) -> Option<u64> {
+    let details = error?["details"].as_array()?;
+    for d in details {
+        if d["@type"].as_str().is_some_and(|t| t.ends_with("RetryInfo")) {
+            let s = d["retryDelay"].as_str()?;
+            let secs: f64 = s.trim().trim_end_matches('s').parse().ok()?;
+            return Some((secs * 1000.0) as u64);
+        }
+    }
+    None
 }
 
 /// Maximum raw blob size sent inline as base64. Larger blobs -- and all video,
@@ -936,14 +984,13 @@ impl GeminiState {
         let response = chunk.get("response").unwrap_or(&chunk);
 
         if let Some(error) = chunk.get("error").or_else(|| response.get("error")) {
-            let message = error["message"].as_str().unwrap_or("Unknown API error").to_string();
-            let verbose = format!(
-                "{message}\n\nRaw API response:\n{}",
-                serde_json::to_string_pretty(error).unwrap_or_default(),
-            );
+            // Flush any in-progress block, then surface this as a classified
+            // error so a retryable rate-limit/overload here rides out through
+            // the same policy as an HTTP error rather than ending the turn.
             self.finish_block(&mut out);
-            out.push(Ok(StreamEvent::Error(verbose)));
-            out.push(Ok(StreamEvent::Done));
+            let code = error.get("code").and_then(|c| c.as_u64()).unwrap_or(0) as u16;
+            let body = serde_json::json!({ "error": error }).to_string();
+            out.push(Err(classify_error(code, &body, None)));
             self.done = true;
             return out;
         }

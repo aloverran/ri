@@ -404,36 +404,6 @@ async fn send_with_retry(
 
 // -- Codex error types --
 
-/// HTTP-level error from the Codex API. Codex uses `error.code` or
-/// `error.type` for classification (distinct from Anthropic's `error.type`).
-#[derive(Debug)]
-struct CodexHttpError {
-    status: u16,
-    body: String,
-}
-
-impl fmt::Display for CodexHttpError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let pretty = serde_json::from_str::<Value>(&self.body)
-            .ok()
-            .and_then(|v| serde_json::to_string_pretty(&v).ok())
-            .unwrap_or_else(|| self.body.clone());
-
-        if let Some(message) = serde_json::from_str::<Value>(&self.body)
-            .ok()
-            .as_ref()
-            .and_then(|p| p.get("error"))
-            .and_then(|e| e["message"].as_str())
-        {
-            return write!(f, "HTTP {}: {}\n\nRaw response:\n{}", self.status, message, pretty);
-        }
-
-        write!(f, "HTTP {}\n\nRaw response:\n{}", self.status, pretty)
-    }
-}
-
-impl std::error::Error for CodexHttpError {}
-
 /// Error received during a Codex SSE stream (`error` or `response.failed` events).
 /// Stores the parsed event since Codex SSE payloads are already JSON.
 #[derive(Debug)]
@@ -459,27 +429,28 @@ impl fmt::Display for CodexStreamError {
 impl std::error::Error for CodexStreamError {}
 
 fn parse_codex_error(status: u16, body: &str) -> ApiError {
-    let err = CodexHttpError { status, body: body.to_string() };
+    // OpenAI's transient failures: 429 (rate limit / model overloaded) and 5xx
+    // server errors. A permanent balance (`insufficient_quota`) is NOT retried --
+    // it would just keep failing and burn the backoff schedule.
+    let code = serde_json::from_str::<Value>(body).ok().and_then(|p| {
+        p["error"]["code"]
+            .as_str()
+            .or_else(|| p["error"]["type"].as_str())
+            .map(String::from)
+    });
 
-    if let Ok(parsed) = serde_json::from_str::<Value>(body) {
-        if let Some(error) = parsed.get("error") {
-            let code = error["code"].as_str()
-                .or_else(|| error["type"].as_str())
-                .unwrap_or("");
-
-            if code.contains("usage_limit") || code.contains("rate_limit") || status == 429 {
-                return ApiError::rate_limited(60_000, err);
-            }
-
-            return ApiError::other(err);
-        }
+    let err = crate::sse::HttpApiError { status, body: body.to_string() };
+    if code.as_deref() == Some("insufficient_quota") {
+        return ApiError::other(err);
     }
-
-    if status == 429 {
-        return ApiError::rate_limited(60_000, err);
+    let retryable = status == 429
+        || (500..=599).contains(&status)
+        || matches!(code.as_deref(), Some("rate_limit_exceeded" | "usage_limit" | "server_error"));
+    if retryable {
+        ApiError::retryable(0, err)
+    } else {
+        ApiError::other(err)
     }
-
-    ApiError::other(err)
 }
 
 // -- Request body --
