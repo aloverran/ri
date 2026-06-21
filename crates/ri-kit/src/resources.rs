@@ -1,8 +1,8 @@
 // Context file discovery and settings for ri.
 //
-// Shared between ri-cli and ri-web. Discovers AGENTS.md / CLAUDE.md from
-// the global config directory (~/.config/agents/) and project-local locations,
-// walking up from the working directory.
+// Shared between ri-cli and ri-web. Discovers AGENTS.md / CLAUDE.md / README.md
+// from the global config directory (~/.config/agents/) and project-local
+// locations, walking up from the working directory.
 
 use std::collections::HashSet;
 use std::env;
@@ -11,7 +11,12 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-const CONTEXT_FILE_NAMES: &[&str] = &["AGENTS.md", "CLAUDE.md"];
+/// The file names discovered as agent context, in injection-priority order.
+/// AGENTS.md and CLAUDE.md carry agent instructions; README.md rides along to
+/// give the agent a project's human-facing overview wherever one lives. Matched
+/// case-insensitively (see `scan_dir`), so a third-party project's `readme.md`
+/// or `Readme.md` is found just as readily as `README.md`.
+pub const CONTEXT_FILE_NAMES: &[&str] = &["AGENTS.md", "CLAUDE.md", "README.md"];
 
 /// Maximum directory levels to walk upward before stopping. Prevents
 /// unbounded traversal when the starting directory is deeply nested.
@@ -67,9 +72,9 @@ pub fn walk_ancestors(dir: &Path) -> Vec<PathBuf> {
     dirs
 }
 
-/// Walk up from `dir`, collecting context files (AGENTS.md, CLAUDE.md).
-/// At each level checks `.agents/` subdirectory then the directory itself.
-/// Returns files in walk order (closest first).
+/// Walk up from `dir`, collecting context files (AGENTS.md, CLAUDE.md,
+/// README.md). At each level checks `.agents/` subdirectory then the directory
+/// itself. Returns files in walk order (closest first).
 pub fn find_context_files(dir: &Path) -> Vec<ContextFile> {
     let mut files = Vec::new();
     let mut seen = HashSet::new();
@@ -155,27 +160,58 @@ fn collect_walk(dir: &Path, files: &mut Vec<ContextFile>, seen: &mut HashSet<Pat
     }
 }
 
-/// Scan a directory for context files (AGENTS.md, CLAUDE.md).
+/// Scan a directory for context files (AGENTS.md, CLAUDE.md, README.md),
+/// matching each name case-insensitively so a project's `readme.md` reads the
+/// same as `README.md`. Names are tried in `CONTEXT_FILE_NAMES` priority order.
 /// Each discovered file is the root of its own include graph; its parent
 /// directory becomes the boundary that includes cannot escape above.
 fn scan_dir(dir: &Path, files: &mut Vec<ContextFile>, seen: &mut HashSet<PathBuf>) {
-    for name in CONTEXT_FILE_NAMES {
-        let p = dir.join(name);
-        if p.is_file() {
-            if let Ok(raw) = fs::read_to_string(&p) {
-                let canonical = p.canonicalize().unwrap_or_else(|_| p.clone());
-                if seen.insert(canonical.clone()) {
-                    let boundary = canonical.parent()
-                        .map(|d| d.to_path_buf())
-                        .unwrap_or_else(|| canonical.clone());
-                    let mut visited = HashSet::new();
-                    visited.insert(canonical);
-                    let content = expand_includes(&raw, dir, &boundary, &mut visited);
-                    files.push(ContextFile { path: p, content });
-                }
+    let names = dir_filenames(dir);
+    for target in CONTEXT_FILE_NAMES {
+        for name in names.iter().filter(|n| n.eq_ignore_ascii_case(target)) {
+            let p = dir.join(name);
+            if !p.is_file() {
+                continue;
+            }
+            let Ok(raw) = fs::read_to_string(&p) else { continue };
+            let canonical = p.canonicalize().unwrap_or_else(|_| p.clone());
+            if seen.insert(canonical.clone()) {
+                let boundary = canonical.parent()
+                    .map(|d| d.to_path_buf())
+                    .unwrap_or_else(|| canonical.clone());
+                let mut visited = HashSet::new();
+                visited.insert(canonical);
+                let content = expand_includes(&raw, dir, &boundary, &mut visited);
+                files.push(ContextFile { path: p, content });
             }
         }
     }
+}
+
+/// The sorted file names directly inside `dir`. A missing directory yields an
+/// empty list silently -- a `.agents/` subdir usually doesn't exist, and that is
+/// not an anomaly -- while any other read error is surfaced as a warning and
+/// likewise treated as empty. Sorting makes discovery order deterministic
+/// regardless of how the filesystem happens to enumerate entries.
+fn dir_filenames(dir: &Path) -> Vec<String> {
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
+        Err(e) => {
+            tracing::warn!(
+                "could not read directory [{}] while discovering context files: {}",
+                dir.display(),
+                e,
+            );
+            return Vec::new();
+        }
+    };
+    let mut names: Vec<String> = entries
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    names
 }
 
 /// Expand `{{include:path}}` directives in `content`, recursively.
@@ -187,8 +223,8 @@ fn scan_dir(dir: &Path, files: &mut Vec<ContextFile>, seen: &mut HashSet<PathBuf
 /// - `visited`: canonical paths already in the include stack, for cycle
 ///   detection.
 ///
-/// Shared by AGENTS.md/CLAUDE.md discovery and the glob-rule discovery in
-/// ri-web (for global rules, which live on the server's own filesystem), so
+/// Shared by AGENTS.md/CLAUDE.md/README.md discovery and the glob-rule discovery
+/// in ri-web (for global rules, which live on the server's own filesystem), so
 /// every context prompt file expands includes the same way.
 pub fn expand_includes(
     content: &str,
