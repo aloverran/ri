@@ -107,17 +107,78 @@ pub fn create(
     exec: Arc<dyn MetaExec>,
     session_id: RefId,
 ) -> Vec<Box<dyn Tool>> {
-    vec![
+    create_with(store, exec, session_id, true)
+}
+
+/// Build the meta-tools for a spawned child, with `runAgent` omitted: a
+/// sub-agent cannot spawn its own children (unbounded recursion, blocked for
+/// now), so the recursive tool is never *constructed* for it. The block is
+/// structural -- a child's loop cannot hold a tool that was never built -- not a
+/// downstream string filter that a drift could defeat. The other seven tools are
+/// identical to [`create`].
+pub fn create_child(
+    store: Arc<dyn StoreAccess>,
+    exec: Arc<dyn MetaExec>,
+    session_id: RefId,
+) -> Vec<Box<dyn Tool>> {
+    create_with(store, exec, session_id, false)
+}
+
+/// The shared builder behind [`create`] and [`create_child`]. `include_run_agent`
+/// is the one axis on which a child's tool set differs from a top-level
+/// orchestrator's; `runAgent` sits just before `readAgent` so the order still
+/// matches [`TOOL_NAMES`] either way.
+fn create_with(
+    store: Arc<dyn StoreAccess>,
+    exec: Arc<dyn MetaExec>,
+    session_id: RefId,
+    include_run_agent: bool,
+) -> Vec<Box<dyn Tool>> {
+    let mut tools: Vec<Box<dyn Tool>> = vec![
         Box::new(CreateMessageTool { store: store.clone(), session_id: session_id.clone() }),
         Box::new(ReadMessageTool { store: store.clone() }),
         Box::new(CreateContextTool { store: store.clone(), session_id: session_id.clone() }),
         Box::new(ReadContextTool { store: store.clone() }),
         Box::new(UpdateRefTool { store: store.clone(), exec: exec.clone(), session_id }),
         Box::new(ReadRefTool { store: store.clone() }),
-        Box::new(RunAgentTool { store: store.clone(), exec: exec.clone() }),
-        Box::new(ReadAgentTool { store, exec }),
-    ]
+    ];
+    if include_run_agent {
+        tools.push(Box::new(RunAgentTool { store: store.clone(), exec: exec.clone() }));
+    }
+    tools.push(Box::new(ReadAgentTool { store, exec }));
+    // `TOOL_NAMES` is a hand-maintained mirror used to advertise/validate the
+    // tools without a seam to build them; assert it matches what we actually
+    // build, loudly and in debug, so a tool added here but forgotten there can't
+    // silently become un-advertised and un-passable.
+    debug_assert!(
+        tools.iter().map(|t| t.name())
+            .eq(TOOL_NAMES.iter().copied().filter(|n| include_run_agent || *n != RUN_AGENT)),
+        "meta-tool set drifted from TOOL_NAMES (include_run_agent={})", include_run_agent
+    );
+    tools
 }
+
+/// The name of the `runAgent` meta-tool. Called out as a constant because it is
+/// the one meta-tool a harness may deliberately withhold from a spawned child:
+/// letting a sub-agent spawn its own sub-agents is unbounded recursion, so a
+/// harness that blocks downward spawning filters this name out of the set it
+/// advertises and builds for children.
+pub const RUN_AGENT: &str = "runAgent";
+
+/// The names of the eight meta-tools, in the order [`create`] builds them. The
+/// single source of truth a harness uses to advertise or filter the meta-tools
+/// -- e.g. "base tools plus every meta-tool except [`RUN_AGENT`]" for the set a
+/// child may receive. Must stay in sync with the set [`create`] returns.
+pub const TOOL_NAMES: &[&str] = &[
+    "createMessage",
+    "readMessage",
+    "createContext",
+    "readContext",
+    "updateRef",
+    "readRef",
+    RUN_AGENT,
+    "readAgent",
+];
 
 // -- Message -----------------------------------------------------------------
 
@@ -1102,7 +1163,7 @@ struct RunAgentTool {
 #[async_trait]
 impl Tool for RunAgentTool {
     fn name(&self) -> &str {
-        "runAgent"
+        RUN_AGENT
     }
 
     fn description(&self) -> &str {
@@ -1299,6 +1360,16 @@ impl Tool for ReadAgentTool {
             out.push_str(&format!("model: {}\n", model));
         }
 
+        // The toolset the most recent turn ran with -- the runtime counterpart
+        // of `model`, read the same way off the result meta.
+        let tools = latest_tools(&head_messages);
+        if let Some(names) = &tools {
+            out.push_str(&format!(
+                "tools: {}\n",
+                if names.is_empty() { "(none -- single turn)".to_string() } else { names.join(", ") }
+            ));
+        }
+
         if let Some(partial) = &status.streaming_preview {
             out.push_str(&format!("streaming: {}\n", truncate(partial, 280)));
         }
@@ -1308,6 +1379,7 @@ impl Tool for ReadAgentTool {
         ToolOutput::text(out).with_details(json!({
             "session_id": session_id.to_string(),
             "running": status.running,
+            "tools": tools,
         }))
     }
 }
@@ -1320,6 +1392,24 @@ fn latest_model(messages: &[Message]) -> Option<String> {
         .and_then(|meta| meta.get("model"))
         .and_then(|v| v.as_str())
         .map(str::to_string)
+}
+
+/// The tool names the session's most recent tool-bearing assistant turn ran
+/// with, read from its `meta.tools`. The mirror of [`latest_model`], and the one
+/// reader of "what toolset this session last ran" -- shared by `readAgent` and
+/// by a harness reconstructing a continued session's tools. An empty array is a
+/// real recorded value (a single-turn agent), distinct from `None` (no turn has
+/// recorded a toolset yet); a trailing error message records no tools and is
+/// skipped, so the last real toolset still surfaces.
+pub fn latest_tools(messages: &[Message]) -> Option<Vec<String>> {
+    messages.iter().rev()
+        .filter(|m| m.role == Role::Assistant)
+        .find_map(|m| {
+            m.meta.as_ref()
+                .and_then(|meta| meta.get("tools"))
+                .and_then(|v| v.as_array())
+                .map(|arr| arr.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+        })
 }
 
 /// A short preview of an agent's latest output: the last assistant message's
