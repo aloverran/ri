@@ -167,6 +167,15 @@ impl Pool {
         self.inner.lock().unwrap().refs.get(id).cloned()
     }
 
+    /// Wall-clock of the line that produced `id`'s current state -- the
+    /// ref's "last touched" time, advanced on every write to it (head
+    /// move, facet edit, creation) and reloaded from the freshest line on
+    /// disk. `None` only if no line for `id` has been loaded. Distinct
+    /// from the chat facet's `created_at`, which is frozen at birth.
+    pub fn ref_ts(&self, id: &RefId) -> Option<DateTime<Utc>> {
+        self.inner.lock().unwrap().ref_ts.get(id).copied()
+    }
+
     /// Convenience: fetch the context a ref currently points at. `None`
     /// if either the ref or its head context is missing from the pool.
     pub fn head_context(&self, ref_id: &RefId) -> Option<Context> {
@@ -409,6 +418,7 @@ impl Store {
     pub fn get_message(&self, id: &MessageId) -> Option<Message> { self.pool.get_message(id) }
     pub fn get_context(&self, id: &ContextId) -> Option<Context> { self.pool.get_context(id) }
     pub fn get_ref(&self, id: &RefId) -> Option<Ref> { self.pool.get_ref(id) }
+    pub fn ref_ts(&self, id: &RefId) -> Option<DateTime<Utc>> { self.pool.ref_ts(id) }
 
     /// Shorthand for `pool.head_context(ref_id)`. Widely used by chat
     /// apps so worth the four lines.
