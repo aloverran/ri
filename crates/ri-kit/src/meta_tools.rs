@@ -795,7 +795,10 @@ impl Tool for ReadContextTool {
          list (with inline summaries), its immediate parents and children for \
          navigation, and its ancestor chain as a diff at each step (what that \
          context added or removed versus its parent). 'depth' bounds the \
-         ancestor walk (default 10)."
+         ancestor walk (default 10). Or pass 'diff_base' (a context id you \
+         already read) to see only what's changed since then -- the new \
+         messages, any removed ones noted, the full list and ancestor walk \
+         omitted. Ideal for cheaply polling a session for what's new."
     }
 
     fn parameters(&self) -> Value {
@@ -812,7 +815,16 @@ impl Tool for ReadContextTool {
                 },
                 "depth": {
                     "type": "integer",
-                    "description": "How far up the ancestor chain to walk. Default 10."
+                    "description": "How far up the ancestor chain to walk. Default 10. Ignored when diff_base is set."
+                },
+                "diff_base": {
+                    "type": "string",
+                    "description": "Optional context id to diff this context against. \
+                        When set, the reply shows only this context's messages that \
+                        are not already in the base (what's new since you last saw \
+                        it), with any removed messages noted; the full message list \
+                        and ancestor walk are omitted. Must be a context id (the one \
+                        you last read), not a session id."
                 }
             }
         })
@@ -846,18 +858,60 @@ impl Tool for ReadContextTool {
             None => return ToolOutput::error(&format!("context '{}' not found", focal_id)),
         };
 
+        // Optional diff base. Resolved as a context id only -- never a ref:
+        // a ref resolves to the live head (= focal here), which would silently
+        // diff focal against itself. A present-but-malformed base (wrong type,
+        // empty, or an unknown id) is surfaced loudly rather than ignored.
+        let diff_base = if let Some(raw) = input.get("diff_base") {
+            match raw.as_str() {
+                Some(s) if !s.is_empty() => {
+                    let base_id = ContextId::from(s);
+                    match store.get_context(&base_id) {
+                        Some(c) => Some(c),
+                        None => return ToolOutput::error(&format!("diff_base context '{}' not found", base_id)),
+                    }
+                }
+                _ => return ToolOutput::error("'diff_base' must be a context id string"),
+            }
+        } else {
+            None
+        };
+
         let mut out = format!("CONTEXT {}\n", focal_id);
         out.push_str(&format!("parents: {}\n", id_list(&focal.parents)));
         let children: Vec<ContextId> = store.children(&focal_id).into_iter().map(|c| c.id).collect();
         out.push_str(&format!("children: {}\n", id_list_capped(&children, 12)));
 
-        out.push_str(&format!("\nmessages ({}):\n", focal.messages.len()));
-        append_message_list(&mut out, &store, &focal.messages);
-
-        append_ancestors(&mut out, &store, &focal, depth);
+        // A diff base turns the read into a delta against it -- the messages new
+        // to focal since the caller last saw that base. Without one, the full
+        // message list plus the ancestry log: the two other reads a node affords.
+        if let Some(base) = diff_base {
+            append_base_diff(&mut out, &store, &base, &focal);
+        } else {
+            out.push_str(&format!("\nmessages ({}):\n", focal.messages.len()));
+            append_message_list(&mut out, &store, &focal.messages);
+            append_ancestors(&mut out, &store, &focal, depth);
+        }
 
         ToolOutput::text(out)
     }
+}
+
+/// Render `focal` as a two-tree diff against `base`: the messages in focal not
+/// already in base, and any base had that focal does not. A pure set difference
+/// over message ids -- no chain walk, well-defined for any two contexts.
+fn append_base_diff(out: &mut String, store: &Store, base: &Context, focal: &Context) {
+    let (added, removed) = diff_message_lists(&base.messages, &focal.messages);
+    if added.is_empty() && removed.is_empty() {
+        out.push_str(&format!("\nno new messages since {}\n", base.id));
+        return;
+    }
+    if removed.is_empty() {
+        out.push_str(&format!("\n{} new since {}:\n", added.len(), base.id));
+    } else {
+        out.push_str(&format!("\n{} new, {} removed since {}:\n", added.len(), removed.len(), base.id));
+    }
+    append_diff(out, store, &added, &removed);
 }
 
 /// Walk the first-parent chain from `focal`, rendering each ancestor as a diff
