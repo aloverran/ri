@@ -520,7 +520,7 @@ async fn update_ref_create_update_guard_and_canary() {
     // Ownership guard: a different ref a running agent owns is refused.
     let store = mount(&f.dir);
     let other = ri_kit::chat::create(&store, ri_kit::chat::ChatFacet {
-        title: "other".into(), created_at: "t".into(), cwd: String::new(),
+        title: "other".into(), cwd: String::new(),
         host: None, parent: None, pinned: false,
     }).unwrap();
     f.seam.mark_running(&other.id);

@@ -75,9 +75,17 @@ struct PoolInner {
     messages: HashMap<MessageId, Message>,
     contexts: HashMap<ContextId, Context>,
     refs: HashMap<RefId, Ref>,
-    /// Wall-clock ts of the line that produced each ref's current state.
-    /// Used to discard older snapshots when the same RefId appears in
-    /// multiple files or mounts.
+    /// First-write wall-clock of each message and context: the instant the
+    /// store persisted the atom. Immutable atoms are written once, so this
+    /// is their insertion time. Absent for legacy lines that predate the
+    /// stamp.
+    message_inserted: HashMap<MessageId, DateTime<Utc>>,
+    context_inserted: HashMap<ContextId, DateTime<Utc>>,
+    /// Creation and last-write wall-clock of each ref. A ref is an
+    /// append-only run of full snapshots: `ref_created` is the earliest
+    /// line (its birth, frozen) and `ref_ts` the latest (its last touch,
+    /// which also drives snapshot supersession on load).
+    ref_created: HashMap<RefId, DateTime<Utc>>,
     ref_ts: HashMap<RefId, DateTime<Utc>>,
     /// Mount directory plus its per-file write locks.
     mounts: HashMap<MountId, Mount>,
@@ -106,6 +114,9 @@ impl Pool {
                 messages: HashMap::new(),
                 contexts: HashMap::new(),
                 refs: HashMap::new(),
+                message_inserted: HashMap::new(),
+                context_inserted: HashMap::new(),
+                ref_created: HashMap::new(),
                 ref_ts: HashMap::new(),
                 mounts: HashMap::new(),
                 next_mount: 0,
@@ -167,11 +178,35 @@ impl Pool {
         self.inner.lock().unwrap().refs.get(id).cloned()
     }
 
+    /// Insertion time of a message -- the wall-clock the store first
+    /// persisted it. Messages are immutable and written once, so this is a
+    /// stable birth stamp. `None` if the message isn't loaded or its line
+    /// predates the stamp. Display metadata only: ordering and "what's
+    /// new" are answered by the context DAG, never by this clock.
+    pub fn inserted_at(&self, id: &MessageId) -> Option<DateTime<Utc>> {
+        self.inner.lock().unwrap().message_inserted.get(id).copied()
+    }
+
+    /// Insertion time of a context, as [`Pool::inserted_at`] is for
+    /// messages.
+    pub fn context_inserted_at(&self, id: &ContextId) -> Option<DateTime<Utc>> {
+        self.inner.lock().unwrap().context_inserted.get(id).copied()
+    }
+
+    /// Creation time of a ref -- the earliest snapshot line written for it,
+    /// frozen across later head moves. Derived purely from the lines on
+    /// disk (the minimum `ts`), so it never drifts and a remount rebuilds
+    /// it. `None` if the ref isn't loaded. Pairs with [`Pool::ref_ts`],
+    /// which tracks the latest line (last touched).
+    pub fn ref_created_at(&self, id: &RefId) -> Option<DateTime<Utc>> {
+        self.inner.lock().unwrap().ref_created.get(id).copied()
+    }
+
     /// Wall-clock of the line that produced `id`'s current state -- the
     /// ref's "last touched" time, advanced on every write to it (head
     /// move, facet edit, creation) and reloaded from the freshest line on
-    /// disk. `None` only if no line for `id` has been loaded. Distinct
-    /// from the chat facet's `created_at`, which is frozen at birth.
+    /// disk. `None` only if no line for `id` has been loaded. Pairs with
+    /// [`Pool::ref_created_at`], its frozen birth.
     pub fn ref_ts(&self, id: &RefId) -> Option<DateTime<Utc>> {
         self.inner.lock().unwrap().ref_ts.get(id).copied()
     }
@@ -213,6 +248,7 @@ impl Pool {
     pub fn remove_ref(&self, id: &RefId) -> Option<Ref> {
         let mut inner = self.inner.lock().unwrap();
         inner.ref_ts.remove(id);
+        inner.ref_created.remove(id);
         inner.refs.remove(id)
     }
 
@@ -331,14 +367,18 @@ impl Store {
     /// Write a message. The atom is appended to this store's segment file
     /// and registered in the pool.
     pub fn write_message(&self, msg: &Message) -> eyre::Result<()> {
+        let ts = Utc::now();
         let line = serde_json::to_string(&MessageLine {
             msg: msg.id.clone(),
             role: msg.role,
             content: msg.content.clone(),
+            ts: Some(ts),
             meta: msg.meta.clone(),
         })?;
         self.append_line(&line)?;
-        self.pool.inner.lock().unwrap().messages.insert(msg.id.clone(), msg.clone());
+        let mut inner = self.pool.inner.lock().unwrap();
+        inner.messages.insert(msg.id.clone(), msg.clone());
+        keep_earliest(&mut inner.message_inserted, msg.id.clone(), ts);
         tracing::debug!("Wrote {:?} message [{}] to mount {:?} segment [{}]", msg.role, msg.id, self.mount, self.segment.0);
         Ok(())
     }
@@ -346,14 +386,18 @@ impl Store {
     /// Write a context. Immutable by convention: writing the same id
     /// twice is a usage error but not structurally prevented.
     pub fn write_context(&self, ctx: &Context) -> eyre::Result<()> {
+        let ts = Utc::now();
         let line = serde_json::to_string(&ContextLine {
             context: ctx.id.clone(),
             messages: ctx.messages.clone(),
             parents: ctx.parents.clone(),
+            ts: Some(ts),
             meta: ctx.meta.clone(),
         })?;
         self.append_line(&line)?;
-        self.pool.inner.lock().unwrap().contexts.insert(ctx.id.clone(), ctx.clone());
+        let mut inner = self.pool.inner.lock().unwrap();
+        inner.contexts.insert(ctx.id.clone(), ctx.clone());
+        keep_earliest(&mut inner.context_inserted, ctx.id.clone(), ts);
         tracing::debug!("Wrote context [{}] to mount {:?} segment [{}] ({} messages, {} parents)",
             ctx.id, self.mount, self.segment.0, ctx.messages.len(), ctx.parents.len());
         Ok(())
@@ -375,6 +419,7 @@ impl Store {
         let mut inner = self.pool.inner.lock().unwrap();
         inner.refs.insert(r.id.clone(), r.clone());
         inner.ref_ts.insert(r.id.clone(), ts);
+        keep_earliest(&mut inner.ref_created, r.id.clone(), ts);
         tracing::debug!("Wrote ref [{}] -> [{}] to mount {:?} segment [{}]", r.id, r.head, self.mount, self.segment.0);
         Ok(())
     }
@@ -418,6 +463,9 @@ impl Store {
     pub fn get_message(&self, id: &MessageId) -> Option<Message> { self.pool.get_message(id) }
     pub fn get_context(&self, id: &ContextId) -> Option<Context> { self.pool.get_context(id) }
     pub fn get_ref(&self, id: &RefId) -> Option<Ref> { self.pool.get_ref(id) }
+    pub fn inserted_at(&self, id: &MessageId) -> Option<DateTime<Utc>> { self.pool.inserted_at(id) }
+    pub fn context_inserted_at(&self, id: &ContextId) -> Option<DateTime<Utc>> { self.pool.context_inserted_at(id) }
+    pub fn ref_created_at(&self, id: &RefId) -> Option<DateTime<Utc>> { self.pool.ref_created_at(id) }
     pub fn ref_ts(&self, id: &RefId) -> Option<DateTime<Utc>> { self.pool.ref_ts(id) }
 
     /// Shorthand for `pool.head_context(ref_id)`. Widely used by chat
@@ -537,11 +585,17 @@ impl Store {
             install_ref(&mut inner, Ref { id, head: sl.head, meta }, ts);
         } else if obj.get("msg").is_some() {
             let ml: MessageLine = serde_json::from_value(obj)?;
+            if let Some(ts) = ml.ts {
+                keep_earliest(&mut inner.message_inserted, ml.msg.clone(), ts);
+            }
             inner.messages.insert(ml.msg.clone(), Message {
                 id: ml.msg, role: ml.role, content: ml.content, meta: ml.meta,
             });
         } else if obj.get("context").is_some() {
             let cl: ContextLine = serde_json::from_value(obj)?;
+            if let Some(ts) = cl.ts {
+                keep_earliest(&mut inner.context_inserted, cl.context.clone(), ts);
+            }
             inner.contexts.insert(cl.context.clone(), Context {
                 id: cl.context, messages: cl.messages, parents: cl.parents, meta: cl.meta,
             });
@@ -587,6 +641,11 @@ fn collect_jsonl(dir: &Path, out: &mut Vec<PathBuf>, depth: usize) {
 /// later-arriving line so a same-second double-write still converges
 /// without a coin flip in the parser.
 fn install_ref(inner: &mut PoolInner, r: Ref, ts: DateTime<Utc>) {
+    // Birth = earliest snapshot line ever seen for this id. Recorded
+    // before the supersession check so an older line still counts toward
+    // creation even when it loses the head/meta race below.
+    keep_earliest(&mut inner.ref_created, r.id.clone(), ts);
+
     if let Some(existing_ts) = inner.ref_ts.get(&r.id) {
         if ts < *existing_ts {
             return;
@@ -594,6 +653,20 @@ fn install_ref(inner: &mut PoolInner, r: Ref, ts: DateTime<Utc>) {
     }
     inner.ref_ts.insert(r.id.clone(), ts);
     inner.refs.insert(r.id.clone(), r);
+}
+
+/// Record the earliest wall-clock seen for an atom id. Insertion time is
+/// the first write; when the same id appears on multiple lines (a
+/// re-persist, or the same atom loaded from two files) the minimum wins,
+/// so a remount in any order converges to the true birth.
+fn keep_earliest<K: std::hash::Hash + Eq>(
+    map: &mut HashMap<K, DateTime<Utc>>,
+    id: K,
+    ts: DateTime<Utc>,
+) {
+    map.entry(id)
+        .and_modify(|e| if ts < *e { *e = ts; })
+        .or_insert(ts);
 }
 
 /// Parse a legacy session line's `ts` field into a `DateTime<Utc>`.
@@ -621,6 +694,11 @@ struct MessageLine {
     msg: MessageId,
     role: Role,
     content: Vec<ContentBlock>,
+    /// Wall-clock of when the store first persisted this message -- its
+    /// insertion time. Optional only to tolerate legacy lines written
+    /// before the stamp existed; fresh writes always carry it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ts: Option<DateTime<Utc>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     meta: Option<serde_json::Value>,
 }
@@ -631,6 +709,9 @@ struct ContextLine {
     messages: Vec<MessageId>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     parents: Vec<ContextId>,
+    /// Insertion time, as on [`MessageLine`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ts: Option<DateTime<Utc>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     meta: Option<serde_json::Value>,
 }
@@ -671,7 +752,6 @@ fn synth_chat_meta(sl: &LegacySessionLine) -> serde_json::Value {
     json!({
         "chat": {
             "title": sl.name.clone().unwrap_or_default(),
-            "created_at": sl.ts.clone().unwrap_or_default(),
             "cwd": sl.cwd.clone().unwrap_or_default(),
             "host": sl.host.clone(),
             "parent": sl.parent.clone(),

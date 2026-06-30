@@ -493,11 +493,13 @@ impl Context {
 /// target you point at whatever context is "current". The application
 /// decides what "current" means.
 ///
-/// Refs are the minimum viable pointer. Everything else -- display name,
-/// creation timestamp, cwd, parent ref, host -- lives in `meta` via
-/// facets. This keeps the primitive neutral: chat, memory banks, and
-/// whatever comes next all attach their own typed payloads without
-/// touching core.
+/// Refs are the minimum viable pointer. Application state -- display
+/// name, cwd, parent ref, host -- lives in `meta` via facets. This keeps
+/// the primitive neutral: chat, memory banks, and whatever comes next all
+/// attach their own typed payloads without touching core. The ref's
+/// creation and last-write wall-clocks are not application state -- the
+/// store stamps them and the pool exposes them (`Pool::ref_created_at`,
+/// `Pool::ref_ts`), so they stay off the struct.
 ///
 /// On disk, every write appends a full snapshot line. Last line per
 /// RefId wins on load.

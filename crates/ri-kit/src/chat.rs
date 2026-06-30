@@ -11,9 +11,10 @@ use ri::{Context, ContextId, Facet, HasMeta, Message, Pool, Ref, RefId, Store};
 use serde::{Deserialize, Serialize};
 
 /// Application-level state for a chat session. The title drives the
-/// session list; created_at drives the sort order; cwd + host drive
-/// where the session's tools run; parent expresses sub-agent lineage;
-/// pinned sessions sort to the top of the session list view.
+/// session list; cwd + host drive where the session's tools run; parent
+/// expresses sub-agent lineage; pinned sessions sort to the top of the
+/// session list view. Creation time is not carried here -- it is core's
+/// truth, read from `Pool::ref_created_at`.
 ///
 /// This facet is shared across chat-style applications (ri-web, ri-cli)
 /// and is intentionally narrow: feature-specific per-session state
@@ -24,7 +25,6 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatFacet {
     pub title: String,
-    pub created_at: String,
     #[serde(default)]
     pub cwd: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -122,7 +122,6 @@ pub fn snapshot_ref(
         .ok_or_else(|| eyre::eyre!("snapshot source ref [{}] has no chat facet", source.id))?;
     let chat = ChatFacet {
         title: source_chat.title.clone(),
-        created_at: chrono::Utc::now().to_rfc3339(),
         cwd: source_chat.cwd.clone(),
         host: source_chat.host.clone(),
         parent: Some(source.id.clone()),
@@ -244,7 +243,6 @@ pub fn update_facet(
         .and_then(|r| r.ok())
         .unwrap_or(ChatFacet {
             title: String::new(),
-            created_at: String::new(),
             cwd: String::new(),
             host: None,
             parent: None,
