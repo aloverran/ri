@@ -471,9 +471,12 @@ impl Tool for CreateContextTool {
                 "parents": {
                     "type": "array",
                     "items": { "type": "string" },
-                    "description": "Parent context ids for DAG lineage without \
-                        embedding their messages. Contexts embedded via \
-                        context_id are already registered as parents."
+                    "description": "Lineage-only parents for the new context, \
+                        without embedding their messages. Each accepts a context \
+                        id (used as-is) or a ref id (snapshotted to its current \
+                        head context at author time); an unknown id is an error. \
+                        Contexts embedded via context_id are already registered \
+                        as parents."
                 },
                 "merge_into": {
                     "type": "string",
@@ -614,7 +617,10 @@ impl Tool for CreateContextTool {
             }
         }
 
-        // Explicit lineage-only parents (deduplicated with auto-parents).
+        // Explicit lineage-only parents, deduplicated against the embed-slot
+        // parents above. ctx-or-ref: a known context is used as-is, a ref
+        // resolves to its head -- register the resolved context, never the ref
+        // id, so the DAG never holds a ref where a context id belongs.
         if let Some(extra) = input.get("parents").and_then(|v| v.as_array()) {
             for (i, v) in extra.iter().enumerate() {
                 let id = match v.as_str() {
@@ -623,8 +629,22 @@ impl Tool for CreateContextTool {
                         "parents[{}]: must be a non-empty string", i
                     )),
                 };
-                if seen_parents.insert(id.to_string()) {
-                    parents.push(ContextId::from(id));
+                let resolved = match resolve_to_context_id(&store, id) {
+                    Some(c) => c,
+                    None => return ToolOutput::error(&format!(
+                        "parents[{}]: [{}] is neither a known context nor a ref", i, id
+                    )),
+                };
+                // Only reachable when id named a ref whose head context is
+                // missing (e.g. its family was deleted); a context id already
+                // proved present inside resolve_to_context_id.
+                if store.get_context(&resolved).is_none() {
+                    return ToolOutput::error(&format!(
+                        "parents[{}]: ref [{}] points at a missing head context [{}]", i, id, resolved
+                    ));
+                }
+                if seen_parents.insert(resolved.to_string()) {
+                    parents.push(resolved);
                 }
             }
         }

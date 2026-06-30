@@ -85,7 +85,6 @@ fn fixture(tag: &str) -> Fixture {
     let store = mount(&dir);
     let session = ri_kit::chat::create(&store, ri_kit::chat::ChatFacet {
         title: "test session".to_string(),
-        created_at: chrono::Utc::now().to_rfc3339(),
         cwd: "/tmp".to_string(),
         host: None,
         parent: None,
@@ -359,6 +358,67 @@ async fn create_context_embed_ref_and_exclude() {
     })).await;
     assert!(out.is_error);
     assert!(text(&out).contains("exclude[0]"), "got: {}", text(&out));
+}
+
+#[tokio::test]
+async fn create_context_parents_resolve_and_validate() {
+    let f = fixture("create-context-parents");
+
+    let m1 = f.one_message("user", "seed").await;
+    let ctx_a = f.context_of(&[m1.as_str()]).await;
+    let body = f.one_message("user", "body").await;
+
+    // A context id in `parents` is recorded as lineage only -- no message
+    // embedding, unlike the context_id embed slot.
+    let out = f.run("createContext", json!({
+        "messages": [ { "message_id": body.as_str() } ],
+        "parents": [ ctx_a.as_str() ]
+    })).await;
+    assert!(!out.is_error, "context-id parent failed: {}", text(&out));
+    let store = mount(&f.dir);
+    let c = store.get_context(&ContextId::from(detail_str(&out, "context_id").as_str())).unwrap();
+    assert_eq!(
+        c.messages.iter().map(|m| m.to_string()).collect::<Vec<_>>(), vec![body.clone()],
+        "a parent adds lineage only, never messages"
+    );
+    assert_eq!(c.parents.iter().map(|p| p.to_string()).collect::<Vec<_>>(), vec![ctx_a.clone()]);
+
+    // A ref id in `parents` snapshots to its head context: the stored parent is
+    // the resolved context, never the ref id.
+    f.run("updateRef", json!({ "ref_id": "ref_topic", "context_id": ctx_a })).await;
+    let out = f.run("createContext", json!({
+        "messages": [ { "message_id": body.as_str() } ],
+        "parents": [ "ref_topic" ]
+    })).await;
+    assert!(!out.is_error, "ref parent failed: {}", text(&out));
+    let store = mount(&f.dir);
+    let c = store.get_context(&ContextId::from(detail_str(&out, "context_id").as_str())).unwrap();
+    assert_eq!(
+        c.parents.iter().map(|p| p.to_string()).collect::<Vec<_>>(), vec![ctx_a.clone()],
+        "ref parent resolved to its head context, not stored as the ref id"
+    );
+
+    // A ref embedded in `messages` and also named in `parents` collapses to one
+    // parent: dedup keys on the resolved context id across both slots.
+    let out = f.run("createContext", json!({
+        "messages": [ { "context_id": "ref_topic" } ],
+        "parents": [ "ref_topic" ]
+    })).await;
+    assert!(!out.is_error, "dedup case failed: {}", text(&out));
+    let store = mount(&f.dir);
+    let c = store.get_context(&ContextId::from(detail_str(&out, "context_id").as_str())).unwrap();
+    assert_eq!(
+        c.parents.iter().map(|p| p.to_string()).collect::<Vec<_>>(), vec![ctx_a.clone()],
+        "embed + parents naming the same resolved context dedup to one parent"
+    );
+
+    // An unknown id -- neither context nor ref -- surfaces before any write.
+    let out = f.run("createContext", json!({
+        "messages": [ { "message_id": body.as_str() } ],
+        "parents": [ "ctx_nope" ]
+    })).await;
+    assert!(out.is_error);
+    assert!(text(&out).contains("neither a known context nor a ref"), "got: {}", text(&out));
 }
 
 #[tokio::test]
