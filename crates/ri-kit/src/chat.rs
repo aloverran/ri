@@ -101,6 +101,20 @@ pub fn create(store: &Store, facet: ChatFacet) -> eyre::Result<Ref> {
     create_with_id(store, RefId::generate(), facet)
 }
 
+/// Create a chat session whose head is an existing context, rather than a
+/// fresh empty root. Like [`create_with_id`] but the ref starts at `head`,
+/// so the new session's history descends from it and inherits its parents.
+///
+/// This is how a sub-agent is forked from a composed context: the session
+/// begins at that context, so whatever parent the caller set on it (its own
+/// head, or nothing) is exactly what the sub-agent connects to in the DAG.
+/// `head` must already exist in the store; no context is written here.
+pub fn create_with_head(store: &Store, id: RefId, head: ContextId, facet: ChatFacet) -> eyre::Result<Ref> {
+    let r = Ref::with_id(id, head).with_facet(&facet)?;
+    store.write_ref(&r)?;
+    Ok(r)
+}
+
 /// Tag a context as a live snapshot sub-session of `source`: mint a fresh
 /// ref pinned at `head`, carrying a [`ChatFacet`] (so it lists under the
 /// source's Sub-sessions, navigable for history inspection) inherited from

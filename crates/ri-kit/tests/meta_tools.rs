@@ -11,7 +11,7 @@ use serde_json::json;
 use tokio_util::sync::CancellationToken;
 
 use ri::{ContentBlock, ContextId, HasMeta, MessageId, RefId, Role, Store, Tool, ToolOutput};
-use ri_kit::meta_tools::{AgentStatus, ExecRequest, MetaExec, StoreAccess};
+use ri_kit::meta_tools::{AgentStatus, ExecRequest, ExecTarget, MetaExec, StoreAccess};
 
 /// A fresh, empty sessions dir for one test.
 fn temp_sessions_dir(tag: &str) -> PathBuf {
@@ -675,7 +675,10 @@ async fn run_agent_tool_selection_and_validation() {
         assert_eq!(spawned[0].tools, None, "default = full set");
         assert_eq!(spawned[0].max_tokens, Some(1000));
         assert_eq!(spawned[0].thinking.as_ref().map(|t| t.to_string()), Some("high".to_string()));
-        assert_eq!(spawned[0].messages.len(), 1, "seed context resolved to its messages");
+        assert!(
+            matches!(&spawned[0].target, ExecTarget::Fork(c) if c.to_string() == ctx1),
+            "a context target forks a new session beginning there"
+        );
         assert_eq!(spawned[1].tools.as_deref(), Some(&[][..]), "empty = single turn");
         assert_eq!(spawned[2].tools.as_deref(), Some(&["read".to_string()][..]));
     }
@@ -687,13 +690,50 @@ async fn run_agent_tool_selection_and_validation() {
 
     let out = f.run("runAgent", json!({ "context_id": "ctx_nope", "model_id": "stub-model" })).await;
     assert!(out.is_error);
-    assert_eq!(text(&out), "context 'ctx_nope' not found");
+    assert_eq!(text(&out), "'ctx_nope' is neither a known context nor a ref");
 
     let out = f.run("runAgent", json!({
         "context_id": ctx1, "model_id": "stub-model", "model_params": { "thinking": "bananas" }
     })).await;
     assert!(out.is_error);
     assert_eq!(text(&out), "invalid thinking level 'bananas'");
+}
+
+#[tokio::test]
+async fn run_agent_continue_and_running_guard() {
+    let f = fixture("run-agent-continue");
+    let m1 = f.one_message("user", "seed").await;
+    let ctx1 = f.context_of(&[m1.as_str()]).await;
+
+    // A ref id targets continue-mode: the run resumes that ref on its head
+    // rather than forking a new session.
+    f.run("updateRef", json!({ "ref_id": "ref_cont", "context_id": ctx1 })).await;
+    let out = f.run("runAgent", json!({
+        "context_id": "ref_cont", "model_id": "stub-model", "tools": []
+    })).await;
+    assert!(!out.is_error, "continue on an idle ref: {}", text(&out));
+    assert!(text(&out).starts_with("Continuing session"), "got: {}", text(&out));
+    {
+        let spawned = f.seam.spawned.lock().unwrap();
+        let last = spawned.last().expect("a spawn was recorded");
+        assert!(
+            matches!(&last.target, ExecTarget::Continue(r) if r.as_str() == "ref_cont"),
+            "a ref target continues that ref"
+        );
+    }
+
+    // Single ownership: a ref a running loop owns is refused before any spawn.
+    f.seam.mark_running(&RefId::from("ref_cont"));
+    let before = f.seam.spawned.lock().unwrap().len();
+    let out = f.run("runAgent", json!({
+        "context_id": "ref_cont", "model_id": "stub-model", "tools": []
+    })).await;
+    assert!(out.is_error);
+    assert!(text(&out).contains("already running"), "got: {}", text(&out));
+    assert_eq!(
+        f.seam.spawned.lock().unwrap().len(), before,
+        "a running ref never reaches spawn_agent"
+    );
 }
 
 #[tokio::test]

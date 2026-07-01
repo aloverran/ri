@@ -50,14 +50,30 @@ pub trait StoreAccess: Send + Sync {
     fn store(&self) -> Result<Store, String>;
 }
 
-/// A validated execution request assembled by `runAgent`: the resolved seed
-/// messages, the caller's model and parameter choices, and the tool selection.
-/// `thinking: None` means "harness default".
+/// Where a spawned run begins. The one field that decides fork-vs-continue;
+/// the harness realizes it (mint a ref at the context, or resume an existing
+/// ref's loop). `resolve_exec_request` picks the variant by whether the id
+/// names a context or a ref.
+pub enum ExecTarget {
+    /// Fork a new session whose history begins at this context. The context's
+    /// own parents are preserved, so a context composed with a parent yields a
+    /// connected sub-agent, and a parentless one yields an island.
+    Fork(ContextId),
+    /// Continue an existing session on its current head -- run another loop
+    /// (or turn) without forking, so the session's chain grows in place.
+    Continue(RefId),
+}
+
+/// A validated execution request assembled by `runAgent`: where to begin
+/// (`target`), the caller's model and parameter choices, and the tool
+/// selection. `thinking: None` means "harness default".
 pub struct ExecRequest {
-    pub messages: Vec<MessageId>,
+    pub target: ExecTarget,
     pub model_id: String,
     pub thinking: Option<ThinkingLevel>,
     pub max_tokens: Option<usize>,
+    /// Display label for a forked session. Ignored when continuing (the ref
+    /// already has a name).
     pub label: Option<String>,
     /// Function tools the spawned loop may call, by name. `None` means the
     /// harness's full default tool set (a worker that loops); `Some(empty)`
@@ -1241,13 +1257,18 @@ impl Tool for RunAgentTool {
     }
 
     fn description(&self) -> &str {
-        "Start an agent on a context, asynchronously, and return the new \
-         session_id. With no tools (tools: []) it is a single LLM turn -- the \
-         model's native capabilities (e.g. Gemini search and code execution) \
-         turn on automatically. With tools it loops -- LLM turn, tool calls, \
-         repeat -- until the model stops calling them, writing every message \
-         back to the new session. Omit 'tools' for the full default tool set. \
-         Check on the result with readAgent."
+        "Run an agent asynchronously and return its session_id. The target is \
+         either a context id -- forks a new session whose history begins at \
+         that context, keeping the context's parents (so a context you composed \
+         with a parent yields a connected sub-agent, a parentless one an island) \
+         -- or a ref/session id -- continues that existing session on its \
+         current head instead of forking, erroring if it is already running. \
+         With no tools (tools: []) it is a single LLM turn -- the model's native \
+         capabilities (e.g. Gemini search and code execution) turn on \
+         automatically. With tools it loops -- LLM turn, tool calls, repeat -- \
+         until the model stops calling them, writing every message back to the \
+         session. Omit 'tools' for the full default tool set. Check on the \
+         result with readAgent."
     }
 
     fn parameters(&self) -> Value {
@@ -1258,7 +1279,10 @@ impl Tool for RunAgentTool {
             "properties": {
                 "context_id": {
                     "type": "string",
-                    "description": "The context to use as the prompt history."
+                    "description": "A context id -- fork a new session whose \
+                        history begins there, preserving the context's parents \
+                        -- or a ref/session id -- continue that session on its \
+                        current head (errors if it is already running)."
                 },
                 "model_id": {
                     "type": "string",
@@ -1283,7 +1307,7 @@ impl Tool for RunAgentTool {
                 },
                 "label": {
                     "type": "string",
-                    "description": "Display label for the sub-session. Defaults to the model name."
+                    "description": "Display label for a forked sub-session (ignored when continuing a ref). Defaults to the model name."
                 }
             },
             "required": ["context_id", "model_id"]
@@ -1295,12 +1319,30 @@ impl Tool for RunAgentTool {
             Ok(r) => r,
             Err(msg) => return ToolOutput::error(&msg),
         };
+        // Continuing a session that is already running would race its owning
+        // loop -- the same single-ownership rule updateRef enforces. Surface it
+        // before spawning; the loop is the authoritative writer of its head.
+        if let ExecTarget::Continue(ref_id) = &request.target {
+            if self.exec.agent_status(ref_id).await.running {
+                return ToolOutput::error(&format!(
+                    "session [{}] is already running; wait for it to idle, or \
+                     deliver input as data with createContext merge_into", ref_id
+                ));
+            }
+        }
         let single_turn = matches!(&request.tools, Some(t) if t.is_empty());
+        let continuing = matches!(&request.target, ExecTarget::Continue(_));
 
         match self.exec.spawn_agent(request).await {
             Ok(id) => {
-                let kind = if single_turn { "Single turn" } else { "Agent loop" };
-                ToolOutput::text(format!("{} started on session '{}'", kind, id))
+                let action = if continuing {
+                    "Continuing session"
+                } else if single_turn {
+                    "Single turn started on session"
+                } else {
+                    "Agent loop started on session"
+                };
+                ToolOutput::text(format!("{} '{}'", action, id))
                     .with_details(json!({ "session_id": id }))
             }
             Err(msg) => ToolOutput::error(&msg),
@@ -1309,8 +1351,9 @@ impl Tool for RunAgentTool {
 }
 
 /// Parse and validate `runAgent`'s input (context_id, model_id, model_params,
-/// tools, label) and resolve the context to its message list. Unknown tool
-/// names are rejected here against the seam's advertised set, so the canary
+/// tools, label) and resolve the target. The `context_id` slot names either a
+/// context (fork a new session there) or a ref (continue that session); an id
+/// that is neither, or an unknown tool name, is rejected here so the canary
 /// surfaces before anything spawns.
 fn resolve_exec_request(
     store: &dyn StoreAccess,
@@ -1319,14 +1362,21 @@ fn resolve_exec_request(
 ) -> Result<ExecRequest, String> {
     let store = store.store()?;
 
-    let context_id = input.get("context_id").and_then(|v| v.as_str())
+    let id = input.get("context_id").and_then(|v| v.as_str())
         .ok_or("missing 'context_id' parameter")?;
     let model_id = input.get("model_id").and_then(|v| v.as_str())
         .ok_or("missing 'model_id' parameter")?;
 
-    let messages = store.get_context(&ContextId::from(context_id))
-        .map(|ctx| ctx.messages)
-        .ok_or_else(|| format!("context '{}' not found", context_id))?;
+    // A context forks a new session that begins there; a ref continues that
+    // session on its current head. Distinct id prefixes make this unambiguous,
+    // and an id naming neither is surfaced now rather than at spawn.
+    let target = if store.get_context(&ContextId::from(id)).is_some() {
+        ExecTarget::Fork(ContextId::from(id))
+    } else if store.get_ref(&RefId::from(id)).is_some() {
+        ExecTarget::Continue(RefId::from(id))
+    } else {
+        return Err(format!("'{}' is neither a known context nor a ref", id));
+    };
 
     let params = input.get("model_params");
     let thinking = match params.and_then(|p| p.get("thinking")).and_then(|v| v.as_str()) {
@@ -1365,7 +1415,7 @@ fn resolve_exec_request(
 
     let label = input.get("label").and_then(|v| v.as_str()).map(str::to_string);
 
-    Ok(ExecRequest { messages, model_id: model_id.to_string(), thinking, max_tokens, label, tools })
+    Ok(ExecRequest { target, model_id: model_id.to_string(), thinking, max_tokens, label, tools })
 }
 
 /// Inspect a spawned agent's runtime status: whether its loop is alive, what it
