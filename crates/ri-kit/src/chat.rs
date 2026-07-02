@@ -108,9 +108,18 @@ pub fn create(store: &Store, facet: ChatFacet) -> eyre::Result<Ref> {
 /// This is how a sub-agent is forked from a composed context: the session
 /// begins at that context, so whatever parent the caller set on it (its own
 /// head, or nothing) is exactly what the sub-agent connects to in the DAG.
-/// `head` must already exist in the store; no context is written here.
-pub fn create_with_head(store: &Store, id: RefId, head: ContextId, facet: ChatFacet) -> eyre::Result<Ref> {
-    let r = Ref::with_id(id, head).with_facet(&facet)?;
+/// A fork is born granted -- `caps` is stamped in the same single write as
+/// the chat facet, so no crash window can leave a spawned session without
+/// its grant. `head` must already exist in the store; no context is written
+/// here.
+pub fn create_with_head(
+    store: &Store,
+    id: RefId,
+    head: ContextId,
+    facet: ChatFacet,
+    caps: &crate::caps::CapSet,
+) -> eyre::Result<Ref> {
+    let r = Ref::with_id(id, head).with_facet(&facet)?.with_facet(caps)?;
     store.write_ref(&r)?;
     Ok(r)
 }

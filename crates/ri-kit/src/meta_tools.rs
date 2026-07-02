@@ -19,6 +19,14 @@
 //! ref at one. A `session_id` (a ref id) is what `runAgent` hands back and
 //! `readAgent` reads.
 //!
+//! The tools are built within a capability grant (`crate::caps`): [`create`]
+//! takes the calling loop's effective [`CapSet`] and constructs exactly the
+//! meta-tools it names -- a loop cannot hold a meta-tool it was not granted,
+//! by construction. The two tools that transfer authority (`runAgent`,
+//! `updateRef`) also carry the grant, because everything they convey -- a
+//! forked child's grant, a continued run's toolset, another ref's rewritten
+//! grant -- is bounded by its transition (see `crate::caps`).
+//!
 //! The tools themselves are harness-independent: names, descriptions, schemas,
 //! validation, store surgery, and output formatting all live here, once, shared
 //! by every harness. What a harness genuinely owns is reached through two seams:
@@ -26,8 +34,8 @@
 //! - [`StoreAccess`]: how to obtain the current store view. ri-web hands out a
 //!   clone of its long-lived shared handle; ri-cli mounts the sessions
 //!   directory fresh per call.
-//! - [`MetaExec`]: model + tool resolution, how a spawned loop runs, and the
-//!   runtime status of a ref. ri-web wires a child SessionState with SSE and SSH
+//! - [`MetaExec`]: model resolution, how a spawned loop runs, and the runtime
+//!   status of a ref. ri-web wires a child SessionState with SSE and SSH
 //!   inheritance and reads its live `live_sessions`; ri-cli spawns a
 //!   self-contained background task and has no live registry to read.
 
@@ -42,6 +50,8 @@ use ri::{
     ContentBlock, Context, ContextId, HasMeta, Message, MessageId, Ref, RefId, Role, Store,
     ThinkingLevel, Tool, ToolOutput,
 };
+
+use crate::caps::CapSet;
 
 /// How the meta-tools obtain the store. The harness chooses freshness and
 /// lifetime semantics; `Err` carries the harness's own human-readable reason
@@ -65,8 +75,8 @@ pub enum ExecTarget {
 }
 
 /// A validated execution request assembled by `runAgent`: where to begin
-/// (`target`), the caller's model and parameter choices, and the tool
-/// selection. `thinking: None` means "harness default".
+/// (`target`), the caller's model and parameter choices, and the run's
+/// capability grant. `thinking: None` means "harness default".
 pub struct ExecRequest {
     pub target: ExecTarget,
     pub model_id: String,
@@ -75,12 +85,12 @@ pub struct ExecRequest {
     /// Display label for a forked session. Ignored when continuing (the ref
     /// already has a name).
     pub label: Option<String>,
-    /// Function tools the spawned loop may call, by name. `None` means the
-    /// harness's full default tool set (a worker that loops); `Some(empty)`
-    /// means no function tools -- a single turn with the model's native
-    /// capabilities enabled; `Some(names)` means exactly that subset. Names are
-    /// pre-validated against [`MetaExec::tool_names`].
-    pub tools: Option<Vec<String>>,
+    /// The grant the spawned run executes with, fully resolved and already
+    /// attenuation-checked against the caller. Empty means no function tools
+    /// -- a single turn with the model's native capabilities enabled. The
+    /// harness assembles the loop's tools from exactly these names, and on a
+    /// fork stamps this grant onto the new ref as its `caps` facet.
+    pub caps: CapSet,
 }
 
 /// Runtime status of a ref's agent loop, as the harness sees it. A ref the
@@ -93,18 +103,15 @@ pub struct AgentStatus {
     pub streaming_preview: Option<String>,
 }
 
-/// Harness seam for the runtime tier: which models and tools exist, how a
-/// spawned loop runs, and the live status of a ref. `spawn_agent` returns the
-/// new session's ref id immediately; the loop proceeds in the background.
+/// Harness seam for the runtime tier: which models exist, how a spawned loop
+/// runs, and the live status of a ref. `spawn_agent` returns the new session's
+/// ref id immediately; the loop proceeds in the background.
 #[async_trait]
 pub trait MetaExec: Send + Sync {
     /// Model ids advertised in `runAgent`'s schema.
     fn model_ids(&self) -> Vec<String>;
-    /// Base function-tool names advertised in `runAgent`'s `tools` schema and
-    /// validated against. Empty is legal (a harness with no base tools).
-    fn tool_names(&self) -> Vec<String>;
-    /// Spawn a detached agent loop. The tool set is chosen by `request.tools`;
-    /// an empty set yields a single turn with native capabilities on.
+    /// Spawn a detached agent loop running with `request.caps`; an empty
+    /// grant yields a single turn with native capabilities on.
     async fn spawn_agent(&self, request: ExecRequest) -> Result<RefId, String>;
     /// Runtime status of a ref's loop: whether one is alive and any partial
     /// output it is streaming. The single liveness oracle behind both the
@@ -112,79 +119,77 @@ pub trait MetaExec: Send + Sync {
     async fn agent_status(&self, ref_id: &RefId) -> AgentStatus;
 }
 
-/// Build the eight meta-tools over the two harness seams. `session_id` is the
-/// calling session: spawned runs are parented to it, and composed contexts and
-/// forged messages land in its family file. A running ref -- including the
-/// caller's own -- is never repointed by `updateRef` (the loop owns its head);
-/// a live ref relocates its head only through its own loop, via a `jump`
-/// envelope (`createContext` / `crate::envelope`).
+/// Build the meta-tools over the two harness seams, within a capability grant.
+///
+/// `session_id` is the calling session: spawned runs are parented to it, and
+/// composed contexts and forged messages land in its family file. `caps` is
+/// the calling loop's effective grant: exactly the meta-tools it names are
+/// constructed (an ungranted meta-tool cannot be held, by construction), and
+/// the two authority-transferring tools (`runAgent`, `updateRef`) carry the
+/// grant as the ceiling on everything they convey.
+///
+/// A running ref -- including the caller's own -- is never repointed by
+/// `updateRef` (the loop owns its head); a live ref relocates its head only
+/// through its own loop, via a `jump` envelope (`createContext` /
+/// `crate::envelope`).
 pub fn create(
     store: Arc<dyn StoreAccess>,
     exec: Arc<dyn MetaExec>,
     session_id: RefId,
+    caps: &CapSet,
 ) -> Vec<Box<dyn Tool>> {
-    create_with(store, exec, session_id, true)
-}
-
-/// Build the meta-tools for a spawned child, with `runAgent` omitted: a
-/// sub-agent cannot spawn its own children (unbounded recursion, blocked for
-/// now), so the recursive tool is never *constructed* for it. The block is
-/// structural -- a child's loop cannot hold a tool that was never built -- not a
-/// downstream string filter that a drift could defeat. The other seven tools are
-/// identical to [`create`].
-pub fn create_child(
-    store: Arc<dyn StoreAccess>,
-    exec: Arc<dyn MetaExec>,
-    session_id: RefId,
-) -> Vec<Box<dyn Tool>> {
-    create_with(store, exec, session_id, false)
-}
-
-/// The shared builder behind [`create`] and [`create_child`]. `include_run_agent`
-/// is the one axis on which a child's tool set differs from a top-level
-/// orchestrator's; `runAgent` sits just before `readAgent` so the order still
-/// matches [`TOOL_NAMES`] either way.
-fn create_with(
-    store: Arc<dyn StoreAccess>,
-    exec: Arc<dyn MetaExec>,
-    session_id: RefId,
-    include_run_agent: bool,
-) -> Vec<Box<dyn Tool>> {
-    let mut tools: Vec<Box<dyn Tool>> = vec![
-        Box::new(CreateMessageTool { store: store.clone(), session_id: session_id.clone() }),
-        Box::new(ReadMessageTool { store: store.clone() }),
-        Box::new(CreateContextTool { store: store.clone(), session_id: session_id.clone() }),
-        Box::new(ReadContextTool { store: store.clone() }),
-        Box::new(UpdateRefTool { store: store.clone(), exec: exec.clone(), session_id }),
-        Box::new(ReadRefTool { store: store.clone() }),
-    ];
-    if include_run_agent {
-        tools.push(Box::new(RunAgentTool { store: store.clone(), exec: exec.clone() }));
+    let mut tools: Vec<Box<dyn Tool>> = Vec::new();
+    if caps.contains("createMessage") {
+        tools.push(Box::new(CreateMessageTool { store: store.clone(), session_id: session_id.clone() }));
     }
-    tools.push(Box::new(ReadAgentTool { store, exec }));
-    // `TOOL_NAMES` is a hand-maintained mirror used to advertise/validate the
-    // tools without a seam to build them; assert it matches what we actually
-    // build, loudly and in debug, so a tool added here but forgotten there can't
-    // silently become un-advertised and un-passable.
+    if caps.contains("readMessage") {
+        tools.push(Box::new(ReadMessageTool { store: store.clone() }));
+    }
+    if caps.contains("createContext") {
+        tools.push(Box::new(CreateContextTool { store: store.clone(), session_id: session_id.clone() }));
+    }
+    if caps.contains("readContext") {
+        tools.push(Box::new(ReadContextTool { store: store.clone() }));
+    }
+    if caps.contains("updateRef") {
+        tools.push(Box::new(UpdateRefTool {
+            store: store.clone(),
+            exec: exec.clone(),
+            session_id,
+            caps: caps.clone(),
+        }));
+    }
+    if caps.contains("readRef") {
+        tools.push(Box::new(ReadRefTool { store: store.clone() }));
+    }
+    if caps.contains(RUN_AGENT) {
+        tools.push(Box::new(RunAgentTool { store: store.clone(), exec: exec.clone(), caps: caps.clone() }));
+    }
+    if caps.contains("readAgent") {
+        tools.push(Box::new(ReadAgentTool { store, exec }));
+    }
+    // `TOOL_NAMES` is a hand-maintained mirror used to advertise the meta-tool
+    // inventory; assert the grant-filtered build matches it, loudly and in
+    // debug, so a tool added here but forgotten there can't silently become
+    // un-buildable.
     debug_assert!(
         tools.iter().map(|t| t.name())
-            .eq(TOOL_NAMES.iter().copied().filter(|n| include_run_agent || *n != RUN_AGENT)),
-        "meta-tool set drifted from TOOL_NAMES (include_run_agent={})", include_run_agent
+            .eq(TOOL_NAMES.iter().copied().filter(|n| caps.contains(n))),
+        "meta-tool set drifted from TOOL_NAMES"
     );
     tools
 }
 
-/// The name of the `runAgent` meta-tool. Called out as a constant because it is
-/// the one meta-tool a harness may deliberately withhold from a spawned child:
-/// letting a sub-agent spawn its own sub-agents is unbounded recursion, so a
-/// harness that blocks downward spawning filters this name out of the set it
-/// advertises and builds for children.
+/// The name of the `runAgent` meta-tool. Called out as a constant because it
+/// is the leveled capability in practice: harnesses grant it with a level
+/// (`crate::caps`), so each spawned generation holds it one level lower and a
+/// level-1 holder cannot pass it on at all -- recursion is bounded by data,
+/// not by construction-site special cases.
 pub const RUN_AGENT: &str = "runAgent";
 
 /// The names of the eight meta-tools, in the order [`create`] builds them. The
-/// single source of truth a harness uses to advertise or filter the meta-tools
-/// -- e.g. "base tools plus every meta-tool except [`RUN_AGENT`]" for the set a
-/// child may receive. Must stay in sync with the set [`create`] returns.
+/// meta-tool inventory a harness combines with its base tool names when
+/// minting a root grant. Must stay in sync with the set [`create`] can return.
 pub const TOOL_NAMES: &[&str] = &[
     "createMessage",
     "readMessage",
@@ -988,18 +993,23 @@ fn append_ancestors(out: &mut String, store: &Store, focal: &Context, depth: usi
 // -- Ref ---------------------------------------------------------------------
 
 /// Create or update a ref: point `ref_id` at `context_id`, creating the ref as
-/// a bare pointer if it doesn't exist. Enforces single ownership -- a ref with
-/// a running agent loop is refused, because that loop is the authoritative
-/// writer of its head and would silently overwrite the move at its next
-/// checkpoint; influence such a ref via `createContext merge_into`, or move it
-/// once idle. The move is a raw pointer swap; a swap that drops the prior head
-/// out of the new head's ancestry is surfaced, not blocked.
+/// a bare pointer if it doesn't exist, and optionally (re)write its capability
+/// grant. Enforces single ownership -- a ref with a running agent loop is
+/// refused, because that loop is the authoritative writer of its head and
+/// would silently overwrite the move at its next checkpoint; influence such a
+/// ref via `createContext merge_into`, or move it once idle. The move is a raw
+/// pointer swap; a swap that drops the prior head out of the new head's
+/// ancestry is surfaced, not blocked.
 struct UpdateRefTool {
     store: Arc<dyn StoreAccess>,
     exec: Arc<dyn MetaExec>,
     /// The calling session, so the guard can phrase a self-targeted refusal:
     /// a session cannot repoint its own head from inside its running loop.
     session_id: RefId,
+    /// The calling loop's grant: the ceiling on any `caps` it writes. Like
+    /// every capability transfer, a written grant is bounded by this set's
+    /// transition (`crate::caps`).
+    caps: CapSet,
 }
 
 #[async_trait]
@@ -1012,9 +1022,11 @@ impl Tool for UpdateRefTool {
         "Create or update a ref: a named, mutable pointer to a context (a \
          session is a ref). Points ref_id at context_id, creating the ref as a \
          bare pointer (no chat facet, so it won't appear in the session list) if \
-         it doesn't already exist. A ref has exactly one owner: while an agent \
-         loop is running on ref_id this is refused -- that loop owns its head and \
-         would overwrite the move -- so deliver to a running ref with \
+         it doesn't already exist. Optionally sets the ref's capability grant \
+         via 'caps' -- the toolset it runs with when continued -- bounded by \
+         what this session can convey. A ref has exactly one owner: while an \
+         agent loop is running on ref_id this is refused -- that loop owns its \
+         head and would overwrite the move -- so deliver to a running ref with \
          createContext merge_into instead, or move it once idle. The move is a \
          raw pointer swap; if context_id does not descend from the ref's current \
          head, the response notes that the previous chain history was left \
@@ -1032,6 +1044,18 @@ impl Tool for UpdateRefTool {
                 "context_id": {
                     "type": "string",
                     "description": "The context the ref should point at (its new head)."
+                },
+                "caps": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": format!(
+                        "Optionally replace the ref's capability grant: the tool \
+                         names it runs with when continued. Each name must be \
+                         conveyable by this session; a leveled capability \
+                         (runAgent) is granted one level lower. Pass base names \
+                         only -- 'runAgent', never 'runAgent(1)'. You can \
+                         convey: {}. Omit to leave the ref's grant unchanged.",
+                        self.caps.transition().describe())
                 }
             },
             "required": ["ref_id", "context_id"]
@@ -1051,6 +1075,27 @@ impl Tool for UpdateRefTool {
         let head = match input.get("context_id").and_then(|v| v.as_str()) {
             Some(s) if !s.is_empty() => ContextId::from(s),
             _ => return ToolOutput::error("missing 'context_id' parameter"),
+        };
+
+        // Resolve the requested grant before any write, so an unconveyable
+        // name has no side effects. Bounded like every transfer: by the
+        // transition of the caller's own grant.
+        let new_caps = match input.get("caps") {
+            None | Some(Value::Null) => None,
+            Some(Value::Array(arr)) => {
+                let mut names = Vec::with_capacity(arr.len());
+                for v in arr {
+                    match v.as_str() {
+                        Some(s) if !s.is_empty() => names.push(s.to_string()),
+                        _ => return ToolOutput::error("caps: each entry must be a tool name string"),
+                    }
+                }
+                match self.caps.grant(Some(&names)) {
+                    Ok(c) => Some(c),
+                    Err(e) => return ToolOutput::error(&format!("caps: {}", e)),
+                }
+            }
+            Some(_) => return ToolOutput::error("caps: must be an array of tool names"),
         };
 
         // Surface a dangling head now, not later when the ref resolves to a
@@ -1087,10 +1132,15 @@ impl Tool for UpdateRefTool {
             Err(e) => return ToolOutput::error(&format!("resolve family store: {}", e)),
         };
 
-        let (new_ref, created, prior_head) = match &existing {
+        let (mut new_ref, created, prior_head) = match &existing {
             Some(r) => (r.clone().with_head(head.clone()), false, Some(r.head.clone())),
             None => (Ref::with_id(ref_id.clone(), head.clone()), true, None),
         };
+        if let Some(c) = &new_caps {
+            if let Err(e) = new_ref.set_facet(c) {
+                return ToolOutput::error(&format!("failed to encode caps facet: {}", e));
+            }
+        }
         if let Err(e) = family_store.write_ref(&new_ref) {
             return ToolOutput::error(&format!("failed to write ref: {}", e));
         }
@@ -1113,6 +1163,9 @@ impl Tool for UpdateRefTool {
 
         let verb = if created { "Created" } else { "Updated" };
         let mut text = format!("{} ref [{}] -> [{}]", verb, ref_id, head);
+        if let Some(c) = &new_caps {
+            text.push_str(&format!("; caps set to {}", c.describe()));
+        }
         if let Some(note) = severed_note {
             text.push_str(&note);
         }
@@ -1183,6 +1236,12 @@ impl Tool for ReadRefTool {
         out.push_str(&format!("head: {}\n", r.head));
         out.push_str(&format!("chain: {} contexts reachable\n", reachable.len()));
         out.push_str(&format!("facets: {}\n", describe_facets(&r)));
+        let caps_line = match r.facet::<CapSet>() {
+            Some(Ok(c)) => c.describe(),
+            Some(Err(e)) => format!("(malformed: {})", e),
+            None => "(no grant)".to_string(),
+        };
+        out.push_str(&format!("caps: {}\n", caps_line));
 
         out.push_str(&format!(
             "\ninbox ({} pending envelope{}):\n",
@@ -1239,15 +1298,19 @@ fn describe_facets(r: &Ref) -> String {
 
 // -- Agent -------------------------------------------------------------------
 
-/// Spawn a sub-agent loop asynchronously from a context.
+/// Spawn a sub-agent loop asynchronously from a context or ref.
 ///
-/// Validates the shared execute parameters and the tool selection, resolves the
-/// context to its message list, and hands the request to the harness seam,
-/// which creates the child session and starts the loop in the background.
-/// Returns immediately with the new session_id.
+/// Validates the shared execute parameters, resolves the run's capability
+/// grant against the caller's (every transfer is bounded by the caller's
+/// transition -- see `crate::caps`), and hands the request to the harness
+/// seam, which creates the child session (stamping the grant on its ref) and
+/// starts the loop in the background. Returns immediately with the new
+/// session_id.
 struct RunAgentTool {
     store: Arc<dyn StoreAccess>,
     exec: Arc<dyn MetaExec>,
+    /// The calling loop's grant: the ceiling on what any spawned run receives.
+    caps: CapSet,
 }
 
 #[async_trait]
@@ -1263,17 +1326,19 @@ impl Tool for RunAgentTool {
          with a parent yields a connected sub-agent, a parentless one an island) \
          -- or a ref/session id -- continues that existing session on its \
          current head instead of forking, erroring if it is already running. \
-         With no tools (tools: []) it is a single LLM turn -- the model's native \
-         capabilities (e.g. Gemini search and code execution) turn on \
-         automatically. With tools it loops -- LLM turn, tool calls, repeat -- \
-         until the model stops calling them, writing every message back to the \
-         session. Omit 'tools' for the full default tool set. Check on the \
-         result with readAgent."
+         Capabilities attenuate: a run receives at most what you can convey \
+         (your own grant, with runAgent one level lower -- so recursion is \
+         bounded), and continuing a session whose own grant exceeds that is \
+         refused unless you pass 'tools' to run it narrowed. With no tools \
+         (tools: []) it is a single LLM turn -- the model's native capabilities \
+         (e.g. Gemini search and code execution) turn on automatically. With \
+         tools it loops -- LLM turn, tool calls, repeat -- until the model \
+         stops calling them, writing every message back to the session. Check \
+         on the result with readAgent."
     }
 
     fn parameters(&self) -> Value {
         let models = self.exec.model_ids().join(", ");
-        let tools = self.exec.tool_names().join(", ");
         json!({
             "type": "object",
             "properties": {
@@ -1300,10 +1365,14 @@ impl Tool for RunAgentTool {
                     "type": "array",
                     "items": { "type": "string" },
                     "description": format!(
-                        "Function tools the agent may call, by name. Omit for the \
-                         full default tool set (a worker that loops); pass [] for \
-                         a single turn with no tools; or list a subset. An \
-                         unknown name is an error. Available: {}", tools)
+                        "Capabilities to grant the run, by tool name. Omit to \
+                         convey everything you can; pass [] for a single turn \
+                         with no tools. On a continue, omitting runs the session \
+                         with its own grant (refused if that exceeds yours). An \
+                         unconveyable name is an error. Pass base names only -- \
+                         'runAgent', never 'runAgent(1)'; the (n) shows the level \
+                         a grant lands at. You can convey: {}",
+                        self.caps.transition().describe())
                 },
                 "label": {
                     "type": "string",
@@ -1315,7 +1384,7 @@ impl Tool for RunAgentTool {
     }
 
     async fn run(&self, input: Value, _cancel: CancellationToken) -> ToolOutput {
-        let request = match resolve_exec_request(self.store.as_ref(), self.exec.as_ref(), &input) {
+        let request = match resolve_exec_request(self.store.as_ref(), &self.caps, &input) {
             Ok(r) => r,
             Err(msg) => return ToolOutput::error(&msg),
         };
@@ -1330,8 +1399,9 @@ impl Tool for RunAgentTool {
                 ));
             }
         }
-        let single_turn = matches!(&request.tools, Some(t) if t.is_empty());
+        let single_turn = request.caps.is_empty();
         let continuing = matches!(&request.target, ExecTarget::Continue(_));
+        let granted = request.caps.describe();
 
         match self.exec.spawn_agent(request).await {
             Ok(id) => {
@@ -1342,7 +1412,7 @@ impl Tool for RunAgentTool {
                 } else {
                     "Agent loop started on session"
                 };
-                ToolOutput::text(format!("{} '{}'", action, id))
+                ToolOutput::text(format!("{} '{}' (caps: {})", action, id, granted))
                     .with_details(json!({ "session_id": id }))
             }
             Err(msg) => ToolOutput::error(&msg),
@@ -1351,13 +1421,23 @@ impl Tool for RunAgentTool {
 }
 
 /// Parse and validate `runAgent`'s input (context_id, model_id, model_params,
-/// tools, label) and resolve the target. The `context_id` slot names either a
-/// context (fork a new session there) or a ref (continue that session); an id
-/// that is neither, or an unknown tool name, is rejected here so the canary
-/// surfaces before anything spawns.
+/// tools, label), resolve the target, and resolve the run's grant against the
+/// caller's. The `context_id` slot names either a context (fork a new session
+/// there) or a ref (continue that session); an id that is neither, or a grant
+/// the caller cannot convey, is rejected here so the canary surfaces before
+/// anything spawns.
+///
+/// Grant resolution is the one attenuation rule, applied per target:
+/// - Fork: the request's `tools` (or everything conveyable when omitted),
+///   resolved by `caps.grant` -- always within the caller's transition.
+/// - Continue with `tools`: the same resolution; a per-run override that never
+///   rewrites the target's own grant.
+/// - Continue without `tools`: the target ref's own `caps` facet, refused
+///   loudly if it exceeds what the caller can convey (or if the ref has no
+///   grant at all), with both remedies named.
 fn resolve_exec_request(
     store: &dyn StoreAccess,
-    exec: &dyn MetaExec,
+    caps: &CapSet,
     input: &Value,
 ) -> Result<ExecRequest, String> {
     let store = store.store()?;
@@ -1392,30 +1472,80 @@ fn resolve_exec_request(
         None => None,
     };
 
-    // tools absent => None (full default set); present => validate every name
-    // against the seam's advertised tools.
-    let tools = match input.get("tools") {
+    let requested: Option<Vec<String>> = match input.get("tools") {
         None => None,
         Some(Value::Array(arr)) => {
-            let available = exec.tool_names();
             let mut names = Vec::with_capacity(arr.len());
             for v in arr {
-                let name = v.as_str().ok_or("tools: each entry must be a tool name string")?;
-                if !available.contains(&name.to_string()) {
-                    return Err(format!(
-                        "tools: unknown tool '{}'; available: {}", name, available.join(", ")
-                    ));
+                match v.as_str() {
+                    Some(s) if !s.is_empty() => names.push(s.to_string()),
+                    _ => return Err("tools: each entry must be a tool name string".to_string()),
                 }
-                names.push(name.to_string());
             }
             Some(names)
         }
         Some(_) => return Err("tools: must be an array of tool names".to_string()),
     };
 
+    let run_caps = match (&target, &requested) {
+        (_, Some(names)) => caps.grant(Some(names)).map_err(|e| format!("tools: {}", e))?,
+        (ExecTarget::Fork(_), None) => caps.grant(None).map_err(|e| format!("tools: {}", e))?,
+        (ExecTarget::Continue(ref_id), None) => {
+            // The target already proved present during target resolution.
+            let r = store.get_ref(ref_id)
+                .ok_or_else(|| format!("ref [{}] disappeared during resolution", ref_id))?;
+            match r.facet::<CapSet>() {
+                None => return Err(format!(
+                    "session [{}] has no capability grant; pass 'tools' to run it \
+                     with an explicit set, or updateRef with 'caps' to give it one",
+                    ref_id
+                )),
+                Some(Err(e)) => return Err(format!(
+                    "session [{}] has a malformed caps facet: {}", ref_id, e
+                )),
+                Some(Ok(target_caps)) => {
+                    let conveyable = caps.transition();
+                    let violations = target_caps.violations(&conveyable);
+                    if !violations.is_empty() {
+                        // A name the caller holds but transition dropped (an
+                        // exhausted level) would otherwise read as "not
+                        // granted" -- say what actually happened.
+                        let exhausted: Vec<String> = target_caps.names().into_iter()
+                            .filter(|n| caps.contains(n) && !conveyable.contains(n))
+                            .map(|n| format!("[{}]", n))
+                            .collect();
+                        let note = if exhausted.is_empty() {
+                            String::new()
+                        } else {
+                            format!(
+                                " (you hold {} but at a level that does not extend \
+                                 to runs you start)",
+                                exhausted.join(", ")
+                            )
+                        };
+                        return Err(format!(
+                            "session [{}] runs with a grant exceeding what you can \
+                             convey: {}{}. Pass 'tools' to run it narrowed this run, \
+                             or updateRef with 'caps' to change its grant.",
+                            ref_id, violations.join("; "), note
+                        ));
+                    }
+                    target_caps
+                }
+            }
+        }
+    };
+
     let label = input.get("label").and_then(|v| v.as_str()).map(str::to_string);
 
-    Ok(ExecRequest { target, model_id: model_id.to_string(), thinking, max_tokens, label, tools })
+    Ok(ExecRequest {
+        target,
+        model_id: model_id.to_string(),
+        thinking,
+        max_tokens,
+        label,
+        caps: run_caps,
+    })
 }
 
 /// Inspect a spawned agent's runtime status: whether its loop is alive, what it
@@ -1519,12 +1649,14 @@ fn latest_model(messages: &[Message]) -> Option<String> {
 }
 
 /// The tool names the session's most recent tool-bearing assistant turn ran
-/// with, read from its `meta.tools`. The mirror of [`latest_model`], and the one
-/// reader of "what toolset this session last ran" -- shared by `readAgent` and
-/// by a harness reconstructing a continued session's tools. An empty array is a
-/// real recorded value (a single-turn agent), distinct from `None` (no turn has
-/// recorded a toolset yet); a trailing error message records no tools and is
-/// skipped, so the last real toolset still surfaces.
+/// with, read from its `meta.tools`. The mirror of [`latest_model`]. This is
+/// provenance, never authority: `readAgent` displays it, and a harness may
+/// consult it once to derive a `caps` grant for a ref predating the facet --
+/// a session's durable grant lives on its ref (`crate::caps`), not in its
+/// content. An empty array is a real recorded value (a single-turn agent),
+/// distinct from `None` (no turn has recorded a toolset yet); a trailing
+/// error message records no tools and is skipped, so the last real toolset
+/// still surfaces.
 pub fn latest_tools(messages: &[Message]) -> Option<Vec<String>> {
     messages.iter().rev()
         .filter(|m| m.role == Role::Assistant)

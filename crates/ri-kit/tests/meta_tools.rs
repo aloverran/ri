@@ -54,10 +54,6 @@ impl MetaExec for StubSeam {
         vec!["stub-model".to_string()]
     }
 
-    fn tool_names(&self) -> Vec<String> {
-        ["bash", "read", "write", "edit"].iter().map(|s| s.to_string()).collect()
-    }
-
     async fn spawn_agent(&self, request: ExecRequest) -> Result<RefId, String> {
         self.spawned.lock().unwrap().push(request);
         Ok(RefId::from("ref_stub_agent"))
@@ -71,8 +67,18 @@ impl MetaExec for StubSeam {
     }
 }
 
-/// One assembled test fixture: a session ref in a temp store, the meta-tools
-/// built over the stub seam.
+/// The grant the fixture session runs with: a web-root-shaped set (four base
+/// names plus every meta tool), `runAgent` leveled at 2.
+fn root_caps() -> ri_kit::caps::CapSet {
+    ri_kit::caps::CapSet::unit(
+        ["bash", "read", "write", "edit"].into_iter()
+            .chain(ri_kit::meta_tools::TOOL_NAMES.iter().copied()),
+    )
+    .with_leveled(ri_kit::meta_tools::RUN_AGENT, 2)
+}
+
+/// One assembled test fixture: a session ref in a temp store carrying the
+/// root grant, the meta-tools built over the stub seam within it.
 struct Fixture {
     dir: PathBuf,
     session_id: RefId,
@@ -91,12 +97,15 @@ fn fixture(tag: &str) -> Fixture {
         pinned: false,
     })
     .unwrap();
+    let caps = root_caps();
+    let stamped = session.clone().with_facet(&caps).unwrap();
+    store.write_ref(&stamped).unwrap();
     let seam = Arc::new(StubSeam {
         dir: dir.clone(),
         spawned: Mutex::new(Vec::new()),
         running: Mutex::new(HashSet::new()),
     });
-    let tools = ri_kit::meta_tools::create(seam.clone(), seam.clone(), session.id.clone());
+    let tools = ri_kit::meta_tools::create(seam.clone(), seam.clone(), session.id.clone(), &caps);
     Fixture { dir, session_id: session.id, seam, tools }
 }
 
@@ -577,6 +586,31 @@ async fn update_ref_create_update_guard_and_canary() {
     assert!(out.is_error);
     assert_eq!(text(&out), "context 'ctx_nope' not found");
 
+    // A caps write mints the grant on the ref, bounded by what the caller can
+    // convey: runAgent lands one level lower, and an unconveyable name is
+    // refused before any write.
+    let out = f.run("updateRef", json!({
+        "ref_id": "ref_topic", "context_id": ctx_c, "caps": ["read", "runAgent"]
+    })).await;
+    assert!(!out.is_error, "caps write failed: {}", text(&out));
+    assert!(text(&out).contains("caps set to read, runAgent(1)"), "got: {}", text(&out));
+    let store = mount(&f.dir);
+    let granted = store.get_ref(&RefId::from("ref_topic")).unwrap()
+        .facet::<ri_kit::caps::CapSet>().unwrap().unwrap();
+    assert_eq!(granted.describe(), "read, runAgent(1)");
+
+    let head_before = store.get_ref(&RefId::from("ref_topic")).unwrap().head;
+    let out = f.run("updateRef", json!({
+        "ref_id": "ref_topic", "context_id": ctx_c, "caps": ["frobnicate"]
+    })).await;
+    assert!(out.is_error);
+    assert!(text(&out).contains("cannot convey [frobnicate]"), "got: {}", text(&out));
+    let store = mount(&f.dir);
+    let after = store.get_ref(&RefId::from("ref_topic")).unwrap();
+    assert_eq!(after.head, head_before, "a refused caps write moves nothing");
+    let kept = after.facet::<ri_kit::caps::CapSet>().unwrap().unwrap();
+    assert_eq!(kept.describe(), "read, runAgent(1)", "a refused caps write grants nothing");
+
     // Ownership guard: a different ref a running agent owns is refused.
     let store = mount(&f.dir);
     let other = ri_kit::chat::create(&store, ri_kit::chat::ChatFacet {
@@ -604,15 +638,17 @@ async fn read_ref_head_facets_and_inbox() {
     let m1 = f.one_message("user", "x").await;
     let ctx_a = f.context_of(&[m1.as_str()]).await;
 
-    // The chat session ref reports its facet.
+    // The chat session ref reports its facet and its grant.
     let out = f.run("readRef", json!({ "ref_id": f.session_id.as_str() })).await;
     assert!(!out.is_error, "unexpected error: {}", text(&out));
     assert!(text(&out).contains("chat \"test session\""), "facet shown: {}", text(&out));
+    assert!(text(&out).contains("runAgent(2)"), "grant shown: {}", text(&out));
 
-    // A raw ref (created by updateRef) reports "raw".
+    // A raw ref (created by updateRef) reports "raw" and no grant.
     f.run("updateRef", json!({ "ref_id": "ref_raw", "context_id": ctx_a })).await;
     let out = f.run("readRef", json!({ "ref_id": "ref_raw" })).await;
     assert!(text(&out).contains("raw"), "raw ref: {}", text(&out));
+    assert!(text(&out).contains("caps: (no grant)"), "capless shown: {}", text(&out));
 
     // An envelope addressed to ref_raw shows up as one pending inbox item.
     f.run("createContext", json!({
@@ -634,25 +670,30 @@ async fn run_agent_tool_selection_and_validation() {
     let m1 = f.one_message("user", "seed").await;
     let ctx1 = f.context_of(&[m1.as_str()]).await;
 
-    // Schema advertises the seam's models and tool names.
+    // Schema advertises the seam's models and the conveyable grant: the
+    // caller's set transitioned, so runAgent shows one level lower.
     let params = f.tool("runAgent").parameters().to_string();
     assert!(params.contains("stub-model"), "models advertised: {}", params);
     assert!(params.contains("bash") && params.contains("edit"), "tools advertised: {}", params);
+    assert!(params.contains("runAgent(1)"), "conveyable runAgent level shown: {}", params);
 
-    // Default (no tools key) -> full set, loop.
+    // Default (no tools key) -> everything conveyable, loop.
     let out = f.run("runAgent", json!({
         "context_id": ctx1, "model_id": "stub-model", "label": "worker",
         "model_params": { "thinking": "high", "max_tokens": 1000 }
     })).await;
     assert!(!out.is_error, "unexpected error: {}", text(&out));
-    assert_eq!(text(&out), "Agent loop started on session 'ref_stub_agent'");
+    assert!(text(&out).starts_with("Agent loop started on session 'ref_stub_agent'"),
+        "got: {}", text(&out));
+    assert!(text(&out).contains("runAgent(1)"), "granted set reported: {}", text(&out));
 
     // Empty tools -> single turn.
     let out = f.run("runAgent", json!({
         "context_id": ctx1, "model_id": "stub-model", "tools": []
     })).await;
     assert!(!out.is_error);
-    assert_eq!(text(&out), "Single turn started on session 'ref_stub_agent'");
+    assert!(text(&out).starts_with("Single turn started on session 'ref_stub_agent'"),
+        "got: {}", text(&out));
 
     // Subset -> loop with that subset.
     let out = f.run("runAgent", json!({
@@ -660,27 +701,27 @@ async fn run_agent_tool_selection_and_validation() {
     })).await;
     assert!(!out.is_error);
 
-    // Unknown tool name is a surfaced error listing the available set.
+    // A name outside the caller's grant is a surfaced error.
     let out = f.run("runAgent", json!({
         "context_id": ctx1, "model_id": "stub-model", "tools": ["frobnicate"]
     })).await;
     assert!(out.is_error);
-    assert!(text(&out).contains("unknown tool 'frobnicate'") && text(&out).contains("bash"),
+    assert!(text(&out).contains("cannot convey [frobnicate]") && text(&out).contains("does not include"),
         "got: {}", text(&out));
 
-    // The requests that reached the seam carry the right tool selection.
+    // The requests that reached the seam carry the resolved grants.
     {
         let spawned = f.seam.spawned.lock().unwrap();
         assert_eq!(spawned.len(), 3, "three successful spawns");
-        assert_eq!(spawned[0].tools, None, "default = full set");
+        assert_eq!(spawned[0].caps, root_caps().transition(), "default = everything conveyable");
         assert_eq!(spawned[0].max_tokens, Some(1000));
         assert_eq!(spawned[0].thinking.as_ref().map(|t| t.to_string()), Some("high".to_string()));
         assert!(
             matches!(&spawned[0].target, ExecTarget::Fork(c) if c.to_string() == ctx1),
             "a context target forks a new session beginning there"
         );
-        assert_eq!(spawned[1].tools.as_deref(), Some(&[][..]), "empty = single turn");
-        assert_eq!(spawned[2].tools.as_deref(), Some(&["read".to_string()][..]));
+        assert!(spawned[1].caps.is_empty(), "empty = single turn");
+        assert_eq!(spawned[2].caps.names(), vec!["read".to_string()]);
     }
 
     // Validation surface.
@@ -697,6 +738,128 @@ async fn run_agent_tool_selection_and_validation() {
     })).await;
     assert!(out.is_error);
     assert_eq!(text(&out), "invalid thinking level 'bananas'");
+}
+
+#[tokio::test]
+async fn run_agent_attenuates_run_agent_level() {
+    let f = fixture("run-agent-attenuation");
+    let m1 = f.one_message("user", "seed").await;
+    let ctx1 = f.context_of(&[m1.as_str()]).await;
+
+    // The root fixture (runAgent level 2) grants runAgent at level 1.
+    let out = f.run("runAgent", json!({
+        "context_id": ctx1, "model_id": "stub-model", "tools": ["read", "runAgent"]
+    })).await;
+    assert!(!out.is_error, "level-2 caller conveys runAgent: {}", text(&out));
+    {
+        let spawned = f.seam.spawned.lock().unwrap();
+        let caps = &spawned.last().unwrap().caps;
+        assert_eq!(caps.describe(), "read, runAgent(1)", "runAgent granted one level lower");
+    }
+
+    // A level-1 loop (a child's grant) cannot convey runAgent at all: build
+    // its tools directly, as a harness would for the spawned child.
+    let child_caps = root_caps().transition();
+    let child_tools = ri_kit::meta_tools::create(
+        f.seam.clone(), f.seam.clone(), f.session_id.clone(), &child_caps,
+    );
+    let child_run = child_tools.iter().find(|t| t.name() == "runAgent").unwrap();
+    let out = child_run.run(json!({
+        "context_id": ctx1, "model_id": "stub-model", "tools": ["runAgent"]
+    }), CancellationToken::new()).await;
+    assert!(out.is_error);
+    assert!(text(&out).contains("holds it at level 1") && text(&out).contains("does not extend"),
+        "exhausted level teaches: {}", text(&out));
+
+    // The grandchild grant (transition of the child's) has no runAgent, so
+    // the tool is never even constructed for it.
+    let grandchild_caps = child_caps.transition();
+    assert!(!grandchild_caps.contains("runAgent"));
+    let grandchild_tools = ri_kit::meta_tools::create(
+        f.seam.clone(), f.seam.clone(), f.session_id.clone(), &grandchild_caps,
+    );
+    assert!(
+        grandchild_tools.iter().all(|t| t.name() != "runAgent"),
+        "an ungranted meta-tool is not built"
+    );
+
+    // A level-1 caller refusing a runAgent-holding continue names the real
+    // cause -- held, but exhausted -- beside the violation list.
+    let strong = ri::Ref::with_id(RefId::from("ref_exhausted"), ContextId::from(ctx1.as_str()))
+        .with_facet(&ri_kit::caps::CapSet::none().with_leveled("runAgent", 1))
+        .unwrap();
+    mount(&f.dir).write_ref(&strong).unwrap();
+    let out = child_run.run(json!({
+        "context_id": "ref_exhausted", "model_id": "stub-model"
+    }), CancellationToken::new()).await;
+    assert!(out.is_error);
+    assert!(text(&out).contains("does not extend to runs you start"),
+        "exhausted note shown: {}", text(&out));
+}
+
+#[tokio::test]
+async fn run_agent_continue_reads_the_target_grant() {
+    let f = fixture("run-agent-continue-caps");
+    let m1 = f.one_message("user", "seed").await;
+    let ctx1 = f.context_of(&[m1.as_str()]).await;
+    let store = mount(&f.dir);
+
+    // A capless ref refuses a default continue, teaching both remedies.
+    f.run("updateRef", json!({ "ref_id": "ref_bare", "context_id": ctx1 })).await;
+    let out = f.run("runAgent", json!({
+        "context_id": "ref_bare", "model_id": "stub-model"
+    })).await;
+    assert!(out.is_error);
+    assert!(text(&out).contains("no capability grant") && text(&out).contains("updateRef"),
+        "capless continue teaches: {}", text(&out));
+
+    // A ref granted within the caller's conveyable set continues quietly,
+    // running with its own grant.
+    let out = f.run("updateRef", json!({
+        "ref_id": "ref_worker", "context_id": ctx1, "caps": ["read", "bash"]
+    })).await;
+    assert!(!out.is_error, "grant write failed: {}", text(&out));
+    let out = f.run("runAgent", json!({
+        "context_id": "ref_worker", "model_id": "stub-model"
+    })).await;
+    assert!(!out.is_error, "within-grant continue: {}", text(&out));
+    {
+        let spawned = f.seam.spawned.lock().unwrap();
+        assert_eq!(spawned.last().unwrap().caps.describe(), "bash, read",
+            "a default continue runs the target's own grant");
+    }
+
+    // A ref whose grant exceeds the caller's conveyable set is refused with
+    // the violations and both remedies -- here, runAgent at the caller's own
+    // level, which a spawn cannot convey.
+    let strong = ri::Ref::with_id(RefId::from("ref_strong"), ContextId::from(ctx1.as_str()))
+        .with_facet(&ri_kit::caps::CapSet::unit(["read"]).with_leveled("runAgent", 2))
+        .unwrap();
+    store.write_ref(&strong).unwrap();
+    let out = f.run("runAgent", json!({
+        "context_id": "ref_strong", "model_id": "stub-model"
+    })).await;
+    assert!(out.is_error);
+    assert!(
+        text(&out).contains("exceeding what you can convey")
+            && text(&out).contains("[runAgent] at level 2 exceeds level 1"),
+        "exceeding continue refused with violations: {}", text(&out)
+    );
+
+    // An explicit tools override runs the target narrowed, without touching
+    // its durable grant.
+    let out = f.run("runAgent", json!({
+        "context_id": "ref_strong", "model_id": "stub-model", "tools": ["read"]
+    })).await;
+    assert!(!out.is_error, "explicit downgrade: {}", text(&out));
+    {
+        let spawned = f.seam.spawned.lock().unwrap();
+        assert_eq!(spawned.last().unwrap().caps.describe(), "read");
+    }
+    let store = mount(&f.dir);
+    let still = store.get_ref(&RefId::from("ref_strong")).unwrap()
+        .facet::<ri_kit::caps::CapSet>().unwrap().unwrap();
+    assert_eq!(still.describe(), "read, runAgent(2)", "a per-run override never rewrites the facet");
 }
 
 #[tokio::test]

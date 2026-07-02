@@ -1,5 +1,6 @@
 // Building blocks for ri agent applications.
 
+pub mod caps;
 pub mod chat;
 pub mod commands;
 pub mod envelope;
