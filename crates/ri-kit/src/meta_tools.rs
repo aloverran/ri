@@ -181,10 +181,10 @@ pub fn create(
 }
 
 /// The name of the `runAgent` meta-tool. Called out as a constant because it
-/// is the leveled capability in practice: harnesses grant it with a level
-/// (`crate::caps`), so each spawned generation holds it one level lower and a
-/// level-1 holder cannot pass it on at all -- recursion is bounded by data,
-/// not by construction-site special cases.
+/// is the budgeted capability in practice: harnesses grant it with a transfer
+/// budget (`crate::caps`), decremented at each hand-down, so a holder with a
+/// spent budget cannot pass it on at all -- recursion is bounded by data, not
+/// by construction-site special cases.
 pub const RUN_AGENT: &str = "runAgent";
 
 /// The names of the eight meta-tools, in the order [`create`] builds them. The
@@ -1051,10 +1051,11 @@ impl Tool for UpdateRefTool {
                     "description": format!(
                         "Optionally replace the ref's capability grant: the tool \
                          names it runs with when continued. Each name must be \
-                         conveyable by this session; a leveled capability \
-                         (runAgent) is granted one level lower. Pass base names \
-                         only -- 'runAgent', never 'runAgent(1)'. You can \
-                         convey: {}. Omit to leave the ref's grant unchanged.",
+                         conveyable by this session; a budgeted capability \
+                         (runAgent) is granted with its transfer budget reduced \
+                         by one. Pass base names only -- 'runAgent', never \
+                         'runAgent(1)'. You can convey: {}. Omit to leave the \
+                         ref's grant unchanged.",
                         self.caps.transition().describe())
                 }
             },
@@ -1327,9 +1328,10 @@ impl Tool for RunAgentTool {
          -- or a ref/session id -- continues that existing session on its \
          current head instead of forking, erroring if it is already running. \
          Capabilities attenuate: a run receives at most what you can convey \
-         (your own grant, with runAgent one level lower -- so recursion is \
-         bounded), and continuing a session whose own grant exceeds that is \
-         refused unless you pass 'tools' to run it narrowed. With no tools \
+         (your own grant, with runAgent's transfer budget reduced by one -- so \
+         recursion is bounded), and continuing a session whose own grant \
+         exceeds that is refused unless you pass 'tools' to run it narrowed. \
+         With no tools \
          (tools: []) it is a single LLM turn -- the model's native capabilities \
          (e.g. Gemini search and code execution) turn on automatically. With \
          tools it loops -- LLM turn, tool calls, repeat -- until the model \
@@ -1370,8 +1372,9 @@ impl Tool for RunAgentTool {
                          with no tools. On a continue, omitting runs the session \
                          with its own grant (refused if that exceeds yours). An \
                          unconveyable name is an error. Pass base names only -- \
-                         'runAgent', never 'runAgent(1)'; the (n) shows the level \
-                         a grant lands at. You can convey: {}",
+                         'runAgent', never 'runAgent(1)'; the (n) shows a grant's \
+                         remaining transfer budget, and a bare runAgent can spawn \
+                         but not share. You can convey: {}",
                         self.caps.transition().describe())
                 },
                 "label": {
@@ -1507,8 +1510,8 @@ fn resolve_exec_request(
                     let conveyable = caps.transition();
                     let violations = target_caps.violations(&conveyable);
                     if !violations.is_empty() {
-                        // A name the caller holds but transition dropped (an
-                        // exhausted level) would otherwise read as "not
+                        // A name the caller holds but transition dropped (a
+                        // spent transfer budget) would otherwise read as "not
                         // granted" -- say what actually happened.
                         let exhausted: Vec<String> = target_caps.names().into_iter()
                             .filter(|n| caps.contains(n) && !conveyable.contains(n))
@@ -1518,8 +1521,8 @@ fn resolve_exec_request(
                             String::new()
                         } else {
                             format!(
-                                " (you hold {} but at a level that does not extend \
-                                 to runs you start)",
+                                " (you hold {} but with no transfer budget left \
+                                 to convey it)",
                                 exhausted.join(", ")
                             )
                         };

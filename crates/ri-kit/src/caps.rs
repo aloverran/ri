@@ -15,12 +15,14 @@
 //!     conveyable = transition(own effective caps)
 //! ```
 //!
-//! [`CapSet::transition`] is one spawn generation: unit capabilities pass
-//! through unchanged, leveled capabilities decrement and drop out at
-//! zero. `runAgent` is the leveled capability in practice -- holding it
-//! at level n means "n more generations may spawn below me" -- but this
-//! module attaches no meaning to names: which capability carries a level,
-//! and at what root value, is the harness's configuration.
+//! [`CapSet::transition`] is one grant generation: unit capabilities pass
+//! through unchanged, budgeted capabilities decrement their transfer
+//! budget and drop out once it is spent. Presence in the set is what says
+//! "I hold this"; the budget says only how many more times it may be
+//! handed down -- a holder at budget 0 uses the capability freely but
+//! cannot convey it. `runAgent` is the budgeted capability in practice,
+//! but this module attaches no meaning to names: which capability carries
+//! a budget, and at what root value, is the harness's configuration.
 //!
 //! This module is a leaf: pure data, no knowledge of tools, loops, or
 //! harnesses. Enforcement call sites (`runAgent`, `updateRef`) live in
@@ -33,32 +35,39 @@ use serde::{Deserialize, Serialize};
 
 /// One grant within a [`CapSet`].
 ///
-/// A unit grant (`level: None`) is plain access, unbounded under
-/// [`CapSet::transition`]. A leveled grant additionally bounds re-granting:
-/// each transition decrements the level, and a level that would reach zero
-/// is dropped rather than stored -- a persisted level is always >= 1.
+/// A unit grant (`budget: None`) is plain access, unbounded under
+/// [`CapSet::transition`]. A budgeted grant additionally bounds
+/// re-granting: the budget counts how many more times the capability may
+/// be handed down. Each transition decrements it, and a spent budget
+/// (0) drops out of the next transition entirely.
+///
+/// Unknown fields are rejected so that data written under a different
+/// encoding surfaces as a malformed facet -- a loud canary that heals
+/// through the harness derivation paths -- rather than silently parsing
+/// as an unbounded unit grant.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Cap {
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub level: Option<u32>,
+    pub budget: Option<u32>,
 }
 
 impl Cap {
     /// A plain unit grant.
     pub fn unit() -> Self {
-        Cap { level: None }
+        Cap { budget: None }
     }
 
-    /// A leveled grant.
-    pub fn leveled(level: u32) -> Self {
-        Cap { level: Some(level) }
+    /// A grant with a transfer budget.
+    pub fn budgeted(budget: u32) -> Self {
+        Cap { budget: Some(budget) }
     }
 }
 
 /// The set of capabilities a session runs with: tool name -> grant.
 ///
 /// Stored on a session ref under the `caps` facet key. On disk it reads
-/// as `{"bash": {}, "runAgent": {"level": 2}}`.
+/// as `{"bash": {}, "runAgent": {"budget": 1}}`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct CapSet(pub BTreeMap<String, Cap>);
@@ -78,9 +87,9 @@ impl CapSet {
         CapSet(names.into_iter().map(|n| (n.into(), Cap::unit())).collect())
     }
 
-    /// Builder: add or replace one leveled grant.
-    pub fn with_leveled(mut self, name: impl Into<String>, level: u32) -> Self {
-        self.0.insert(name.into(), Cap::leveled(level));
+    /// Builder: add or replace one budgeted grant.
+    pub fn with_budget(mut self, name: impl Into<String>, budget: u32) -> Self {
+        self.0.insert(name.into(), Cap::budgeted(budget));
         self
     }
 
@@ -103,17 +112,17 @@ impl CapSet {
         self.0.keys().cloned().collect()
     }
 
-    /// One spawn generation: unit grants pass through unchanged; leveled
-    /// grants decrement, dropping out when the level is exhausted. The
-    /// result is the most any holder of `self` may convey to another
-    /// execution identity.
+    /// One grant generation: unit grants pass through unchanged; budgeted
+    /// grants decrement their transfer budget, dropping out once it is
+    /// spent. The result is the most any holder of `self` may convey to
+    /// another execution identity.
     pub fn transition(&self) -> CapSet {
         CapSet(
             self.0
                 .iter()
-                .filter_map(|(name, cap)| match cap.level {
+                .filter_map(|(name, cap)| match cap.budget {
                     None => Some((name.clone(), Cap::unit())),
-                    Some(n) if n >= 2 => Some((name.clone(), Cap::leveled(n - 1))),
+                    Some(b) if b >= 1 => Some((name.clone(), Cap::budgeted(b - 1))),
                     Some(_) => None,
                 })
                 .collect(),
@@ -123,20 +132,23 @@ impl CapSet {
     /// Every way `self` exceeds `other`, as human-readable phrases; empty
     /// means `self` fits within `other`. The order: a grant fits when the
     /// same name is granted at least as strongly -- a unit grant exceeds
-    /// any leveled one (unit is unbounded), and levels compare numerically.
+    /// any budgeted one (unit is unbounded), and budgets compare
+    /// numerically.
     pub fn violations(&self, other: &CapSet) -> Vec<String> {
         let mut out = Vec::new();
         for (name, cap) in &self.0 {
-            match (other.0.get(name), cap.level) {
+            match (other.0.get(name), cap.budget) {
                 (None, _) => out.push(format!("[{}] is not granted", name)),
-                (Some(Cap { level: None }), _) => {}
-                (Some(Cap { level: Some(_) }), None) => {
-                    out.push(format!("[{}] is unleveled here but bounded there", name))
+                (Some(Cap { budget: None }), _) => {}
+                (Some(Cap { budget: Some(_) }), None) => {
+                    out.push(format!("[{}] is unbounded here but bounded there", name))
                 }
-                (Some(Cap { level: Some(b) }), Some(a)) if a > *b => {
-                    out.push(format!("[{}] at level {} exceeds level {}", name, a, b))
+                (Some(Cap { budget: Some(b) }), Some(a)) if a > *b => {
+                    out.push(format!(
+                        "[{}] transfer budget {} exceeds budget {}", name, a, b
+                    ))
                 }
-                (Some(Cap { level: Some(_) }), Some(_)) => {}
+                (Some(Cap { budget: Some(_) }), Some(_)) => {}
             }
         }
         out
@@ -146,7 +158,7 @@ impl CapSet {
     /// for everything conveyable -- the whole [`CapSet::transition`].
     /// `Some(names)` asks for exactly those grants out of it; a name that
     /// is not conveyable is an error that distinguishes "not held at all"
-    /// from "held, but its level does not extend further".
+    /// from "held, but with no transfer budget remaining".
     pub fn grant(&self, requested: Option<&[String]>) -> Result<CapSet, String> {
         let conveyable = self.transition();
         let Some(names) = requested else {
@@ -160,10 +172,9 @@ impl CapSet {
                 }
                 None if self.contains(name) => {
                     return Err(format!(
-                        "cannot convey [{}]: this session holds it at level {}, which does \
-                         not extend to another agent",
+                        "cannot convey [{}]: this session holds it with no transfer \
+                         budget remaining",
                         name,
-                        self.0[name].level.unwrap_or(0),
                     ));
                 }
                 None => {
@@ -177,17 +188,20 @@ impl CapSet {
         Ok(CapSet(out))
     }
 
-    /// Render for display: `bash, read, runAgent(2)`, or `(none)` when
-    /// empty. Names sort naturally via the underlying map.
+    /// Render for display: `bash, read, runAgent(1)`, or `(none)` when
+    /// empty. A grant with shareable budget shows it in parentheses; a
+    /// spent budget renders as the bare name, like a unit grant -- held,
+    /// nothing left to say about sharing. Names sort naturally via the
+    /// underlying map.
     pub fn describe(&self) -> String {
         if self.0.is_empty() {
             return "(none)".to_string();
         }
         self.0
             .iter()
-            .map(|(name, cap)| match cap.level {
-                None => name.clone(),
-                Some(n) => format!("{}({})", name, n),
+            .map(|(name, cap)| match cap.budget {
+                None | Some(0) => name.clone(),
+                Some(b) => format!("{}({})", name, b),
             })
             .collect::<Vec<_>>()
             .join(", ")
@@ -199,34 +213,34 @@ mod tests {
     use super::*;
 
     fn root() -> CapSet {
-        CapSet::unit(["bash", "read"]).with_leveled("runAgent", 2)
+        CapSet::unit(["bash", "read"]).with_budget("runAgent", 1)
     }
 
     #[test]
-    fn transition_decrements_and_exhausts() {
+    fn transition_decrements_and_spends() {
         let one = root().transition();
-        assert_eq!(one.0["runAgent"], Cap::leveled(1));
+        assert_eq!(one.0["runAgent"], Cap::budgeted(0));
         assert_eq!(one.0["bash"], Cap::unit());
 
         let two = one.transition();
-        assert!(!two.contains("runAgent"), "level 1 does not extend further");
+        assert!(!two.contains("runAgent"), "a spent budget does not convey");
         assert!(two.contains("bash"), "unit grants pass through unchanged");
     }
 
     #[test]
-    fn violations_order_units_and_levels() {
+    fn violations_order_units_and_budgets() {
         let caller = root();
-        // Fits: fewer names, lower level.
-        let ok = CapSet::unit(["bash"]).with_leveled("runAgent", 1);
+        // Fits: fewer names, lower budget.
+        let ok = CapSet::unit(["bash"]).with_budget("runAgent", 0);
         assert!(ok.violations(&caller).is_empty());
-        // Exceeds: a name not granted, a level too high, a unit over a level.
-        let bad = CapSet::unit(["write", "runAgent"]).with_leveled("bash", 1);
+        // Exceeds: a name not granted, a budget too high, a unit over a budget.
+        let bad = CapSet::unit(["write", "runAgent"]).with_budget("bash", 1);
         let v = bad.violations(&caller);
-        assert_eq!(v.len(), 2, "write missing + runAgent unleveled: {:?}", v);
-        let high = CapSet::none().with_leveled("runAgent", 3);
+        assert_eq!(v.len(), 2, "write missing + runAgent unbounded: {:?}", v);
+        let high = CapSet::none().with_budget("runAgent", 2);
         assert_eq!(high.violations(&caller).len(), 1);
-        // A leveled grant fits within a unit grant.
-        let under = CapSet::none().with_leveled("bash", 5);
+        // A budgeted grant fits within a unit grant.
+        let under = CapSet::none().with_budget("bash", 5);
         assert!(under.violations(&caller).is_empty());
     }
 
@@ -236,22 +250,33 @@ mod tests {
         assert_eq!(caller.grant(None).unwrap(), caller.transition());
 
         let sel = caller.grant(Some(&["bash".into(), "runAgent".into()])).unwrap();
-        assert_eq!(sel.0["runAgent"], Cap::leveled(1));
+        assert_eq!(sel.0["runAgent"], Cap::budgeted(0));
         assert_eq!(sel.names(), vec!["bash", "runAgent"]);
 
         let not_held = caller.grant(Some(&["write".into()])).unwrap_err();
         assert!(not_held.contains("does not include"), "{}", not_held);
 
-        let exhausted = caller.transition().grant(Some(&["runAgent".into()])).unwrap_err();
-        assert!(exhausted.contains("level 1"), "{}", exhausted);
+        let spent = caller.transition().grant(Some(&["runAgent".into()])).unwrap_err();
+        assert!(spent.contains("no transfer budget"), "{}", spent);
     }
 
     #[test]
-    fn facet_roundtrip_shape() {
+    fn describe_shows_budget_only_when_shareable() {
+        assert_eq!(root().describe(), "bash, read, runAgent(1)");
+        assert_eq!(root().transition().describe(), "bash, read, runAgent");
+    }
+
+    #[test]
+    fn facet_roundtrip_shape_and_foreign_encoding() {
         let json = serde_json::to_value(root()).unwrap();
         assert_eq!(json["bash"], serde_json::json!({}));
-        assert_eq!(json["runAgent"], serde_json::json!({"level": 2}));
+        assert_eq!(json["runAgent"], serde_json::json!({"budget": 1}));
         let back: CapSet = serde_json::from_value(json).unwrap();
         assert_eq!(back, root());
+
+        // Data written under a different encoding is malformed, never a
+        // silent unit grant.
+        let foreign = serde_json::json!({"runAgent": {"level": 2}});
+        assert!(serde_json::from_value::<CapSet>(foreign).is_err());
     }
 }
