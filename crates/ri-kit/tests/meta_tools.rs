@@ -10,8 +10,8 @@ use async_trait::async_trait;
 use serde_json::json;
 use tokio_util::sync::CancellationToken;
 
-use ri::{ContentBlock, ContextId, HasMeta, MessageId, RefId, Role, Store, Tool, ToolOutput};
-use ri_kit::meta_tools::{AgentStatus, ExecRequest, ExecTarget, MetaExec, StoreAccess};
+use ri::{ContentBlock, ContextId, HasMeta, MessageId, Ref, RefId, Role, Store, Tool, ToolOutput};
+use ri_kit::meta_tools::{AgentStatus, ExecRequest, ExecTarget, MetaExec, Repoint, StoreAccess};
 
 /// A fresh, empty sessions dir for one test.
 fn temp_sessions_dir(tag: &str) -> PathBuf {
@@ -26,8 +26,10 @@ fn mount(dir: &PathBuf) -> Store {
 }
 
 /// Stub harness seam: store access mounts fresh per call (CLI-style),
-/// `spawn_agent` records the request, and `agent_status` reports a ref running
-/// iff it has been marked so (driving the ownership guard).
+/// `spawn_agent` records the request, `agent_status` reports a ref running iff
+/// marked so (readAgent, the continue guard), and `repoint_ref` refuses a
+/// marked-running ref (the updateRef ownership guard) and otherwise persists
+/// the move, CLI-style.
 struct StubSeam {
     dir: PathBuf,
     spawned: Mutex<Vec<ExecRequest>>,
@@ -64,6 +66,19 @@ impl MetaExec for StubSeam {
             running: self.running.lock().unwrap().contains(ref_id.as_str()),
             streaming_preview: None,
         }
+    }
+
+    async fn repoint_ref(&self, new_ref: &Ref) -> Result<Repoint, String> {
+        // Mirror the harness contract: a ref a running loop owns refuses the
+        // move; otherwise persist it (fresh mount + family store, CLI-style).
+        if self.running.lock().unwrap().contains(new_ref.id.as_str()) {
+            return Ok(Repoint::Running);
+        }
+        let store = self.store()?;
+        let family = ri_kit::chat::family_store(&store, &new_ref.id)
+            .map_err(|e| format!("resolve family store: {}", e))?;
+        family.write_ref(new_ref).map_err(|e| format!("write ref: {}", e))?;
+        Ok(Repoint::Moved)
     }
 }
 

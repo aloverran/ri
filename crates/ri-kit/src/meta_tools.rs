@@ -1,16 +1,18 @@
 //! Meta-tools for orchestrating ri from within an agent loop.
 //!
-//! Eight tools, in two tiers. The first six are pure data operations on the
-//! three atoms of `ri::model` -- they need only a [`StoreAccess`]. The last two
-//! reach into the harness runtime through [`MetaExec`], because an "agent" is
-//! not an atom: it is a ref plus a live loop, and "is a loop running" lives in
-//! the harness, never in the DAG.
+//! Eight tools. Six are pure data operations on the three atoms of
+//! `ri::model` -- they need only a [`StoreAccess`]. `updateRef` is data plus
+//! one runtime seam: persisting a ref move must also keep a resident session's
+//! cached head in step, so it routes through [`MetaExec`] too. `runAgent` and
+//! `readAgent` are pure runtime, because an "agent" is not an atom: it is a ref
+//! plus a live loop, and "is a loop running" lives in the harness, never in the
+//! DAG.
 //!
 //! ```text
 //!             produce         read          tier
 //!   Message   createMessage   readMessage   data   (StoreAccess)
 //!   Context   createContext   readContext   data   (StoreAccess)
-//!   Ref       updateRef       readRef       data + one runtime guard
+//!   Ref       updateRef       readRef       data + one runtime seam
 //!   Agent     runAgent        readAgent     runtime (MetaExec)
 //! ```
 //!
@@ -103,9 +105,20 @@ pub struct AgentStatus {
     pub streaming_preview: Option<String>,
 }
 
+/// The outcome of an `updateRef` move through [`MetaExec::repoint_ref`],
+/// reported so `UpdateRefTool` can phrase the result in its own voice.
+pub enum Repoint {
+    /// The ref was written; a resident idle session's cached head moved with it.
+    Moved,
+    /// Refused, nothing written: a loop currently owns the ref and is the
+    /// authoritative writer of its head. The caller phrases the refusal.
+    Running,
+}
+
 /// Harness seam for the runtime tier: which models exist, how a spawned loop
-/// runs, and the live status of a ref. `spawn_agent` returns the new session's
-/// ref id immediately; the loop proceeds in the background.
+/// runs, the live status of a ref, and how a ref move reaches a resident
+/// session. `spawn_agent` returns the new session's ref id immediately; the
+/// loop proceeds in the background.
 #[async_trait]
 pub trait MetaExec: Send + Sync {
     /// Model ids advertised in `runAgent`'s schema.
@@ -114,9 +127,19 @@ pub trait MetaExec: Send + Sync {
     /// grant yields a single turn with native capabilities on.
     async fn spawn_agent(&self, request: ExecRequest) -> Result<RefId, String>;
     /// Runtime status of a ref's loop: whether one is alive and any partial
-    /// output it is streaming. The single liveness oracle behind both the
-    /// `updateRef` ownership guard and `readAgent`.
+    /// output it is streaming. The liveness oracle behind `readAgent` and the
+    /// `runAgent` continue guard.
     async fn agent_status(&self, ref_id: &RefId) -> AgentStatus;
+    /// Persist a validated `updateRef` move, keeping any resident session's
+    /// working head in step with it. The harness owns this because "is a loop
+    /// running" and "is this ref resident in memory" live in the harness, not
+    /// the DAG: a resident idle session caches the head in `head_messages`, and
+    /// if the ref moved without it the session's next checkpoint would weld the
+    /// stale list onto the new head. Writing the ref and the cached head
+    /// together, under the session's own lock, is the fix. `Running` refuses a
+    /// ref a loop owns; a ref no session holds is written to disk alone (a
+    /// later load hydrates the new head).
+    async fn repoint_ref(&self, new_ref: &Ref) -> Result<Repoint, String>;
 }
 
 /// Build the meta-tools over the two harness seams, within a capability grant.
@@ -997,9 +1020,10 @@ fn append_ancestors(out: &mut String, store: &Store, focal: &Context, depth: usi
 /// grant. Enforces single ownership -- a ref with a running agent loop is
 /// refused, because that loop is the authoritative writer of its head and
 /// would silently overwrite the move at its next checkpoint; influence such a
-/// ref via `createContext merge_into`, or move it once idle. The move is a raw
-/// pointer swap; a swap that drops the prior head out of the new head's
-/// ancestry is surfaced, not blocked.
+/// ref via `createContext merge_into`, or move it once idle. The move goes
+/// through the [`MetaExec::repoint_ref`] seam, which keeps a resident session's
+/// cached head in step with the ref. A swap that drops the prior head out of
+/// the new head's ancestry is surfaced, not blocked.
 struct UpdateRefTool {
     store: Arc<dyn StoreAccess>,
     exec: Arc<dyn MetaExec>,
@@ -1107,32 +1131,6 @@ impl Tool for UpdateRefTool {
 
         let existing = store.get_ref(&ref_id);
 
-        // Single ownership: while an agent loop runs on a ref, that loop is the
-        // authoritative writer of its head -- it would overwrite a pointer move
-        // at its next checkpoint, so reporting success here would be a silent
-        // lie. This holds even when the loop is the caller (a tool call runs
-        // inside it). A running ref is therefore never repointed; influence it
-        // as data (createContext merge_into) or move it once idle.
-        if existing.is_some() && self.exec.agent_status(&ref_id).await.running {
-            let hint = if ref_id == self.session_id {
-                "your own loop owns your head while you run -- relocate it with a \
-                 createContext jump envelope, which the loop applies at its next boundary"
-            } else {
-                "address it with createContext merge_into (weave messages) or jump \
-                 (relocate its head) instead, or move it once idle"
-            };
-            return ToolOutput::error(&format!(
-                "ref [{}] is owned by a running agent loop; {}", ref_id, hint
-            ));
-        }
-
-        // The ref's own family file (a not-yet-existing raw ref anchors on
-        // itself), so its snapshots stay with its family for clean deletion.
-        let family_store = match crate::chat::family_store(&store, &ref_id) {
-            Ok(s) => s,
-            Err(e) => return ToolOutput::error(&format!("resolve family store: {}", e)),
-        };
-
         let (mut new_ref, created, prior_head) = match &existing {
             Some(r) => (r.clone().with_head(head.clone()), false, Some(r.head.clone())),
             None => (Ref::with_id(ref_id.clone(), head.clone()), true, None),
@@ -1142,8 +1140,27 @@ impl Tool for UpdateRefTool {
                 return ToolOutput::error(&format!("failed to encode caps facet: {}", e));
             }
         }
-        if let Err(e) = family_store.write_ref(&new_ref) {
-            return ToolOutput::error(&format!("failed to write ref: {}", e));
+
+        // Single ownership, enforced by the harness under one lock: a ref a
+        // running loop owns is never repointed -- the loop is its authoritative
+        // head-writer (this holds even when the loop is the caller, since a tool
+        // call runs inside it). The seam performs the guarded move and reports
+        // whether it happened.
+        match self.exec.repoint_ref(&new_ref).await {
+            Ok(Repoint::Moved) => {}
+            Ok(Repoint::Running) => {
+                let hint = if ref_id == self.session_id {
+                    "your own loop owns your head while you run -- relocate it with a \
+                     createContext jump envelope, which the loop applies at its next boundary"
+                } else {
+                    "address it with createContext merge_into (weave messages) or jump \
+                     (relocate its head) instead, or move it once idle"
+                };
+                return ToolOutput::error(&format!(
+                    "ref [{}] is owned by a running agent loop; {}", ref_id, hint
+                ));
+            }
+            Err(e) => return ToolOutput::error(&e),
         }
 
         // Chain canary: a raw swap can drop the prior head out of the new
