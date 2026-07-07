@@ -16,20 +16,20 @@ use ri::{Tool, ToolOutput};
 
 pub fn all_tools(cwd: PathBuf) -> Vec<Box<dyn Tool>> {
     vec![
-        Box::new(BashTool { cwd: cwd.clone() }),
+        Box::new(ExecTool { cwd: cwd.clone() }),
         Box::new(ReadTool { cwd: cwd.clone() }),
         Box::new(WriteTool { cwd: cwd.clone() }),
         Box::new(EditTool { cwd }),
     ]
 }
 
-struct BashTool {
+struct ExecTool {
     cwd: PathBuf,
 }
 
 #[async_trait]
-impl Tool for BashTool {
-    fn name(&self) -> &str { "bash" }
+impl Tool for ExecTool {
+    fn name(&self) -> &str { "exec" }
     fn description(&self) -> &str { "Execute a shell command. Runs non-interactively. Output is returned after the command completes." }
     fn parameters(&self) -> serde_json::Value {
         serde_json::json!({
@@ -42,8 +42,8 @@ impl Tool for BashTool {
         })
     }
     async fn run(&self, input: serde_json::Value, cancel: tokio_util::sync::CancellationToken) -> ToolOutput {
-        run_bash(input, &self.cwd, &HashMap::new(), cancel)
-            .instrument(tracing::info_span!("tool", name = "bash"))
+        run_exec(input, &self.cwd, &HashMap::new(), cancel)
+            .instrument(tracing::info_span!("tool", name = "exec"))
             .await
     }
 }
@@ -127,7 +127,7 @@ impl Tool for EditTool {
 
 // -- Tool implementations --
 
-async fn run_bash(
+async fn run_exec(
     input: serde_json::Value,
     cwd: &Path,
     env_vars: &HashMap<String, String>,
@@ -215,7 +215,7 @@ async fn run_bash(
     }
 
     let exit_code = exit_status.unwrap().code().unwrap_or(-1);
-    tracing::debug!("Bash exited with code {exit_code}");
+    tracing::debug!("command exited with code {exit_code}");
 
     let stdout = String::from_utf8_lossy(&stdout_bytes);
     let stderr = String::from_utf8_lossy(&stderr_bytes);

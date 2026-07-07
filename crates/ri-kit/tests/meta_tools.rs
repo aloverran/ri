@@ -86,7 +86,7 @@ impl MetaExec for StubSeam {
 /// names plus every meta tool), `runAgent` at transfer budget 1.
 fn root_caps() -> ri_kit::caps::CapSet {
     ri_kit::caps::CapSet::unit(
-        ["bash", "read", "write", "edit"].into_iter()
+        ["exec", "read", "write", "edit"].into_iter()
             .chain(ri_kit::meta_tools::TOOL_NAMES.iter().copied()),
     )
     .with_budget(ri_kit::meta_tools::RUN_AGENT, 1)
@@ -691,7 +691,7 @@ async fn run_agent_tool_selection_and_validation() {
     // no further transfer budget.
     let params = f.tool("runAgent").parameters().to_string();
     assert!(params.contains("stub-model"), "models advertised: {}", params);
-    assert!(params.contains("bash") && params.contains("edit"), "tools advertised: {}", params);
+    assert!(params.contains("exec") && params.contains("edit"), "tools advertised: {}", params);
     assert!(params.contains("runAgent, updateRef"), "bare conveyable runAgent shown: {}", params);
 
     // Default (no tools key) -> everything conveyable, loop.
@@ -835,7 +835,7 @@ async fn run_agent_continue_reads_the_target_grant() {
     // A ref granted within the caller's conveyable set continues quietly,
     // running with its own grant.
     let out = f.run("updateRef", json!({
-        "ref_id": "ref_worker", "context_id": ctx1, "caps": ["read", "bash"]
+        "ref_id": "ref_worker", "context_id": ctx1, "caps": ["read", "exec"]
     })).await;
     assert!(!out.is_error, "grant write failed: {}", text(&out));
     let out = f.run("runAgent", json!({
@@ -844,7 +844,7 @@ async fn run_agent_continue_reads_the_target_grant() {
     assert!(!out.is_error, "within-grant continue: {}", text(&out));
     {
         let spawned = f.seam.spawned.lock().unwrap();
-        assert_eq!(spawned.last().unwrap().caps.describe(), "bash, read",
+        assert_eq!(spawned.last().unwrap().caps.describe(), "exec, read",
             "a default continue runs the target's own grant");
     }
 

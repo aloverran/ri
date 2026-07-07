@@ -392,7 +392,7 @@ fn parse_token_response(body: &Value) -> eyre::Result<Credentials> {
 // -- Tool name mapping for OAuth (Claude Code compatibility) --
 
 const CLAUDE_CODE_TOOLS: &[&str] = &[
-    "Read", "Write", "Edit", "Bash", "Grep", "Glob",
+    "Read", "Write", "Edit", "Grep", "Glob",
     "AskUserQuestion", "EnterPlanMode", "ExitPlanMode",
     "KillShell", "NotebookEdit", "Skill", "Task",
     "TaskOutput", "TodoWrite", "WebFetch", "WebSearch",

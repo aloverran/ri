@@ -67,7 +67,7 @@ impl Cap {
 /// The set of capabilities a session runs with: tool name -> grant.
 ///
 /// Stored on a session ref under the `caps` facet key. On disk it reads
-/// as `{"bash": {}, "runAgent": {"budget": 1}}`.
+/// as `{"exec": {}, "runAgent": {"budget": 1}}`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct CapSet(pub BTreeMap<String, Cap>);
@@ -188,7 +188,7 @@ impl CapSet {
         Ok(CapSet(out))
     }
 
-    /// Render for display: `bash, read, runAgent(1)`, or `(none)` when
+    /// Render for display: `exec, read, runAgent(1)`, or `(none)` when
     /// empty. A grant with shareable budget shows it in parentheses; a
     /// spent budget renders as the bare name, like a unit grant -- held,
     /// nothing left to say about sharing. Names sort naturally via the
@@ -213,34 +213,34 @@ mod tests {
     use super::*;
 
     fn root() -> CapSet {
-        CapSet::unit(["bash", "read"]).with_budget("runAgent", 1)
+        CapSet::unit(["exec", "read"]).with_budget("runAgent", 1)
     }
 
     #[test]
     fn transition_decrements_and_spends() {
         let one = root().transition();
         assert_eq!(one.0["runAgent"], Cap::budgeted(0));
-        assert_eq!(one.0["bash"], Cap::unit());
+        assert_eq!(one.0["exec"], Cap::unit());
 
         let two = one.transition();
         assert!(!two.contains("runAgent"), "a spent budget does not convey");
-        assert!(two.contains("bash"), "unit grants pass through unchanged");
+        assert!(two.contains("exec"), "unit grants pass through unchanged");
     }
 
     #[test]
     fn violations_order_units_and_budgets() {
         let caller = root();
         // Fits: fewer names, lower budget.
-        let ok = CapSet::unit(["bash"]).with_budget("runAgent", 0);
+        let ok = CapSet::unit(["exec"]).with_budget("runAgent", 0);
         assert!(ok.violations(&caller).is_empty());
         // Exceeds: a name not granted, a budget too high, a unit over a budget.
-        let bad = CapSet::unit(["write", "runAgent"]).with_budget("bash", 1);
+        let bad = CapSet::unit(["write", "runAgent"]).with_budget("exec", 1);
         let v = bad.violations(&caller);
         assert_eq!(v.len(), 2, "write missing + runAgent unbounded: {:?}", v);
         let high = CapSet::none().with_budget("runAgent", 2);
         assert_eq!(high.violations(&caller).len(), 1);
         // A budgeted grant fits within a unit grant.
-        let under = CapSet::none().with_budget("bash", 5);
+        let under = CapSet::none().with_budget("exec", 5);
         assert!(under.violations(&caller).is_empty());
     }
 
@@ -249,9 +249,9 @@ mod tests {
         let caller = root();
         assert_eq!(caller.grant(None).unwrap(), caller.transition());
 
-        let sel = caller.grant(Some(&["bash".into(), "runAgent".into()])).unwrap();
+        let sel = caller.grant(Some(&["exec".into(), "runAgent".into()])).unwrap();
         assert_eq!(sel.0["runAgent"], Cap::budgeted(0));
-        assert_eq!(sel.names(), vec!["bash", "runAgent"]);
+        assert_eq!(sel.names(), vec!["exec", "runAgent"]);
 
         let not_held = caller.grant(Some(&["write".into()])).unwrap_err();
         assert!(not_held.contains("does not include"), "{}", not_held);
@@ -262,14 +262,14 @@ mod tests {
 
     #[test]
     fn describe_shows_budget_only_when_shareable() {
-        assert_eq!(root().describe(), "bash, read, runAgent(1)");
-        assert_eq!(root().transition().describe(), "bash, read, runAgent");
+        assert_eq!(root().describe(), "exec, read, runAgent(1)");
+        assert_eq!(root().transition().describe(), "exec, read, runAgent");
     }
 
     #[test]
     fn facet_roundtrip_shape_and_foreign_encoding() {
         let json = serde_json::to_value(root()).unwrap();
-        assert_eq!(json["bash"], serde_json::json!({}));
+        assert_eq!(json["exec"], serde_json::json!({}));
         assert_eq!(json["runAgent"], serde_json::json!({"budget": 1}));
         let back: CapSet = serde_json::from_value(json).unwrap();
         assert_eq!(back, root());
