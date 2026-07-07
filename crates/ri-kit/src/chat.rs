@@ -25,8 +25,12 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatFacet {
     pub title: String,
-    #[serde(default)]
-    pub cwd: String,
+    /// The session's working directory, or `None` for a session that has no
+    /// directory at all (a pure orchestrator, say). Legacy refs recorded the
+    /// missing case as `""`; the deserializer folds that spelling into `None`
+    /// so no reader ever sees an empty-string pseudo-path.
+    #[serde(default, deserialize_with = "none_when_empty", skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub host: Option<String>,
     /// Parent ref, if this session was spawned by another.
@@ -37,6 +41,16 @@ pub struct ChatFacet {
     /// marker. Default false on existing/legacy refs.
     #[serde(default)]
     pub pinned: bool,
+}
+
+/// Deserialize an optional string, reading JSON `null` and `""` both as
+/// `None`. The empty string is the legacy on-disk spelling of "absent".
+fn none_when_empty<'de, D>(de: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let v: Option<String> = serde::Deserialize::deserialize(de)?;
+    Ok(v.filter(|s| !s.is_empty()))
 }
 
 impl Facet for ChatFacet {
@@ -266,7 +280,7 @@ pub fn update_facet(
         .and_then(|r| r.ok())
         .unwrap_or(ChatFacet {
             title: String::new(),
-            cwd: String::new(),
+            cwd: None,
             host: None,
             parent: None,
             pinned: false,

@@ -462,7 +462,7 @@ fn build_body(opts: &RequestOptions, prompt_cache_key: Option<&str>, resolved: &
         "model": opts.model.id,
         "store": false,
         "stream": true,
-        "instructions": opts.system_prompt,
+        "instructions": opts.system_text(),
         "input": messages,
         "text": { "verbosity": "medium" },
         "include": ["reasoning.encrypted_content"],

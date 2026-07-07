@@ -624,8 +624,9 @@ fn build_api_key_body(opts: &RequestOptions, resolved: &media::ResolvedMap) -> V
         "generationConfig": generation_config,
     });
 
-    if !opts.system_prompt.is_empty() {
-        body["systemInstruction"] = json!({ "parts": [{ "text": opts.system_prompt }] });
+    let system = opts.system_text();
+    if !system.is_empty() {
+        body["systemInstruction"] = json!({ "parts": [{ "text": system }] });
     }
 
     if !opts.tools.is_empty() {
@@ -673,9 +674,9 @@ fn build_cloud_body(variant: GeminiVariant, project_id: &str, opts: &RequestOpti
     let mut request = json!({ "contents": contents });
 
     let system_text = if variant == GeminiVariant::Antigravity {
-        format!("{}\n\n{}\n{}", ANTIGRAVITY_SYSTEM_INSTRUCTION, BRIDGE_PROMPT, opts.system_prompt)
+        format!("{}\n\n{}\n{}", ANTIGRAVITY_SYSTEM_INSTRUCTION, BRIDGE_PROMPT, opts.system_text())
     } else {
-        opts.system_prompt.to_string()
+        opts.system_text()
     };
     request["systemInstruction"] = json!({ "parts": [{ "text": system_text }] });
 

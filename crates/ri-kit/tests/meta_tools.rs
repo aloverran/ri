@@ -106,7 +106,7 @@ fn fixture(tag: &str) -> Fixture {
     let store = mount(&dir);
     let session = ri_kit::chat::create(&store, ri_kit::chat::ChatFacet {
         title: "test session".to_string(),
-        cwd: "/tmp".to_string(),
+        cwd: Some("/tmp".to_string()),
         host: None,
         parent: None,
         pinned: false,
@@ -630,7 +630,7 @@ async fn update_ref_create_update_guard_and_canary() {
     // Ownership guard: a different ref a running agent owns is refused.
     let store = mount(&f.dir);
     let other = ri_kit::chat::create(&store, ri_kit::chat::ChatFacet {
-        title: "other".into(), cwd: String::new(),
+        title: "other".into(), cwd: None,
         host: None, parent: None, pinned: false,
     }).unwrap();
     f.seam.mark_running(&other.id);

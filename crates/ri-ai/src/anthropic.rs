@@ -559,12 +559,16 @@ fn build_body(opts: &RequestOptions, auth: Auth, resolved: &media::ResolvedMap) 
         let mut system_blocks = vec![
             json!({ "type": "text", "text": "You are Claude Code, Anthropic's official CLI for Claude." }),
         ];
-        if !opts.system_prompt.trim().is_empty() {
-            system_blocks.push(json!({ "type": "text", "text": opts.system_prompt }));
+        let system = opts.system_text();
+        if !system.is_empty() {
+            system_blocks.push(json!({ "type": "text", "text": system }));
         }
         body["system"] = json!(system_blocks);
-    } else if !opts.system_prompt.trim().is_empty() {
-        body["system"] = json!([{ "type": "text", "text": opts.system_prompt }]);
+    } else {
+        let system = opts.system_text();
+        if !system.is_empty() {
+            body["system"] = json!([{ "type": "text", "text": system }]);
+        }
     }
 
     if !opts.tools.is_empty() {

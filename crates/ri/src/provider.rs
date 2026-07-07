@@ -88,6 +88,34 @@ pub struct RequestOptions {
     pub blobs: std::sync::Arc<crate::blob::Blobs>,
 }
 
+impl RequestOptions {
+    /// The complete system prompt for this request: `system_prompt` followed
+    /// by the text of every `Role::System` message in `messages`, in list
+    /// order, joined with blank lines. System-role messages are data like any
+    /// other -- a context may carry several (a base prompt plus swappable
+    /// sections) -- and every provider hoists them into its native system
+    /// field through this one accessor, so callers never pre-extract.
+    pub fn system_text(&self) -> String {
+        let mut parts: Vec<&str> = Vec::new();
+        if !self.system_prompt.trim().is_empty() {
+            parts.push(&self.system_prompt);
+        }
+        for msg in &self.messages {
+            if msg.role != crate::model::Role::System {
+                continue;
+            }
+            for block in &msg.content {
+                if let crate::model::ContentBlock::Text { text, .. } = block {
+                    if !text.trim().is_empty() {
+                        parts.push(text);
+                    }
+                }
+            }
+        }
+        parts.join("\n\n")
+    }
+}
+
 type BoxError = Box<dyn std::error::Error + Send + Sync + 'static>;
 
 /// An error from an LLM provider. The one actionable distinction is whether the
