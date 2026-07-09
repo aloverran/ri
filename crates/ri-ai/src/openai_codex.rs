@@ -519,10 +519,12 @@ fn derive_prompt_cache_key(messages: &[Message]) -> Option<String> {
 
 // -- Message conversion (ri messages -> Responses API input) --
 
-/// Capability-aware resolution pass: OpenAI takes `image/*` inline for Stage 2.
-/// audio/pdf/video become a surfaced placeholder.
-/// Conservative cap on raw image size sent as a data-URL. Over this is
-/// surfaced as a placeholder rather than risking a 413 on the request payload.
+/// Capability-aware resolution pass. These models read png/jpeg/webp/gif images
+/// inline (as a data-URL); audio/pdf/video, an unsupported image format, or an
+/// over-cap image becomes a surfaced placeholder. The accepted set and the 20 MB
+/// cap are OpenAI's documented limits -- not verified against the live API here
+/// (no credentials), unlike the Anthropic and Gemini sets.
+const OPENAI_ACCEPTED_IMAGE: &[&str] = &["image/png", "image/jpeg", "image/webp", "image/gif"];
 const OPENAI_IMAGE_LIMIT: u64 = 20 * 1024 * 1024;
 
 async fn resolve_blobs(opts: &RequestOptions) -> media::ResolvedMap {
@@ -531,7 +533,7 @@ async fn resolve_blobs(opts: &RequestOptions) -> media::ResolvedMap {
         // The codex / GPT-5.x models here are natively multimodal for images
         // (vision) but do NOT accept input_audio or input_file; audio/pdf/video
         // are genuinely unsupported, so a placeholder is the correct total result.
-        let resolved = if !mime.starts_with("image/") {
+        let resolved = if !mime.starts_with("image/") || !OPENAI_ACCEPTED_IMAGE.contains(&mime.as_str()) {
             media::Resolved::Placeholder(format!(
                 "[attachment {}, {} - this model can't read it]",
                 mime, media::human_size(size)

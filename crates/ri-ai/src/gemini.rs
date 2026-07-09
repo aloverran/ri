@@ -361,6 +361,15 @@ const GEMINI_INLINE_LIMIT: u64 = 18_000_000;
 /// uri is never referenced after the server has swept it.
 const FILES_API_TTL_HOURS: i64 = 47;
 
+/// The image formats Gemini reads inline, verified against the API. Any other
+/// `image/*` -- tiff, svg, ico, bmp -- returns a hard "Unsupported MIME type"
+/// 400, so it is surfaced as a placeholder rather than sent. Audio/video/pdf
+/// keep their own sendable paths.
+const GEMINI_ACCEPTED_IMAGE: &[&str] = &[
+    "image/png", "image/jpeg", "image/gif", "image/webp",
+    "image/heic", "image/heif", "image/avif",
+];
+
 impl GeminiProvider {
     /// A still-valid cached fileUri for a hash, dropping the entry if past TTL.
     fn cached_file_uri(&self, hash: &BlobHash) -> Option<String> {
@@ -387,7 +396,8 @@ impl GeminiProvider {
         let mut map = media::ResolvedMap::new();
         for (mime, hash, size) in media::collect_blobs(&opts.messages) {
             let is_video = mime.starts_with("video/");
-            let sendable = mime.starts_with("image/")
+            let is_image = mime.starts_with("image/");
+            let sendable = (is_image && GEMINI_ACCEPTED_IMAGE.contains(&mime.as_str()))
                 || mime.starts_with("audio/")
                 || is_video
                 || mime == "application/pdf";

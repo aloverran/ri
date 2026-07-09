@@ -32,17 +32,37 @@ pub enum Resolved {
 /// Per-request map from a blob's content address to how it was resolved.
 pub type ResolvedMap = HashMap<BlobHash, Resolved>;
 
-/// Read a blob's bytes off the Tokio path (`spawn_blocking` around the
-/// synchronous `Blobs::get`) and base64-encode them. `None` if the blob is
-/// missing or the read failed -- callers fall back to a placeholder.
-pub async fn read_blob_b64(blobs: &Blobs, hash: &BlobHash) -> Option<String> {
+/// Read a blob's raw bytes off the Tokio path (`spawn_blocking` around the
+/// synchronous `Blobs::get`). `None` if the blob is missing or the read
+/// failed -- callers fall back to a placeholder.
+pub async fn read_blob_bytes(blobs: &Blobs, hash: &BlobHash) -> Option<Vec<u8>> {
     let blobs = blobs.clone();
     let hash = hash.clone();
-    let bytes = tokio::task::spawn_blocking(move || blobs.get(&hash))
+    tokio::task::spawn_blocking(move || blobs.get(&hash))
         .await
         .ok()?
-        .ok()??;
-    Some(base64::engine::general_purpose::STANDARD.encode(bytes))
+        .ok()?
+}
+
+/// Standard base64 of a byte slice, the form every provider transmits inline media in.
+pub fn encode_b64(bytes: &[u8]) -> String {
+    base64::engine::general_purpose::STANDARD.encode(bytes)
+}
+
+/// A blob's bytes, base64-encoded for inline transmission. `None` when the
+/// blob is missing or unreadable -- callers fall back to a placeholder.
+pub async fn read_blob_b64(blobs: &Blobs, hash: &BlobHash) -> Option<String> {
+    read_blob_bytes(blobs, hash).await.map(|b| encode_b64(&b))
+}
+
+/// Pixel dimensions of a raster image, read from its header alone -- no full
+/// decode, no pixel buffer (this is the `imagesize` crate's whole purpose).
+/// `None` when the bytes are not a measurable image; a provider decides for
+/// itself what an unmeasurable image means against its own limits.
+pub fn image_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
+    imagesize::blob_size(bytes)
+        .ok()
+        .map(|s| (s.width as u32, s.height as u32))
 }
 
 /// Every distinct `Blob` referenced by a message list, including those nested
