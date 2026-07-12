@@ -1,17 +1,15 @@
 // Slash-command parsing and template expansion.
 //
 // Loads `.md` command templates from a directory and expands a
-// `/name arg1 arg2 ...` user input into the matching template's body
-// with positional arguments substituted.
+// `/name <arguments>` user input into the matching template's body.
 //
-// Templates support variable substitution in their body:
-//   $1, $2, ...         positional args
-//   $@ and $ARGUMENTS   all args joined
-//   ${@:N}              args from Nth onwards (1-indexed)
-//   ${@:N:L}            L args starting from Nth
+// A template body interpolates the argument text with either of two
+// interchangeable placeholders:
+//   $@ and $ARGUMENTS   the argument text, substituted verbatim
 //
-// Substitution is single-pass: argument values containing $ patterns
-// are never re-expanded.
+// The argument is emitted exactly as the user typed it -- newlines,
+// indentation, and internal whitespace preserved -- so a multi-line message
+// survives expansion and can be copied back out to tweak.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -24,12 +22,6 @@ pub struct PromptTemplate {
     pub path: PathBuf,
 }
 
-/// A parsed `/command arg1 arg2 ...` invocation.
-pub struct SlashCommand<'a> {
-    pub name: &'a str,
-    pub args_str: &'a str,
-}
-
 /// Load all .md prompt templates from a single directory.
 ///
 /// Returns an empty vec if the directory doesn't exist or can't be read.
@@ -40,98 +32,57 @@ pub fn load_templates(dir: &Path) -> Vec<PromptTemplate> {
     templates
 }
 
-/// Try to parse `text` as a `/name ...` command.
-/// Returns `None` if the text doesn't start with `/`.
-pub fn parse_command(text: &str) -> Option<SlashCommand<'_>> {
-    if !text.starts_with('/') {
-        return None;
-    }
-    let (name, args_str) = match text.find(' ') {
-        Some(i) => (&text[1..i], &text[i + 1..]),
-        None => (&text[1..], ""),
-    };
-    Some(SlashCommand { name, args_str })
-}
-
-/// If `text` is a `/command ...` that matches a loaded template, expand it.
-/// Otherwise return the text unchanged.
+/// If `text` is a `/command <arguments>` that matches a loaded template, expand
+/// it; otherwise return the text unchanged. When several templates share a name
+/// the last one loaded wins, so a project-local template shadows a global one.
 pub fn expand_prompt(text: &str, templates: &[PromptTemplate]) -> String {
     let cmd = match parse_command(text) {
         Some(c) => c,
         None => return text.to_string(),
     };
-    let tmpl = match templates.iter().find(|t| t.name == cmd.name) {
-        Some(t) => t,
-        None => return text.to_string(),
-    };
-    let args: Vec<&str> = if cmd.args_str.is_empty() {
-        Vec::new()
-    } else {
-        cmd.args_str.split_whitespace().collect()
-    };
-    substitute_args(&tmpl.content, &args)
+    match templates.iter().rfind(|t| t.name == cmd.name) {
+        Some(t) => substitute_args(&t.content, cmd.args_str),
+        None => text.to_string(),
+    }
 }
 
-/// Substitute argument placeholders in a template body. See module docs
-/// for the supported `$` patterns.
-pub fn substitute_args(content: &str, args: &[&str]) -> String {
-    let all = args.join(" ");
-    let bytes = content.as_bytes();
+/// A parsed `/command <arguments>` invocation.
+struct SlashCommand<'a> {
+    name: &'a str,
+    args_str: &'a str,
+}
+
+/// Parse `text` as a `/name <arguments>` command, or `None` if it doesn't start
+/// with `/`. The name runs up to the first whitespace character, which is
+/// consumed as the separator; everything after it is the argument, kept
+/// verbatim -- its own leading indentation and internal formatting preserved.
+fn parse_command(text: &str) -> Option<SlashCommand<'_>> {
+    let rest = text.strip_prefix('/')?;
+    let (name, args_str) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
+    Some(SlashCommand { name, args_str })
+}
+
+/// Replace every `$@` / `$ARGUMENTS` in a template body with `args`, verbatim.
+/// One left-to-right pass that never rescans substituted text, so an argument
+/// that itself contains `$@` is safe; a `$` that starts neither token is literal.
+fn substitute_args(content: &str, args: &str) -> String {
     let mut out = String::with_capacity(content.len());
-    let mut i = 0;
-
-    while i < bytes.len() {
-        if bytes[i] != b'$' {
-            let ch = content[i..].chars().next().unwrap();
-            out.push(ch);
-            i += ch.len_utf8();
-            continue;
-        }
-
-        let rest = &content[i..];
-
-        // ${@:N} or ${@:N:L}
-        if rest.starts_with("${@:") {
-            if let Some(close) = rest.find('}') {
-                out.push_str(&expand_slice(&rest[4..close], args));
-                i += close + 1;
-                continue;
+    let mut rest = content;
+    while let Some(at) = rest.find('$') {
+        out.push_str(&rest[..at]);
+        let token = &rest[at..];
+        match token.strip_prefix("$ARGUMENTS").or_else(|| token.strip_prefix("$@")) {
+            Some(tail) => {
+                out.push_str(args);
+                rest = tail;
+            }
+            None => {
+                out.push('$');
+                rest = &token[1..];
             }
         }
-
-        // $ARGUMENTS
-        if rest.starts_with("$ARGUMENTS") {
-            out.push_str(&all);
-            i += "$ARGUMENTS".len();
-            continue;
-        }
-
-        // $@
-        if rest.len() >= 2 && bytes[i + 1] == b'@' {
-            out.push_str(&all);
-            i += 2;
-            continue;
-        }
-
-        // $N (positional, greedy digits)
-        if rest.len() >= 2 && bytes[i + 1].is_ascii_digit() {
-            let mut j = i + 1;
-            while j < bytes.len() && bytes[j].is_ascii_digit() {
-                j += 1;
-            }
-            if let Ok(n) = content[i + 1..j].parse::<usize>() {
-                let idx = n.saturating_sub(1);
-                out.push_str(args.get(idx).copied().unwrap_or(""));
-                i = j;
-                continue;
-            }
-        }
-
-        // Not a recognized pattern -- emit $ literally.
-        out.push('$');
-        i += 1;
     }
-
+    out.push_str(rest);
     out
 }
 
@@ -221,21 +172,6 @@ fn extract_field<'a>(frontmatter: &'a str, key: &str) -> Option<&'a str> {
     None
 }
 
-fn expand_slice(spec: &str, args: &[&str]) -> String {
-    let parts: Vec<&str> = spec.split(':').collect();
-    let start = parts
-        .first()
-        .and_then(|s| s.parse::<usize>().ok())
-        .map(|n| n.saturating_sub(1))
-        .unwrap_or(0)
-        .min(args.len());
-
-    match parts.get(1).and_then(|s| s.parse::<usize>().ok()) {
-        Some(len) => args[start..(start + len).min(args.len())].join(" "),
-        None => args[start..].join(" "),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -278,66 +214,34 @@ mod tests {
     }
 
     #[test]
-    fn parse_command_basic() {
-        let cmd = parse_command("/task implement foo").unwrap();
-        assert_eq!(cmd.name, "task");
-        assert_eq!(cmd.args_str, "implement foo");
+    fn parse_command_separator() {
+        // Exactly one whitespace char separates the name from the argument: a
+        // newline separator is consumed, but the argument's own leading
+        // indentation survives verbatim.
+        let nl = parse_command("/task\n    indented").unwrap();
+        assert_eq!(nl.name, "task");
+        assert_eq!(nl.args_str, "    indented");
+        assert_eq!(parse_command("/task hello").unwrap().args_str, "hello");
     }
 
     #[test]
-    fn parse_command_no_args() {
-        let cmd = parse_command("/help").unwrap();
-        assert_eq!(cmd.name, "help");
-        assert_eq!(cmd.args_str, "");
+    fn preserves_formatting() {
+        let arg = "# Heading\n\n- one\n- two\n    indented";
+        assert_eq!(substitute_args("$@", arg), arg);
+        assert_eq!(
+            substitute_args("before\n$ARGUMENTS\nafter", arg),
+            format!("before\n{arg}\nafter"),
+        );
     }
 
     #[test]
-    fn parse_command_not_slash() {
-        assert!(parse_command("plain text").is_none());
-    }
-
-    #[test]
-    fn substitute_positional() {
-        let args = vec!["foo", "bar"];
-        assert_eq!(substitute_args("$1 and $2", &args), "foo and bar");
-    }
-
-    #[test]
-    fn substitute_all() {
-        let args = vec!["a", "b", "c"];
-        assert_eq!(substitute_args("args: $@", &args), "args: a b c");
-        assert_eq!(substitute_args("args: $ARGUMENTS", &args), "args: a b c");
-    }
-
-    #[test]
-    fn substitute_slice() {
-        let args = vec!["a", "b", "c", "d"];
-        assert_eq!(substitute_args("${@:2}", &args), "b c d");
-        assert_eq!(substitute_args("${@:2:2}", &args), "b c");
-    }
-
-    #[test]
-    fn substitute_missing_arg() {
-        let args = vec!["only"];
-        assert_eq!(substitute_args("$1 $2 $3", &args), "only  ");
+    fn dollar_is_literal() {
+        assert_eq!(substitute_args("cost is $50", "x"), "cost is $50");
+        assert_eq!(substitute_args("$$ and $", "x"), "$$ and $");
     }
 
     #[test]
     fn no_reexpansion() {
-        let args = vec!["literal $@ text"];
-        assert_eq!(substitute_args("result: $1", &args), "result: literal $@ text");
-    }
-
-    #[test]
-    fn dollar_passthrough() {
-        let args = vec!["x"];
-        assert_eq!(substitute_args("cost is $50", &args), "cost is ");
-        assert_eq!(substitute_args("$$ and $", &args), "$$ and $");
-    }
-
-    #[test]
-    fn utf8_body() {
-        let args = vec!["world"];
-        assert_eq!(substitute_args("hello $1!", &args), "hello world!");
+        assert_eq!(substitute_args("$@", "literal $@ text"), "literal $@ text");
     }
 }
