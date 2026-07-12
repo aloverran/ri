@@ -392,6 +392,11 @@ impl GeminiProvider {
     /// API to a `fileUri`. A non-sendable modality, a missing blob, or an
     /// upload that can't be performed surfaces as a placeholder -- never a
     /// silent drop, never a raw 400.
+    ///
+    /// Deliberately no pixel-dimension guard (unlike the Anthropic pass): Gemini
+    /// never rejects on dimensions -- it resamples every image to a fixed token
+    /// budget (verified: a 9000px image is accepted and normalized), so a guard
+    /// would only reject inputs the model handles fine.
     async fn resolve_blobs(&self, opts: &RequestOptions, api_key: Option<&str>) -> media::ResolvedMap {
         let mut map = media::ResolvedMap::new();
         for (mime, hash, size) in media::collect_blobs(&opts.messages) {
