@@ -27,6 +27,7 @@ async-stream.workspace = true
 dirs.workspace = true
 urlencoding.workspace = true
 fs4.workspace = true
+imagesize = "0.15"
 
 [dev-dependencies]
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

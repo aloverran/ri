@@ -12,7 +12,7 @@ use tokio::sync::Mutex;
 use tracing::error;
 
 use ri::{
-    ApiError, AuthMethod, ContentBlock, EventStream, LlmProvider, Message, Model, ModelCost,
+    ApiError, AuthMethod, BlobHash, ContentBlock, EventStream, LlmProvider, Message, Model, ModelCost,
     RequestOptions, Role, StreamEvent, ThinkingLevel, ToolSchema, Usage,
 };
 use crate::sse::{self, SseEvent, SseInterpreter};
@@ -289,44 +289,114 @@ impl LlmProvider for AnthropicProvider {
     }
 }
 
-/// Maximum raw image size Anthropic accepts inline (~4.5 MB/image). Over this
-/// is surfaced as a placeholder rather than risking a 413/400.
-const ANTHROPIC_IMAGE_LIMIT: u64 = 4_500_000;
+/// The image formats Claude reads. Any other `image/*` is a certain format
+/// rejection, so it is surfaced as a placeholder rather than sent.
+const ANTHROPIC_ACCEPTED_IMAGE: &[&str] = &["image/jpeg", "image/png", "image/gif", "image/webp"];
+
+/// Claude rejects any image whose base64 payload exceeds 10 MiB (verified: it
+/// counts the base64 length exactly -- 4*ceil(raw/3) -- and rejects a lone
+/// 7.6 MiB file whose base64 is 10.2 MiB). base64 inflates raw bytes by 4/3, so
+/// a raw file at or under 3/4 of that limit stays inside it. Over it -> an
+/// actionable placeholder. (A separate, higher request-size limit bounds the
+/// whole payload; this per-image cap does not model that aggregate.)
+const ANTHROPIC_IMAGE_LIMIT: u64 = 10 * 1024 * 1024 * 3 / 4; // 7.5 MiB raw
 
 /// Maximum raw PDF size Anthropic accepts inline as a document (~30 MB).
 const ANTHROPIC_PDF_LIMIT: u64 = 30 * 1024 * 1024;
 
-/// Capability-aware resolution pass: `image/*` under the image cap -> inline
-/// base64 (rendered as an image block); `application/pdf` under the PDF cap ->
-/// inline base64 (rendered as a document block); audio/video, or anything over
-/// a cap, -> placeholder. Anthropic has no upload API, so inline-or-placeholder
-/// is the whole story.
+/// Claude hard-rejects (a non-retryable 400) any image whose longer side
+/// exceeds this. A request carrying more than [`ANTHROPIC_MANY_IMAGES`] images
+/// tightens the per-image bound to [`ANTHROPIC_CROWDED_IMAGE_DIM`]. Both bounds
+/// and the 20-image threshold are verified against the live API. Images between
+/// a bound and the model's native size are downscaled server-side -- not our
+/// concern; we guard only the hard reject an agent would otherwise meet as a
+/// dead turn.
+const ANTHROPIC_IMAGE_DIM: u32 = 8000;
+const ANTHROPIC_MANY_IMAGES: usize = 20;
+const ANTHROPIC_CROWDED_IMAGE_DIM: u32 = 2000;
+
+/// Capability-aware resolution pass. Claude reads jpeg/png/gif/webp images
+/// (inline base64, rendered as an image block) and PDFs (inline as a document);
+/// every other modality, an over-cap blob, or an image past Claude's hard pixel
+/// limit becomes a placeholder. Anthropic has no upload API, so
+/// inline-or-placeholder is the whole story.
 async fn resolve_blobs(opts: &RequestOptions) -> media::ResolvedMap {
+    let entries = media::collect_blobs(&opts.messages);
+    // Claude's per-image pixel bound tightens once a request carries many images.
+    let image_count = entries
+        .iter()
+        .filter(|(mime, _, _)| ANTHROPIC_ACCEPTED_IMAGE.contains(&mime.as_str()))
+        .count();
+    let dim_limit = if image_count > ANTHROPIC_MANY_IMAGES {
+        ANTHROPIC_CROWDED_IMAGE_DIM
+    } else {
+        ANTHROPIC_IMAGE_DIM
+    };
+
     let mut map = media::ResolvedMap::new();
-    for (mime, hash, size) in media::collect_blobs(&opts.messages) {
-        let is_image = mime.starts_with("image/");
-        let is_pdf = mime == "application/pdf";
-        let over_limit = (is_image && size > ANTHROPIC_IMAGE_LIMIT)
-            || (is_pdf && size > ANTHROPIC_PDF_LIMIT);
-        let resolved = if !is_image && !is_pdf {
-            media::Resolved::Placeholder(format!(
-                "[attachment {}, {} - this model can't read it]",
-                mime, media::human_size(size)
-            ))
-        } else if over_limit {
-            media::Resolved::Placeholder(format!(
-                "[attachment {}, {} - exceeds this model's inline size limit]",
-                mime, media::human_size(size)
-            ))
-        } else {
-            match media::read_blob_b64(&opts.blobs, &hash).await {
-                Some(b64) => media::Resolved::Inline { media_type: mime.clone(), b64 },
-                None => media::Resolved::Placeholder(format!("[missing attachment {}]", mime)),
-            }
-        };
+    for (mime, hash, size) in entries {
+        let resolved = resolve_one(opts, &mime, &hash, size, dim_limit).await;
         map.insert(hash, resolved);
     }
     map
+}
+
+/// Resolve one blob against Claude's accept rules, cheapest rejection first.
+/// `dim_limit` is the request-wide per-image pixel bound decided by the caller.
+async fn resolve_one(
+    opts: &RequestOptions,
+    mime: &str,
+    hash: &BlobHash,
+    size: u64,
+    dim_limit: u32,
+) -> media::Resolved {
+    let placeholder = |reason: &str| {
+        media::Resolved::Placeholder(format!(
+            "[attachment {}, {} - {}]",
+            mime,
+            media::human_size(size),
+            reason
+        ))
+    };
+    let missing = || media::Resolved::Placeholder(format!("[missing attachment {}]", mime));
+
+    if mime == "application/pdf" {
+        if size > ANTHROPIC_PDF_LIMIT {
+            return placeholder("exceeds this model's inline size limit");
+        }
+        return match media::read_blob_b64(&opts.blobs, hash).await {
+            Some(b64) => media::Resolved::Inline { media_type: mime.to_string(), b64 },
+            None => missing(),
+        };
+    }
+    if !mime.starts_with("image/") {
+        return placeholder("this model can't read it");
+    }
+    if !ANTHROPIC_ACCEPTED_IMAGE.contains(&mime) {
+        return placeholder("Claude reads only jpeg/png/gif/webp images");
+    }
+    if size > ANTHROPIC_IMAGE_LIMIT {
+        return placeholder(&format!(
+            "exceeds Claude's {} per-image limit; recompress or downscale and re-read",
+            media::human_size(ANTHROPIC_IMAGE_LIMIT)
+        ));
+    }
+
+    // The bytes feed both the pixel check and the base64, so read them once. An
+    // accepted format is always measurable in practice, so an unmeasurable image
+    // here is a corrupt file -- inline it and let the API be the final judge.
+    let Some(bytes) = media::read_blob_bytes(&opts.blobs, hash).await else {
+        return missing();
+    };
+    if let Some((w, h)) = media::image_dimensions(&bytes) {
+        if w > dim_limit || h > dim_limit {
+            return placeholder(&format!(
+                "{}x{} exceeds Claude's {}px dimension limit; resize to <={}px per side and re-read",
+                w, h, dim_limit, dim_limit
+            ));
+        }
+    }
+    media::Resolved::Inline { media_type: mime.to_string(), b64: media::encode_b64(&bytes) }
 }
 
 // -- Token handling --
