@@ -170,6 +170,11 @@ impl LlmProvider for AnthropicProvider {
                 reasoning: true, context_window: 1_000_000, max_tokens: 128_000,
                 cost: ModelCost { input: 5.0, output: 25.0, cache_read: 0.5, cache_write: 6.25 },
             },
+            Model {
+                id: "claude-opus-5".into(), name: "Claude Opus 5".into(),
+                reasoning: true, context_window: 1_000_000, max_tokens: 128_000,
+                cost: ModelCost { input: 5.0, output: 25.0, cache_read: 0.5, cache_write: 6.25 },
+            },
             // Anthropic's most capable widely released model: a tier above Opus,
             // natively 1M-context with always-on adaptive thinking. (Its restricted
             // sibling Claude Mythos 5 is absent from this account's model list, so
@@ -574,12 +579,12 @@ fn assemble_betas(model_id: &str, auth: Auth) -> Vec<String> {
     // first-party. ri's body-root cache_control is honored without it, but it
     // keeps the envelope aligned with the client we impersonate.
     betas.push(PROMPT_CACHING_SCOPE.into());
-    // Mid-stream system blocks: Claude Code opts Opus 4.8 and Fable 5 specifically
+    // Mid-stream system blocks: Claude Code opts Opus 4.8, Opus 5, and Fable 5
     // into this (not the wider Opus line). ri hoists all system content to the top
     // of the request rather than weaving it in, so this is inert today -- but it
     // mirrors the envelope these models were aligned with, and would switch on for
     // free the day ri starts weaving system blocks into the message stream.
-    if model_id.contains("opus-4-8") || model_id.contains("fable") {
+    if model_id.contains("opus-4-8") || model_id.contains("opus-5") || model_id.contains("fable") {
         betas.push(MID_CONVERSATION_SYSTEM.into());
     }
     // Manual escape hatch, appended verbatim (no dedup, matching Claude Code's
@@ -657,59 +662,96 @@ fn build_body(opts: &RequestOptions, auth: Auth, resolved: &media::ResolvedMap) 
         body["tools"] = json!(tools);
     }
 
-    if opts.thinking != ThinkingLevel::Off && opts.model.reasoning {
-        apply_thinking(&mut body, opts.thinking, thinking_mode(&opts.model.id));
+    if opts.model.reasoning {
+        apply_thinking(&mut body, opts.thinking, &opts.model.id);
     }
 
     body
 }
 
-/// Which thinking-config shape a model accepts. Anthropic split the API
-/// in February 2026: newer hybrid-reasoning models (Opus 4.6+, Sonnet 4.6+)
-/// take an adaptive mode with an effort suggestion and decide for themselves
-/// how much to think; older ones still require a hard `budget_tokens` ceiling.
+/// Which thinking-config shape a model accepts. Anthropic split the API in
+/// February 2026: the hybrid-reasoning generation (Opus 4.6+, Sonnet 4.6+) takes
+/// an adaptive effort suggestion, while older models still require a hard
+/// `budget_tokens` ceiling. Fable and Mythos are adaptive but always think --
+/// they reject an explicit `disabled` -- so they form their own mode.
 enum ThinkingMode {
-    Adaptive,
     Budget,
+    Adaptive,
+    AdaptiveAlwaysOn,
 }
 
 fn thinking_mode(model_id: &str) -> ThinkingMode {
-    // Claude Code's `gH8`: the hybrid-reasoning generation takes adaptive
-    // thinking; everything older requires a hard `budget_tokens` ceiling.
-    // Substring matching so a dated id (`claude-opus-4-8-2026...`) classifies the
-    // same as its canonical form, and anything unknown stays on budget.
-    let adaptive = ["opus-4-6", "opus-4-7", "opus-4-8", "sonnet-4-6", "fable"]
-        .iter()
-        .any(|family| model_id.contains(family));
-    if adaptive { ThinkingMode::Adaptive } else { ThinkingMode::Budget }
+    // Claude Code's `gH8` splits adaptive from budget; the always-on split is
+    // ri's own, learned from the live API. Substring matching so a dated id
+    // (`claude-opus-4-8-2026...`) classifies like its canonical form.
+    const ALWAYS_ON: &[&str] = &["fable", "mythos"];
+    const ADAPTIVE: &[&str] = &["opus-4-6", "opus-4-7", "opus-4-8", "opus-5", "sonnet-4-6"];
+    if ALWAYS_ON.iter().any(|f| model_id.contains(f)) {
+        ThinkingMode::AdaptiveAlwaysOn
+    } else if ADAPTIVE.iter().any(|f| model_id.contains(f)) {
+        ThinkingMode::Adaptive
+    } else {
+        ThinkingMode::Budget
+    }
 }
 
-fn apply_thinking(body: &mut Value, level: ThinkingLevel, mode: ThinkingMode) {
-    match mode {
-        ThinkingMode::Adaptive => {
-            let effort = match level {
-                ThinkingLevel::Low => "low",
-                ThinkingLevel::Medium => "medium",
-                ThinkingLevel::High => "high",
-                ThinkingLevel::XHigh => "max",
-                ThinkingLevel::Off => unreachable!("guarded by caller"),
-            };
-            // `display: "summarized"` opts in to the server-side reasoning
-            // summary. Required for Opus 4.7 thinking to stream at all;
-            // older adaptive models accept it verbatim.
-            body["thinking"] = json!({ "type": "adaptive", "display": "summarized" });
-            body["output_config"] = json!({ "effort": effort });
-        }
+/// Write the thinking configuration for a reasoning model. Each mode reads "off"
+/// its own way: budget omits the field, adaptive sends an explicit `disabled`,
+/// and always-on falls to its least effort. The effort/budget maps, the disable
+/// ceiling, and the always-on 400 are all verified against the live API.
+fn apply_thinking(body: &mut Value, level: ThinkingLevel, model_id: &str) {
+    match thinking_mode(model_id) {
         ThinkingMode::Budget => {
             let budget = match level {
+                ThinkingLevel::Off => return, // an absent field is no extended thinking
                 ThinkingLevel::Low => 1024,
                 ThinkingLevel::Medium => 4096,
                 ThinkingLevel::High => 16384,
                 ThinkingLevel::XHigh => 32768,
-                ThinkingLevel::Off => unreachable!("guarded by caller"),
             };
             body["thinking"] = json!({ "type": "enabled", "budget_tokens": budget });
         }
+        ThinkingMode::Adaptive => {
+            // Opus 5 thinks by default, so off must be an explicit `disabled`; the
+            // older adaptive models default off and take it as a verified no-op.
+            // No effort rides with it, keeping under the `effort <= high` ceiling
+            // that disabling requires.
+            if level == ThinkingLevel::Off {
+                body["thinking"] = json!({ "type": "disabled" });
+            } else {
+                set_adaptive(body, adaptive_effort(level));
+            }
+        }
+        ThinkingMode::AdaptiveAlwaysOn => {
+            // Fable and Mythos always think -- an explicit `disabled` 400s -- so
+            // off becomes their least effort rather than an omitted field, which
+            // would drift to the default `high`, the opposite of off.
+            if level == ThinkingLevel::Off {
+                tracing::debug!(model = model_id, "thinking is always-on; 'off' clamped to minimum effort");
+            }
+            set_adaptive(body, adaptive_effort(level));
+        }
+    }
+}
+
+/// The adaptive request shape. `display: "summarized"` opts into the server-side
+/// reasoning summary -- required for Opus 4.7 to stream thinking at all, accepted
+/// verbatim by the rest.
+fn set_adaptive(body: &mut Value, effort: &str) {
+    body["thinking"] = json!({ "type": "adaptive", "display": "summarized" });
+    body["output_config"] = json!({ "effort": effort });
+}
+
+/// Map a thinking level to an adaptive effort. `Off` floors to `low`: the
+/// adaptive mode resolves off to an explicit disable before reaching here, so
+/// only the always-on models arrive with off -- where least effort is exactly
+/// what off can mean.
+fn adaptive_effort(level: ThinkingLevel) -> &'static str {
+    match level {
+        ThinkingLevel::Off | ThinkingLevel::Low => "low",
+        ThinkingLevel::Medium => "medium",
+        ThinkingLevel::High => "high",
+        ThinkingLevel::XHigh => "max",
     }
 }
 

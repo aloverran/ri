@@ -17,10 +17,6 @@ pub fn all_providers() -> Vec<Box<dyn LlmProvider>> {
     FACTORIES.iter().map(|f| f()).collect()
 }
 
-pub fn default_model_id() -> &'static str {
-    "claude-opus-4-8"
-}
-
 /// Model IDs from authenticated providers only.
 /// Used in tool descriptions and error messages -- the caller should only
 /// see models they can actually use.
