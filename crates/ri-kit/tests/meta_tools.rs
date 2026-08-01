@@ -27,9 +27,9 @@ fn mount(dir: &PathBuf) -> Store {
 
 /// Stub harness seam: store access mounts fresh per call (CLI-style),
 /// `spawn_agent` records the request, `agent_status` reports a ref running iff
-/// marked so (readAgent, the continue guard), and `repoint_ref` refuses a
-/// marked-running ref (the updateRef ownership guard) and otherwise persists
-/// the move, CLI-style.
+/// marked so (readAgent, the continue guard), `await_idle` follows that same
+/// mark (readAgent's wait), and `repoint_ref` refuses a marked-running ref (the
+/// updateRef ownership guard) and otherwise persists the move, CLI-style.
 struct StubSeam {
     dir: PathBuf,
     spawned: Mutex<Vec<ExecRequest>>,
@@ -39,6 +39,10 @@ struct StubSeam {
 impl StubSeam {
     fn mark_running(&self, id: &RefId) {
         self.running.lock().unwrap().insert(id.to_string());
+    }
+
+    fn mark_idle(&self, id: &RefId) {
+        self.running.lock().unwrap().remove(id.as_str());
     }
 }
 
@@ -65,6 +69,14 @@ impl MetaExec for StubSeam {
         AgentStatus {
             running: self.running.lock().unwrap().contains(ref_id.as_str()),
             streaming_preview: None,
+        }
+    }
+
+    /// A real harness parks on its own idle edge; the stub samples the same
+    /// mark `agent_status` reads, which is all the tool's contract requires.
+    async fn await_idle(&self, ref_id: &RefId) {
+        while self.running.lock().unwrap().contains(ref_id.as_str()) {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
     }
 
@@ -936,4 +948,72 @@ async fn read_agent_running_and_idle() {
     let out = f.run("readAgent", json!({ "session_id": "ref_nope" })).await;
     assert!(out.is_error);
     assert_eq!(text(&out), "session 'ref_nope' not found");
+}
+
+#[tokio::test]
+async fn read_agent_wait_ends_on_idle_expiry_or_refusal() {
+    use std::time::{Duration, Instant};
+
+    let f = fixture("read-agent-wait");
+
+    // A second session to watch, since a session may not wait on itself.
+    let m1 = f.one_message("user", "seed").await;
+    let ctx1 = f.context_of(&[m1.as_str()]).await;
+    let watched = RefId::from("ref_watched");
+    let out = f.run("updateRef", json!({
+        "ref_id": watched.as_str(), "context_id": ctx1
+    })).await;
+    assert!(!out.is_error, "unexpected error: {}", text(&out));
+
+    // Already idle: the wait is over before it begins.
+    let out = f.run("readAgent", json!({
+        "session_id": watched.as_str(), "wait_seconds": 30
+    })).await;
+    assert!(!out.is_error, "unexpected error: {}", text(&out));
+    assert!(text(&out).contains("[idle]") && text(&out).contains("wait: idle after"),
+        "got: {}", text(&out));
+
+    // Running, then finishing mid-wait: the call returns on that edge, far
+    // inside its own bound.
+    f.seam.mark_running(&watched);
+    let seam = f.seam.clone();
+    let finishing = watched.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        seam.mark_idle(&finishing);
+    });
+    let started = Instant::now();
+    let out = f.run("readAgent", json!({
+        "session_id": watched.as_str(), "wait_seconds": 30
+    })).await;
+    assert!(!out.is_error, "unexpected error: {}", text(&out));
+    assert!(text(&out).contains("[idle]"), "got: {}", text(&out));
+    assert!(started.elapsed() < Duration::from_secs(5),
+        "returned on the idle edge, not the bound: {:?}", started.elapsed());
+
+    // Still running when the time runs out: an ordinary reading, never an error.
+    f.seam.mark_running(&watched);
+    let out = f.run("readAgent", json!({
+        "session_id": watched.as_str(), "wait_seconds": 1
+    })).await;
+    assert!(!out.is_error, "expiry is a reading, not an error: {}", text(&out));
+    assert!(text(&out).contains("[running]") && text(&out).contains("wait: timed out"),
+        "got: {}", text(&out));
+
+    // Waiting on the calling session could only expire, so it is refused --
+    // while reading itself without waiting stays legal.
+    let out = f.run("readAgent", json!({
+        "session_id": f.session_id.as_str(), "wait_seconds": 5
+    })).await;
+    assert!(out.is_error);
+    assert!(text(&out).contains("cannot wait on your own session"), "got: {}", text(&out));
+    let out = f.run("readAgent", json!({ "session_id": f.session_id.as_str() })).await;
+    assert!(!out.is_error, "a self-read without waiting stays legal: {}", text(&out));
+
+    // Waiting for no time is a confusion, not a way to skip the wait.
+    let out = f.run("readAgent", json!({
+        "session_id": watched.as_str(), "wait_seconds": 0
+    })).await;
+    assert!(out.is_error);
+    assert!(text(&out).contains("positive whole number"), "got: {}", text(&out));
 }

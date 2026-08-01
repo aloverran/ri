@@ -130,6 +130,21 @@ pub trait MetaExec: Send + Sync {
     /// output it is streaming. The liveness oracle behind `readAgent` and the
     /// `runAgent` continue guard.
     async fn agent_status(&self, ref_id: &RefId) -> AgentStatus;
+    /// Resolve when no loop is running on `ref_id`: the same fact
+    /// [`MetaExec::agent_status`] reports, delivered when it changes instead of
+    /// when asked, so a watcher can wait on it rather than ask again. A ref the
+    /// harness does not track is already idle and resolves at once. Resolution
+    /// follows the ref rather than one particular run, so a fresh run claiming
+    /// it before the waiter looks keeps the wait going.
+    ///
+    /// The harness owns this because the "is it running" test and the
+    /// registration of the wakeup have to happen under one lock: a shared-layer
+    /// check would release that lock before parking, and a loop finishing in
+    /// the gap would leave the waiter asleep. The wait's bounds stay with the
+    /// caller -- `readAgent` races this against its own timeout and its run's
+    /// cancellation -- so an implementation must tolerate being dropped at any
+    /// await point and must hold no lock the watched loop needs to finish.
+    async fn await_idle(&self, ref_id: &RefId);
     /// Persist a validated `updateRef` move, keeping any resident session's
     /// working head in step with it. The harness owns this because "is a loop
     /// running" and "is this ref resident in memory" live in the harness, not
@@ -178,7 +193,7 @@ pub fn create(
         tools.push(Box::new(UpdateRefTool {
             store: store.clone(),
             exec: exec.clone(),
-            session_id,
+            session_id: session_id.clone(),
             caps: caps.clone(),
         }));
     }
@@ -189,7 +204,7 @@ pub fn create(
         tools.push(Box::new(RunAgentTool { store: store.clone(), exec: exec.clone(), caps: caps.clone() }));
     }
     if caps.contains("readAgent") {
-        tools.push(Box::new(ReadAgentTool { store, exec }));
+        tools.push(Box::new(ReadAgentTool { store, exec, session_id }));
     }
     // `TOOL_NAMES` is a hand-maintained mirror used to advertise the meta-tool
     // inventory; assert the grant-filtered build matches it, loudly and in
@@ -1353,7 +1368,8 @@ impl Tool for RunAgentTool {
          (e.g. Gemini search and code execution) turn on automatically. With \
          tools it loops -- LLM turn, tool calls, repeat -- until the model \
          stops calling them, writing every message back to the session. Check \
-         on the result with readAgent."
+         on the result with readAgent, which can also wait for the run to \
+         finish."
     }
 
     fn parameters(&self) -> Value {
@@ -1572,9 +1588,18 @@ fn resolve_exec_request(
 /// is streaming right now, and a preview of its latest output. The runtime
 /// counterpart to `readRef` -- it reports only what the harness knows, not the
 /// ref's data (head, facets), which `readRef` owns.
+///
+/// With `wait_seconds` this tool blocks. It waits on
+/// [`MetaExec::await_idle`] until the watched loop goes idle, until its own
+/// timeout, or until the calling run is cancelled, and then reads and renders
+/// the status exactly as an unwaited call would -- the wait decides only when
+/// to look. Waiting on the calling session is refused: the loop that would have
+/// to end is the one making the call.
 struct ReadAgentTool {
     store: Arc<dyn StoreAccess>,
     exec: Arc<dyn MetaExec>,
+    /// The calling session, so a wait on it can be refused as unsatisfiable.
+    session_id: RefId,
 }
 
 #[async_trait]
@@ -1588,7 +1613,13 @@ impl Tool for ReadAgentTool {
          running, the text it is streaming right now (if mid-turn), and a \
          preview of its latest persisted output or error. Use this to check on \
          a session started with runAgent. For the ref as data (head, facets, \
-         merge_into inbox) use readRef."
+         merge_into inbox) use readRef. Pass 'wait_seconds' to block until that \
+         agent's loop goes idle, for at most that many seconds: the call \
+         returns the moment the agent finishes, so following a sub-agent costs \
+         one call rather than a sleep-and-look cycle. An agent that is already \
+         idle returns at once -- this waits for a loop to end, not for work \
+         to begin. Running out of time is not an error: it returns an ordinary \
+         reading that says the wait timed out, and you can wait again."
     }
 
     fn parameters(&self) -> Value {
@@ -1598,13 +1629,21 @@ impl Tool for ReadAgentTool {
                 "session_id": {
                     "type": "string",
                     "description": "The session (ref id) returned by runAgent."
+                },
+                "wait_seconds": {
+                    "type": "integer",
+                    "description": "Block until this agent's loop goes idle, for \
+                        at most this many seconds. Omit to read the status \
+                        immediately. The call returns as soon as the agent \
+                        finishes; if the time runs out first, the reply is an \
+                        ordinary reading that says so, and you can wait again."
                 }
             },
             "required": ["session_id"]
         })
     }
 
-    async fn run(&self, input: Value, _cancel: CancellationToken) -> ToolOutput {
+    async fn run(&self, input: Value, cancel: CancellationToken) -> ToolOutput {
         let store = match self.store.store() {
             Ok(s) => s,
             Err(msg) => return ToolOutput::error(&msg),
@@ -1615,9 +1654,53 @@ impl Tool for ReadAgentTool {
             _ => return ToolOutput::error("missing 'session_id' parameter"),
         };
 
+        // A wait is bounded by construction: the parameter is the bound, so
+        // there is no way to ask for an unbounded one. Zero is rejected rather
+        // than read as "no wait" -- asking to wait for no time is a confusion
+        // worth naming.
+        let wait = match input.get("wait_seconds") {
+            None | Some(Value::Null) => None,
+            Some(v) => {
+                match v.as_u64().or_else(|| v.as_str().and_then(|s| s.parse().ok())) {
+                    Some(n) if n > 0 => Some(std::time::Duration::from_secs(n)),
+                    _ => return ToolOutput::error(
+                        "wait_seconds must be a positive whole number of seconds; \
+                         omit it to read the status immediately"
+                    ),
+                }
+            }
+        };
+
         if store.get_ref(&session_id).is_none() {
             return ToolOutput::error(&format!("session '{}' not found", session_id));
         }
+
+        if wait.is_some() && session_id == self.session_id {
+            return ToolOutput::error(&format!(
+                "cannot wait on your own session [{}]: your loop is what is calling \
+                 this tool, so the wait could only run out of time; read without \
+                 wait_seconds, or wait on a session you spawned", session_id
+            ));
+        }
+
+        // Race the three ways a wait ends: the harness's idle signal, the
+        // caller's bound, and the run's cancellation, which covers an operator
+        // stop and a voice whose watched run just ended. Each arm names the
+        // state the wait ended in rather than a transition, since an agent that
+        // was idle throughout never changed. The status is read fresh
+        // afterwards, so this decides only when to look.
+        let waited = match wait {
+            Some(limit) => {
+                let started = std::time::Instant::now();
+                let outcome = tokio::select! {
+                    _ = self.exec.await_idle(&session_id) => "idle",
+                    _ = tokio::time::sleep(limit) => "timed out",
+                    _ = cancel.cancelled() => "cancelled",
+                };
+                Some(format!("wait: {} after {:.1}s\n", outcome, started.elapsed().as_secs_f64()))
+            }
+            None => None,
+        };
 
         let status = self.exec.agent_status(&session_id).await;
 
@@ -1625,6 +1708,9 @@ impl Tool for ReadAgentTool {
             "AGENT {} [{}]\n", session_id,
             if status.running { "running" } else { "idle" }
         );
+        if let Some(note) = waited {
+            out.push_str(&note);
+        }
 
         let head_messages = store.head_context(&session_id)
             .map(|c| store.pool().resolve(&c.messages))
